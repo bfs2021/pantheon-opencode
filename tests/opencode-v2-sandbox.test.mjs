@@ -76,8 +76,8 @@ test('runner script exists and is executable, with valid bash syntax', () => {
 
 test('runner is V2-only: no V1 leg, no sibling-repo inference', () => {
   const src = readFileSync(RUNNER, 'utf8')
-  // The V1 install spec and binary are gone. `@opencode-ai/cli` was only ever
-  // an install spec, never a dependency of this package.
+  // The V1 install spec and binary are gone. `@opencode/cli` is only an
+  // install spec, never a dependency of this package.
   assert.doesNotMatch(
     src,
     /OPENCODE_V1_SPEC|opencode-ai@1\.18\.18/,
@@ -85,6 +85,11 @@ test('runner is V2-only: no V1 leg, no sibling-repo inference', () => {
   )
   assert.doesNotMatch(src, /check_binary "V1/, 'generated script still probes a V1 binary')
   assert.doesNotMatch(src, /prepare_project v1/, 'still generates a project-v1')
+  assert.match(
+    src,
+    /OPENCODE_V2_SPEC="\$\{OPENCODE_V2_SPEC:-@opencode\/cli@latest\}"/,
+    'sandbox should default to the current stable OpenCode CLI package',
+  )
   // `--run v1` must fail loudly rather than silently testing the wrong leg.
   assert.match(src, /the V1 leg was removed/, '--run v1 must be rejected explicitly')
 
@@ -101,6 +106,62 @@ test('runner is V2-only: no V1 leg, no sibling-repo inference', () => {
     /SANDBOX_DIR\/\.\.\/pantheon/,
     'REPO_DIR must not be inferred from a sibling ../pantheon directory',
   )
+})
+
+test('MCP startup failures retain and print the mcp-list diagnostic output', () => {
+  const src = readFileSync(RUNNER, 'utf8')
+  assert.equal(
+    (src.match(/mcp list output \(preserved at \$list_file\)/g) ?? []).length,
+    2,
+    'both MCP registration and handshake failures must print captured output',
+  )
+  assert.equal(
+    (src.match(/cat "\$list_file" >&2 \|\| true/g) ?? []).length,
+    2,
+    'both failure paths must include the original mcp list response',
+  )
+})
+
+test('generated run-test.sh defines its mcp-list timeout under nounset', () => {
+  const src = readFileSync(RUNNER, 'utf8')
+  assert.match(
+    src,
+    /V2_MCP_LIST_TIMEOUT="\$\{PANTHEON_V2_MCP_LIST_TIMEOUT:-15\}"/,
+    'the generated script must define the timeout consumed by `timeout`',
+  )
+})
+
+test('prepare generates an interactive launcher isolated to the sandbox beta', (t) => {
+  const workDir = mkdtempSync(join(tmpdir(), 'pantheon-sandbox-launcher-'))
+  t.after(() => rmSync(workDir, { recursive: true, force: true }))
+  const repoDir = join(workDir, 'repo')
+  const sandboxRoot = join(workDir, 'sandbox')
+  mkdirSync(repoDir, { recursive: true })
+
+  generate(repoDir, sandboxRoot, join(workDir, 'runner-definitions.sh'))
+  const launcher = join(sandboxRoot, 'start-pantheon.sh')
+  assert.ok(existsSync(launcher), 'prepare must create the launcher it advertises')
+  assert.ok(statSync(launcher).mode & 0o111, 'launcher must be executable')
+  const syntax = spawnSync('bash', ['-n', launcher], { encoding: 'utf8' })
+  assert.equal(syntax.status, 0, `launcher has invalid bash syntax:\n${syntax.stderr}`)
+
+  const src = readFileSync(launcher, 'utf8')
+  assert.match(src, /export HOME="\$SANDBOX_HOME"/)
+  assert.match(src, /export XDG_CONFIG_HOME="\$SANDBOX_HOME\/\.config"/)
+  assert.match(src, /export XDG_DATA_HOME="\$SANDBOX_HOME\/\.local\/share"/)
+  assert.match(src, /export OPENCODE_CONFIG_DIR="\$SANDBOX_DIR\/project-v2"/)
+  assert.match(src, /service set port "\$V2_PORT"/)
+  assert.match(src, /PANTHEON_V2_PORT:-49376/)
+  assert.match(src, /probe\.setsockopt\(socket\.SOL_SOCKET, socket\.SO_REUSEADDR, 1\)/)
+  assert.match(src, /Reusing the existing beta sandbox OpenCode service/)
+  assert.match(src, /dedicated V2 port .* occupied by a different or unverifiable service/)
+  assert.match(src, /"@opencode", "cli"/)
+  assert.match(src, /opencode-v2\.db/)
+  assert.ok(
+    src.indexOf('service set port') < src.indexOf('exec "$NPM_PREFIX/bin/opencode2"'),
+    'the managed service port must be isolated before the TUI starts',
+  )
+  assert.match(src, /exec "\$NPM_PREFIX\/bin\/opencode2" "\$@"/)
 })
 
 test('the generated run-test.sh echoes the repo dir byte-for-byte (adversarial paths)', (t) => {

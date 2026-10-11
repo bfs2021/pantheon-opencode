@@ -190,15 +190,24 @@ there is no Pantheon-specific delegation tool surface to configure. See
 [ADR-0011](.pantheon/memory-bank/adr/0011-delegation-engine-contract.md) for the
 historical engine contract.
 
-This beta.6 candidate combines package and dependency updates, security advisory
-overrides, lint and inventory coverage, TUI restoration and state-refresh work,
-and memory/delegation prompt deduplication. The Zeus prompt reuses one
-task-start memory-search result for task context and delegation routing,
-including on a KV hit; automatic subtask-summary storage and delegation
-safeguards remain in place. Runtime call counts and latency have not been
-measured. Checkpoint/session bootstrap and effective Zeus `context_save`/`context_get`
-access are blocked, unverified follow-up work—not fixed features in this
-candidate.
+This beta.8 candidate combines native per-agent MCP permissions for OpenCode V1
+and V2, V2 delegation-permission alignment, simpler memory/compression
+instructions, and a sandbox check that proves the installed package matches
+this checkout instead of silently accepting stale npm-cached code. The isolated
+sandbox launcher also pins the OpenCode background service to its dedicated
+loopback port, rather than colliding with another OpenCode installation. The Zeus
+prompt reuses one task-start memory-search result for context and routing;
+runtime call counts and latency have not been measured. A beta.7 V2 dispatch
+failed because the permission hook passed a bare string to `ctx.session.get`
+instead of the V2 input object `{ sessionID }`; beta.8 corrects the call and
+adds contract tests for the success and failure cases. The user subsequently
+reported a successful Hermes liveness delegation in the active session, but
+freshly restarting and testing the beta.8 sandbox remains the end-to-end gate.
+The original report also included a separate `GET /api/session/{id}/permission`
+404; the session ID exists in the beta7-candidate database but not the default
+global database. Both OpenCode services were running, so the 404 in the global
+log may come from the other instance; this remains an end-to-end verification
+item.
 
 Delegated tasks get at most one retry after an initial timeout or failure. If
 that retry fails, the configured fallback or escalation chain applies.
@@ -522,6 +531,11 @@ agent delegation. The gate is fail-closed: every required check must return an
 explicit PASS; timeouts, auth/network/provider failures and missing
 prerequisites block the run.
 
+The runner defaults to the current stable `@opencode/cli` package and its
+`opencode2` alias; set `OPENCODE_V2_SPEC` only when a test needs a different
+host build. This keeps Pantheon beta testing separate from the OpenCode CLI
+release channel.
+
 "V2" here refers only to the hook canary observed against an OpenCode v2.0.18
 host, where at least one tested hook callback fired; it does not establish
 compatibility with the stable `@opencode/plugin@2.0.18` SDK or full 2.x
@@ -533,6 +547,7 @@ single leg.
 
 ```bash
 scripts/test-opencode-v2-sandbox.sh --prepare     # tarball + install + init in the sandbox
+~/pantheon-sandbox/start-pantheon.sh              # interactive TUI in that isolated beta sandbox
 scripts/test-opencode-v2-sandbox.sh --run v2      # base validation only
 scripts/test-opencode-v2-sandbox.sh --prompts     # base validation + prompt battery
 scripts/test-opencode-v2-sandbox.sh --rehydrate   # offline context rehydration/session-summary probe
@@ -571,7 +586,7 @@ Env overrides:
 |----------|---------|---------|
 | `PANTHEON_SANDBOX_ROOT` | `~/pantheon-sandbox` | Sandbox root (refused if unsafe for `--reset`) |
 | `OPENCODE_V1_SPEC` | `opencode-ai@1.18.18` | Configures the V1 plugin only; the V2-only sandbox runner does not consume or support it |
-| `OPENCODE_V2_SPEC` | `@opencode-ai/cli@beta` | npm spec providing the `opencode2` binary |
+| `OPENCODE_V2_SPEC` | `@opencode/cli@latest` | npm spec providing the `opencode2` binary |
 | `PANTHEON_SANDBOX_MODEL` | `opencode-go/mimo-v2.5` | Model used by init and prompts |
 | `PANTHEON_PROMPT_TIMEOUT` | `300` | Per-prompt timeout in seconds |
 
