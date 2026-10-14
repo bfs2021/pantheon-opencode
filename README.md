@@ -67,6 +67,10 @@ Once OpenCode is running, describe the outcome you want:
 ```
 
 Pantheon helps turn that request into a plan and a sequence of reviewed steps.
+When you ask for a plan or start `/pantheon-deepwork`, Athena returns the full
+plan to Zeus, who displays it in the main conversation before asking for
+approval. The approval prompt will not point to a plan hidden in a child-agent
+conversation.
 
 ## Who is it for?
 
@@ -302,7 +306,7 @@ per installation; V1 and V2 Pantheon plugins must never be registered together.
 |---|---|---|
 | OpenCode config key | singular `plugin` | plural `plugins` |
 | Pantheon registration | `src/plugin.ts` plus `src/plugins/pantheon-hooks.ts` | `<installed>/src/plugin-v2` directory (`index.ts` re-exports `src/plugin-v2.ts`) |
-| Runtime contract | Pantheon V1 plugin: 6 tools (`hashline_edit`, the 3 goal tools, `pantheon_cost`, `pantheon_model`), event/tool hooks and V1 compaction handling | Full V2 plugin: 3 tools (`hashline_edit`, `pantheon_cost`, `pantheon_model`), 5 event subscriptions, session hooks (`prompt`, `context`), a read-only-enforcing tool `execute.before` hook, plus configuration transforms |
+| Runtime contract | Pantheon V1 plugin: 6 tools (`hashline_edit`, the 3 goal tools, `pantheon_cost`, `pantheon_model`), event/tool hooks and V1 compaction handling | Full V2 plugin: 3 orchestration tools plus `vision_describe` when the model catalog is available, 5 event subscriptions, session hooks (`prompt`, `context`), a read-only-enforcing tool `execute.before` hook, plus configuration transforms |
 | V1 APIs | Registered | Own tool definitions via `ctx.tool.transform()` — not the V1 plugin path |
 
 The V2 plugin provides 3 orchestration tools (`hashline_edit`, `pantheon_cost`,
@@ -315,6 +319,83 @@ registered on V2: the goal loop needs a `GoalStore`, a `GoalLoopClient` and a
 `BackgroundJobBoard`, none of which the V2 `PluginContext` exposes, so the gap
 is reported as the `goal-tools` unsupported-feature marker. Use the V1
 contract if you need the goal loop.
+
+V2 also registers `vision_describe` when `ctx.model.list()` is available. It
+checks the live catalog for image input, prefers the paid OpenCode Go
+`opencode-go/mimo-v2.6-flash` model (free-tier models are excluded from automatic
+selection — the direct gateway rejects them with HTTP 403, they only work from
+inside OpenCode; an explicit `PANTHEON_VISION_MODEL`/config/preset pin is still
+honored, so its 403 surfaces as an actionable error rather than a silent
+substitution), and
+sends the image directly to the authenticated OpenCode Zen endpoint. The request
+carries the live session id as the Zen-only `x-opencode-session` header the
+gateway requires (never sent to a non-Zen provider, and never logged). OpenCode
+credentials come from
+`opencode auth login` or `PANTHEON_OPENCODE_API_KEY`; if no supported model or
+credentials are available, the tool returns an explicit error instead of a
+fabricated description. This path works without the optional V1 bridge.
+The V2 prompt hook also preserves image attachment references and tells Zeus
+to inspect relevant visual context and pass the reference plus concise findings
+to Aphrodite. Inline image bytes are not copied into persisted prompt text, and
+an image does not authorize deleting or reverting unrelated work.
+
+The chat-turn native path picks its vision model in a fixed precedence: the
+`PANTHEON_VISION_MODEL` env var, then `visionModel` in `opencode-vision.json`,
+then the active preset's `vision.model`, then automatic discovery in the host
+provider catalog (`GET /config/providers`), then the built-in default. Discovery
+is conservative and paid-only: it keeps only image-capable entries
+(`capabilities.input.image`) whose provider is a trusted Zen provider or whose
+`npm` package is OpenAI-compatible (`@ai-sdk/openai-compatible` /
+`@ai-sdk/openai`), EXCLUDES free-tier entries (`-free` id or `cost.input <= 0`
+— the direct gateway rejects them with HTTP 403), picks the cheapest remaining
+entry, and caches the catalog for 60
+seconds per process; an incompatible model simply falls through to the vision
+MCP tool. The base URL comes from the catalog entry's `api.url`, and the legacy
+Zen endpoints remain the no-catalog fallback. Credentials follow the endpoint:
+for a Zen endpoint the shared `PANTHEON_OPENCODE_API_KEY` / `OPENCODE_API_KEY`
+env keys are tried first, then the OpenCode auth store (the resolved provider
+first, then the legacy `opencode-go` / `opencode` entries); for a non-Zen
+endpoint only that provider's own auth-store entry is used — the shared env keys
+and the legacy Zen entries are never attached to a non-Zen base URL. An
+explicitly configured, qualifying vision model always wins over discovery — a
+pin that does not qualify (non-Zen, text-only, or absent from the catalog) is
+discarded and the automatic selection takes over. `pantheon-opencode init`
+offers an optional vision step in interactive TTY sessions — automatic discovery
+is the default and writes nothing; pinning merges `visionModel` into the global
+`opencode-vision.json`; non-interactive runs never prompt and never write.
+The `/pantheon-vision` command adds a model picker: `vision-status.mjs --list`
+enumerates image-capable candidates — labelling whether the source is the live
+host catalog or an offline `opencode models` heuristic, plus `free`/`paid` and
+credential presence per provider (never the token) — and `--set` pins the chosen
+`provider/model` with the same atomic merge.
+
+The user's question is injected into the vision prompt on both the native and V2
+paths, trimmed and capped at 2000 characters; the same image asked a different
+question gets a fresh description, while an identical re-ask inside the cache
+TTL reuses the stored text. Native describes are robust by design: the timeout
+scales from a 20-second base at roughly 10 seconds per MB of payload up to a
+300-second ceiling, and a zero-dependency EXIF-orientation check (JPEG) adds a
+textual hint so the vision model describes a rotated or mirrored image upright —
+detection only, pixels are never rewritten, and the orientation is folded into
+the cache key.
+
+Vision degrades through an explicit chain — native → vision MCP tool → local.
+When native is unavailable and the vision MCP tool is absent, the image is
+replaced by deterministic local extraction: dimensions, format and size from the
+PNG/JPEG/GIF/WebP header, dominant colors for RGB/RGBA PNG, and OCR only when a
+`tesseract` binary is on `PATH`. It never fabricates content — the degradation is
+stated explicitly. The `vision_describe` and `vision_ocr` MCP tools degrade to
+that local mode when no gateway credential is configured, with no new
+dependencies. (`vision_analyze` requires a gateway credential and returns an
+explicit error instead.)
+Deliberate trade-offs, recorded so they are not reversed by accident: Pantheon
+describes each image once and keeps the text in history (council 2026-08-03)
+rather than preserving the original image for per-turn re-observation;
+describe-always favors zero added latency over an on-demand `describe_image`
+tool. Multi-turn sanitization (`experimental.chat.messages.transform`) is a
+mandatory invariant — it guarantees `image_url` / `FilePart` payloads never
+reach a text-only provider and is not configurable. Bifrost stays opt-in and
+never the default, per the credential incident in [SECURITY.md](SECURITY.md).
 
 The V2 `execute.before` hook is the read-only enforcement point for that
 surface: the host includes the active agent on the event, a read-only agent
@@ -573,6 +654,27 @@ repository from a sibling directory.
 
 This validates the prepared isolated sandbox only. A PASS is not proof of
 support for every real host or for host configurations that were not exercised.
+
+## Latency benchmark (bench/)
+
+`bench/` measures end-to-end session latency of the installed `opencode` CLI
+with the repo's V2 plugin — the baseline every performance change in a release
+must be compared against. It runs two scenarios N times each, interleaved
+(non-interactive, one fresh sandbox directory per run), collects per-run
+metrics from `opencode.db` in READ-ONLY mode (tokens root + child sessions
+without double counting, tool calls per name, child-session count) and hook
+timings from the `[bench]` lines the plugin appends to `hooks.log`:
+
+```bash
+node bench/bin/bench.mjs            # 5 runs per scenario (A and B), ~1h
+BENCH_MODEL=opencode-go/glm-5.3-flash node bench/bin/bench.mjs   # pin a model
+node bench/bin/bench.mjs --runs 1   # smoke: one run per scenario
+```
+
+Results land in `bench/results/baseline-<git-sha>.json` (median + p80 +
+failures per scenario). Performance PRs must attach the delta versus the
+current baseline. Scenario A performs real web research, so its variance is
+network-dependent and recorded per run.
 
 ## Plugin V2 TypeScript coverage
 

@@ -53,6 +53,10 @@ Com o OpenCode em execução, descreva o resultado que você quer:
 ```
 
 O Pantheon ajuda a transformar esse pedido em um plano e em etapas revisadas.
+Quando você pede um plano ou inicia `/pantheon-deepwork`, Athena devolve o plano
+completo para Zeus, que o apresenta na conversa principal antes de pedir
+aprovação. O pedido de aprovação não ficará separado de um plano escondido na
+conversa de um subagente.
 
 ## Para quem é?
 
@@ -122,7 +126,7 @@ registrados juntos.
 |---|---|---|
 | Chave de config do OpenCode | `plugin` singular | `plugins` plural |
 | Registro Pantheon | `src/plugin.ts` mais `src/plugins/pantheon-hooks.ts` | `pantheon-opencode/plugin-v2` (`src/plugin-v2.ts`) |
-| Contrato de runtime | Plugin Pantheon V1: 6 ferramentas (`hashline_edit`, as 3 ferramentas de goal, `pantheon_cost`, `pantheon_model`), hooks de evento/ferramenta e tratamento de compactação V1 | Plugin V2 completo: 3 ferramentas (`hashline_edit`, `pantheon_cost`, `pantheon_model`), 4 assinaturas de eventos, session hooks (`prompt`, `context`), um hook de ferramenta `execute.before` que impõe sessões somente-leitura, além de transforms de configuração |
+| Contrato de runtime | Plugin Pantheon V1: 6 ferramentas (`hashline_edit`, as 3 ferramentas de goal, `pantheon_cost`, `pantheon_model`), hooks de evento/ferramenta e tratamento de compactação V1 | Plugin V2 completo: 3 ferramentas de orquestração mais `vision_describe` quando o catálogo de modelos está disponível, 5 assinaturas de eventos, session hooks (`prompt`, `context`), um hook `execute.before` que impõe sessões somente-leitura, além de transforms de configuração |
 | APIs V1 | Registradas | Definições próprias de ferramentas via `ctx.tool.transform()` — não pelo caminho do plugin V1 |
 
 O plugin V2 fornece 3 ferramentas de orquestração (`hashline_edit`,
@@ -134,6 +138,78 @@ registradas no V2: o goal loop precisa de um `GoalStore`, de um
 `GoalLoopClient` e de um `BackgroundJobBoard`, nenhum dos quais o
 `PluginContext` do V2 expõe, então a lacuna é reportada como o marcador de
 recurso sem suporte `goal-tools`. Use o contrato V1 se precisar do goal loop.
+
+O V2 também registra `vision_describe` quando `ctx.model.list()` está
+disponível. A ferramenta verifica a entrada de imagem no catálogo atual,
+prioriza o modelo pago `opencode-go/mimo-v2.6-flash` (modelos free-tier são
+excluídos da seleção automática — o gateway direto os rejeita com HTTP 403, só
+funcionam de dentro do OpenCode; um pin explícito em
+`PANTHEON_VISION_MODEL`/config/preset continua sendo honrado, então seu 403 vira
+um erro acionável em vez de uma troca silenciosa) e envia a imagem
+diretamente ao endpoint autenticado do OpenCode Zen. A requisição carrega o
+session id vivo no header Zen-only `x-opencode-session` exigido pelo gateway
+(nunca enviado a um provider não-Zen, e nunca logado). As credenciais vêm de
+`opencode auth login` ou `PANTHEON_OPENCODE_API_KEY`; sem modelo compatível ou
+credenciais, a ferramenta retorna um erro explícito em vez de inventar uma
+descrição. Esse caminho funciona sem a ponte V1 opcional.
+O hook de prompt V2 também preserva as referências dos anexos e orienta Zeus a
+inspecionar imagens relevantes e repassar a referência e observações concisas a
+Aphrodite. Bytes inline não são copiados para o texto persistido do prompt, e a
+imagem não autoriza apagar nem reverter alterações fora do escopo.
+
+O caminho nativo do turno de chat escolhe o modelo de visão numa precedência
+fixa: a variável `PANTHEON_VISION_MODEL`, depois `visionModel` em
+`opencode-vision.json`, depois `vision.model` do preset ativo, depois descoberta
+automática no catálogo de providers do host (`GET /config/providers`) e, por
+fim, o padrão embutido. A descoberta é conservadora e somente paga: mantém
+apenas entradas com imagem (`capabilities.input.image`) cujo provider é Zen
+confiável ou cujo pacote `npm` é OpenAI-compatível (`@ai-sdk/openai-compatible` /
+`@ai-sdk/openai`), EXCLUI entradas free-tier (`-free` ou `cost.input <= 0` — o
+gateway direto as rejeita com HTTP 403), escolhe a entrada mais barata restante
+e faz cache do catálogo por 60
+segundos por processo; um modelo incompatível simplesmente cai no fallback da
+tool MCP de visão. A base URL vem do `api.url` da entrada do catálogo, e os
+endpoints Zen legados permanecem como fallback quando não há catálogo. As
+credenciais seguem o endpoint: para um endpoint Zen, as variáveis compartilhadas
+`PANTHEON_OPENCODE_API_KEY` / `OPENCODE_API_KEY` são tentadas primeiro e depois o
+auth store do OpenCode (o provider resolvido primeiro, depois as entradas legadas
+`opencode-go` / `opencode`); para um endpoint não-Zen, apenas a entrada do próprio
+provider no auth store é usada — as variáveis compartilhadas e as entradas Zen
+legadas nunca são anexadas a uma base URL não-Zen. Um modelo de visão
+configurado explicitamente e qualificado sempre vence a descoberta — um pin que
+não qualifica (não-Zen, text-only ou fora do catálogo) é descartado e a seleção
+automática assume. O `pantheon-opencode init` oferece um
+passo opcional de vision em sessões TTY interativas — a descoberta automática é
+o default e não grava nada; pinar faz merge de `visionModel` no
+`opencode-vision.json` global; fluxos não-interativos nunca perguntam nem gravam.
+
+A pergunta do usuário é injetada no prompt de visão nos caminhos nativo e V2,
+aparada e limitada a 2000 caracteres; a mesma imagem com uma pergunta diferente
+gera nova descrição, enquanto uma repetição idêntica dentro do TTL de cache
+reutiliza o texto guardado. O describe nativo é robusto por construção: o
+timeout escala de uma base de 20 segundos a cerca de 10 segundos por MB de
+payload até um teto de 300 segundos, e uma checagem de orientação EXIF sem
+dependências (JPEG) adiciona uma dica textual para o vision model descrever a
+imagem rotacionada ou espelhada na posição correta — só detecção, os pixels
+nunca são reescritos, e a orientação entra na chave do cache.
+
+A visão degrada numa cadeia explícita — nativa → tool MCP de visão → local.
+Quando a nativa está indisponível e a tool MCP de visão não está presente, a
+imagem é substituída por extração local determinística: dimensões, formato e
+tamanho do header PNG/JPEG/GIF/WebP, cores dominantes para PNG RGB/RGBA e OCR
+somente quando o binário `tesseract` está no `PATH`. Nunca fabrica conteúdo — a
+degradação é declarada explicitamente. As tools `vision_describe` e `vision_ocr`
+do MCP degradam para esse modo local quando não há credencial de gateway, sem
+dependências novas. (A `vision_analyze` exige credencial de gateway e retorna um
+erro explícito.) Trade-offs deliberados, registrados para não serem
+revertidos por acidente: o Pantheon descreve cada imagem uma vez e mantém o
+texto no histórico (council 2026-08-03) em vez de preservar a imagem original
+para re-observação a cada turno; o describe-always prioriza latência zero em vez
+de uma tool `describe_image` sob demanda. A sanitização multi-turno
+(`experimental.chat.messages.transform`) é invariante obrigatória — garante que
+`image_url` / `FilePart` nunca cheguem a um provider textual e não é
+configurável. O Bifrost permanece opt-in, nunca padrão, conforme o incidente de
+credencial em [SECURITY.md](SECURITY.md).
 
 O hook `execute.before` do V2 é o ponto de imposição de sessões somente-leitura
 dessa superfície: o host inclui o agente ativo no evento, um agente somente-leitura
@@ -334,6 +410,28 @@ de testar silenciosamente a instalação do host.
 
 Isso valida somente o sandbox isolado e preparado. Um PASS não prova suporte
 para todo host real nem para configurações de host que não foram exercitadas.
+
+## Benchmark de latência (bench/)
+
+O `bench/` mede a latência de sessão de ponta a ponta do CLI `opencode`
+instalado com o plugin V2 do repositório — o baseline contra o qual toda
+mudança de performance de uma release deve ser comparada. Executa dois
+cenários N vezes cada, intercalados (não-interativo, um diretório de sandbox
+novo por run), coleta métricas por run do `opencode.db` em modo READ-ONLY
+(tokens root + sessões filhas sem dupla contagem, tool calls por nome, número
+de sessões filhas) e tempos de hook das linhas `[bench]` que o plugin anexa ao
+`hooks.log`:
+
+```bash
+node bench/bin/bench.mjs            # 5 runs por cenário (A e B), ~1h
+BENCH_MODEL=opencode-go/glm-5.3-flash node bench/bin/bench.mjs   # fixar modelo
+node bench/bin/bench.mjs --runs 1   # smoke: um run por cenário
+```
+
+Os resultados vão para `bench/results/baseline-<git-sha>.json` (mediana +
+p80 + falhas por cenário). PRs de performance devem anexar o delta contra o
+baseline vigente. O cenário A faz pesquisa web real, então a variância de rede
+é registrada por run.
 
 ## Cobertura TypeScript do Plugin V2
 

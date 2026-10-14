@@ -18,6 +18,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## ✅ Closed Issues
 
+## [v1.6.0-beta.10] - 2026-10-12
+
+&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
+     move this section to a versioned entry and reset the template below. --&gt;
+
+## 🆕 What's New
+
+- **Visible plan approval:** Zeus displays Athena's complete plan in the main
+  conversation before requesting approval, including for `/pantheon-deepwork`.
+- **OpenCode V2 Vision:** adds `vision_describe` using the live image-capable
+  model catalog and OpenCode Zen authentication; relative image paths resolve
+  from the active project directory.
+
 ## [v1.6.0-beta.9] - 2026-10-12
 
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
