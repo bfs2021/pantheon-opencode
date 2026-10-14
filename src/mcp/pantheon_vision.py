@@ -15,6 +15,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -59,9 +60,24 @@ if not _logger.handlers:
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 20.0
 HTTP_ERROR_STATUS = 400
+HTTP_BAD_REQUEST = 400
+HTTP_UNAUTHORIZED = 401
+HTTP_FORBIDDEN = 403
 DEFAULT_MODEL = "opencode-go/mimo-v2.5"
 GO_ENDPOINT = "https://opencode.ai/zen/go/v1/chat/completions"
 OPENCODE_ENDPOINT = "https://opencode.ai/zen/v1/chat/completions"
+# The Zen gateway rejects a sessionless request with HTTP 400 MissingSessionID.
+# Only Zen endpoints accept (and require) this header; it is never sent
+# elsewhere.
+SESSION_HEADER = "x-opencode-session"
+_ZEN_ENDPOINT_PREFIX = "https://opencode.ai/zen/"
+# A session id is an opaque OpenCode token. Only the characters real ids use
+# (`ses_...`) plus the separators existing callers already pass are accepted;
+# the length is bounded. Anything else — empty, whitespace, control characters,
+# quotes, CR/LF — is rejected instead of being copied into the header, where a
+# CRLF would split it and let a caller inject extra headers/requests.
+_SESSION_ID_MAX_LENGTH = 128
+_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]+")
 _ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 _EXTENSION_MIME_TYPES = {
     ".png": "image/png",
@@ -269,6 +285,36 @@ def _endpoint_for_model(model: str) -> str:
     return OPENCODE_ENDPOINT if model.startswith("opencode/") else GO_ENDPOINT
 
 
+def _is_zen_endpoint(endpoint: str) -> bool:
+    """Return whether ``endpoint`` is an OpenCode Zen gateway URL.
+
+    The destination host is the security boundary for the
+    ``x-opencode-session`` header: the session identity must reach a Zen
+    endpoint and nothing else. This is a prefix check (not equality) so a
+    self-hosted Zen path still qualifies while a non-Zen URL never does.
+    """
+    return endpoint.startswith(_ZEN_ENDPOINT_PREFIX)
+
+
+def _validated_session_id(value: object) -> str | None:
+    """Return a session id safe to send in the Zen header, or None.
+
+    The value arrives from a tool parameter the plugin forwards (a local MCP
+    process is not handed a session id by the host), so it is untrusted input:
+    only a trimmed, bounded, token-shaped value is accepted. An empty or
+    whitespace-only string, a control character, a quote, or an embedded
+    CR/LF yields None so the header is simply omitted — never copied verbatim.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or len(candidate) > _SESSION_ID_MAX_LENGTH:
+        return None
+    if _SESSION_ID_PATTERN.fullmatch(candidate) is None:
+        return None
+    return candidate
+
+
 def _strip_provider_prefix(model: str) -> str:
     """Return the model ID without its provider prefix.
 
@@ -283,19 +329,39 @@ def _strip_provider_prefix(model: str) -> str:
 
 
 def _opencode_data_dir() -> Path:
-    """Locate the OpenCode data directory on either V1 or V2 hosts."""
-    return Path.home() / ".local" / "share" / "opencode"
+    """Locate the OpenCode data directory on either V1 or V2 hosts.
+
+    Honors ``XDG_DATA_HOME`` (``$XDG_DATA_HOME/opencode`` when set, else
+    ``~/.local/share/opencode``) so a relocated data root resolves the same
+    stores as the plugin. ``OPENCODE_DB`` still names the exact credential db.
+    """
+    data_home = os.getenv("XDG_DATA_HOME", "").strip()
+    base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return base / "opencode"
+
+
+def _credential_db_path() -> Path:
+    """Path to the OpenCode V2 credential database.
+
+    ``OPENCODE_DB`` names the exact file when the host relocated it (e.g. a
+    sandbox with its own db); otherwise the default ``<data dir>/opencode.db``
+    sibling of the V1 ``auth.json`` is used.
+    """
+    override = os.getenv("OPENCODE_DB", "").strip()
+    if override:
+        return Path(override)
+    return _opencode_data_dir() / "opencode.db"
 
 
 def _key_from_credential_db(provider: str) -> str | None:
     """Read a provider key from the V2 SQLite credential store.
 
     OpenCode V2 moved credentials out of ``<data dir>/auth.json`` and into a
-    ``credential`` table in ``<data dir>/opencode.db``; the V1 JSON file no
-    longer exists on a V2 host, so reading it alone left auth silently
-    unresolvable. The value is plaintext JSON of the form
-    ``{"type": "key", "key": "..."}``, so the stdlib is sufficient — no new
-    dependency.
+    ``credential`` table in the OpenCode database (``OPENCODE_DB``, else
+    ``<data dir>/opencode.db``); the V1 JSON file no longer exists on a V2
+    host, so reading it alone left auth silently unresolvable. The value is
+    plaintext JSON of the form ``{"type": "key", "key": "..."}``, so the
+    stdlib is sufficient — no new dependency.
 
     The database is opened read-only via a URI so a missing or locked file
     cannot be created or mutated by a health check.
@@ -306,7 +372,7 @@ def _key_from_credential_db(provider: str) -> str | None:
     Returns:
         The stored key, or None when the store, table, row, or key is absent.
     """
-    db_path = _opencode_data_dir() / "opencode.db"
+    db_path = _credential_db_path()
     if not db_path.is_file():
         return None
     uri = f"file:{db_path}?mode=ro"
@@ -343,9 +409,9 @@ def _resolve_auth() -> tuple[str | None, str]:
     4. a legacy V1 ``<data dir>/auth.json`` file, for hosts that still have one
 
     The V1 file is checked last and only when it exists; it is absent on a V2
-    host. When no source yields a key this returns None and the caller raises,
-    so the failure names the paths and env vars that were tried rather than
-    surfacing as a confusing 401 from the gateway.
+    host. When no source yields a key this returns ``None`` silently: the
+    graceful callers (``vision_describe`` / ``vision_ocr``) degrade to local
+    extraction, and only the fatal gateway path logs the paths/env vars tried.
     """
     model = os.getenv("PANTHEON_VISION_MODEL") or DEFAULT_MODEL
     env_key = os.getenv("PANTHEON_OPENCODE_API_KEY") or os.getenv("OPENCODE_API_KEY")
@@ -375,14 +441,6 @@ def _resolve_auth() -> tuple[str | None, str]:
                 if key:
                     return key, endpoint
 
-    _logger.error(
-        "No OpenCode credential found. Set PANTHEON_OPENCODE_API_KEY (or "
-        "OPENCODE_API_KEY), or store a key for 'opencode-go' in %s "
-        "(tried: env, the credential table in %s, and the legacy %s).",
-        _opencode_data_dir() / "opencode.db",
-        _opencode_data_dir() / "opencode.db",
-        auth_path,
-    )
     return None, _endpoint_for_model(model)
 
 
@@ -403,6 +461,86 @@ def _metadata(image: ImageInput) -> dict[str, Any]:
         "height": image.height,
         "dimensions": dimensions,
     }
+
+
+def _local_fallback_note() -> str:
+    """Local-fallback guidance naming the EFFECTIVE credential database path.
+
+    Built at call time (not a module constant) so a relocated host — via
+    ``OPENCODE_DB`` or ``XDG_DATA_HOME`` — points the operator at the file the
+    resolver actually reads, matching the ``_gateway`` diagnostics.
+    """
+    return (
+        "Gateway de visão indisponível (sem credencial). Usando extração local "
+        "(metadados + best-effort), sem conteúdo inventado. Rode `opencode auth "
+        "login`, configure PANTHEON_OPENCODE_API_KEY ou OPENCODE_API_KEY, ou "
+        f"guarde uma chave para 'opencode-go' em {_credential_db_path()}."
+    )
+
+
+def _image_bytes(image: ImageInput) -> bytes | None:
+    """Return the decoded bytes of an in-memory image source, else None.
+
+    Only data URIs carry bytes locally. Remote URLs are intentionally not
+    fetched here: the local fallback must stay offline and deterministic.
+    """
+    if not image.source.startswith("data:"):
+        return None
+    _header, separator, encoded = image.source.partition(",")
+    if not separator:
+        return None
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def _ocr_bytes(data: bytes) -> str | None:
+    """Best-effort OCR via pytesseract when it is installed.
+
+    The optional dependency is import-guarded: no pytesseract/Pillow is required
+    (neither is added to requirements-vision.txt). Any failure yields None so
+    the caller degrades to metadata-only instead of inventing text.
+    """
+    try:
+        import io  # noqa: PLC0415
+
+        import pytesseract  # noqa: PLC0415
+        from PIL import Image as PILImage  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        with PILImage.open(io.BytesIO(data)) as opened:
+            text = pytesseract.image_to_string(opened)
+    except Exception:
+        return None
+    stripped = text.strip() if isinstance(text, str) else ""
+    return stripped or None
+
+
+def _local_vision_text(image: ImageInput) -> str:
+    """Deterministic local fallback: metadata, plus OCR when available.
+
+    Never fabricates a description; when pytesseract is absent it states so.
+    """
+    metadata = _metadata(image)
+    dims = (
+        f"{metadata['width']}x{metadata['height']}"
+        if metadata["dimensions"]
+        else "dimensões desconhecidas"
+    )
+    size = metadata["size"]
+    size_text = f"{size} bytes" if isinstance(size, int) else "tamanho desconhecido"
+    data = _image_bytes(image)
+    ocr_text = _ocr_bytes(data) if data is not None else None
+    lines = [
+        f"Imagem local: {dims} {metadata['mime']}, {size_text}.",
+        f"Texto OCR: {ocr_text}"
+        if ocr_text
+        else "Texto OCR: indisponível (tesseract/pytesseract não instalado).",
+        _local_fallback_note(),
+    ]
+    return "\n".join(lines)
 
 
 def _content_text(value: Any) -> str:
@@ -465,14 +603,66 @@ def _parse_json_object(value: str) -> dict[str, Any] | None:
     return None
 
 
-async def _gateway(image: ImageInput, prompt: str, *, structured: bool = False) -> str:
-    """Send one multimodal request to the selected OpenCode gateway."""
+def _gateway_http_error(status: int) -> str:
+    """Actionable, non-sensitive VisionError text for a gateway HTTP failure.
+
+    Maps the known Zen failures: 400 ``MissingSessionID`` (session header
+    absent), 401 (credential/model), 403 (free-tier model usable only from
+    inside OpenCode, or no paid access). Never includes the credential, image
+    payload, or session id.
+    """
+    if status == HTTP_BAD_REQUEST:
+        return (
+            "Vision gateway rejected the request (HTTP 400 MissingSessionID): "
+            "the x-opencode-session header is missing — call the tool from an "
+            "OpenCode session so the session id can be forwarded."
+        )
+    if status == HTTP_UNAUTHORIZED:
+        return "Vision gateway rejected the credential (HTTP 401)."
+    if status == HTTP_FORBIDDEN:
+        return (
+            "Vision gateway denied access (HTTP 403): the model may be "
+            "free-tier (usable only from inside OpenCode) or this account has "
+            "no paid access to it."
+        )
+    return "Vision gateway returned an HTTP error."
+
+
+async def _gateway(
+    image: ImageInput,
+    prompt: str,
+    *,
+    structured: bool = False,
+    session_id: str | None = None,
+) -> str:
+    """Send one multimodal request to the selected OpenCode gateway.
+
+    ``session_id`` (when present and valid — see ``_validated_session_id``) is
+    sent as the ``x-opencode-session`` header — and ONLY for a Zen endpoint,
+    which rejects the request with HTTP 400 ``MissingSessionID`` otherwise. An
+    unusable value (empty, whitespace, control characters, CR/LF, quotes) is
+    dropped rather than copied into the header. It is never logged and never
+    sent to a non-Zen host.
+    """
     key, endpoint = _resolve_auth()
     if not key:
+        # Missing credential is FATAL here (unlike the graceful describe/ocr
+        # local fallback), so this is the one place that logs the sources tried.
+        db_path = _credential_db_path()
+        auth_path = _opencode_data_dir() / "auth.json"
+        _logger.error(
+            "No OpenCode credential found. Run `opencode auth login`, set "
+            "PANTHEON_OPENCODE_API_KEY (or OPENCODE_API_KEY), or store a key "
+            "for 'opencode-go' in %s (tried: env, the credential table in %s, "
+            "and the legacy %s).",
+            db_path,
+            db_path,
+            auth_path,
+        )
         raise VisionError(
-            "OpenCode API key not configured. Set PANTHEON_OPENCODE_API_KEY or "
-            "OPENCODE_API_KEY, or store a key for 'opencode-go' in the OpenCode "
-            "credential database (~/.local/share/opencode/opencode.db). "
+            "OpenCode credential not configured. Run `opencode auth login`, "
+            "set PANTHEON_OPENCODE_API_KEY or OPENCODE_API_KEY, or store a key "
+            f"for 'opencode-go' in the OpenCode credential database ({db_path}). "
             "See the pantheon.vision error log for the paths tried."
         )
     safe_prompt = prompt.replace(key, "[redacted]")
@@ -486,21 +676,25 @@ async def _gateway(image: ImageInput, prompt: str, *, structured: bool = False) 
     }
     if structured:
         body["response_format"] = {"type": "json_object"}
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    safe_session_id = _validated_session_id(session_id)
+    if safe_session_id is not None and _is_zen_endpoint(endpoint):
+        headers[SESSION_HEADER] = safe_session_id
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 endpoint,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=body,
             )
         if response.status_code >= HTTP_ERROR_STATUS:
             # Sanitized diagnostic: status, endpoint, bare model, truncated
             # gateway detail (scrubbed), and a body summary with no keys or
             # image bytes. Logged to stderr so the MCP stdio protocol is
-            # never corrupted.
+            # never corrupted. The session id is NEVER logged.
             detail = _scrub(str(getattr(response, "text", "")), key)
             _logger.warning(
                 "vision gateway error status=%s endpoint=%s model=%s detail=%s body=%s",
@@ -510,15 +704,30 @@ async def _gateway(image: ImageInput, prompt: str, *, structured: bool = False) 
                 detail[:200] or "no detail",
                 json.dumps(_sanitized_gateway_body(body)),
             )
-            raise VisionError("Vision gateway returned an HTTP error.")
+            raise VisionError(_gateway_http_error(response.status_code))
         payload = response.json()
         choices = payload.get("choices") if isinstance(payload, dict) else None
-        message = choices[0].get("message") if choices else None
+        first_choice = choices[0] if isinstance(choices, list) and choices else None
+        message = (
+            first_choice.get("message") if isinstance(first_choice, dict) else None
+        )
         text = _content_text(
             message.get("content") if isinstance(message, dict) else ""
         )
         if not text:
-            raise VisionError("Vision gateway returned an empty response.")
+            # Surface finish_reason (e.g. `length`) so a reasoning model cut off
+            # by max_tokens yields an actionable message, not a bare "empty".
+            finish = (
+                first_choice.get("finish_reason")
+                if isinstance(first_choice, dict)
+                else None
+            )
+            suffix = (
+                f" (finish_reason: {finish})"
+                if isinstance(finish, str) and finish
+                else ""
+            )
+            raise VisionError(f"Vision gateway returned an empty response{suffix}.")
         return _scrub(text, key)
     except VisionError:
         raise
@@ -563,21 +772,50 @@ _ANALYZE_PROMPT = (
 
 
 @mcp.tool(description="Describe an image faithfully using the Pantheon vision gateway.")
-async def vision_describe(path: str, prompt: str | None = None) -> str:
-    """Describe image content, text, layout, objects, and uncertainty."""
+async def vision_describe(
+    path: str, prompt: str | None = None, session_id: str | None = None
+) -> str:
+    """Describe image content, text, layout, objects, and uncertainty.
+
+    When no gateway credential is available the tool degrades to a
+    deterministic local extraction (metadata + best-effort OCR) instead of
+    failing outright; it never returns an invented description.
+
+    ``session_id`` is the caller's OpenCode session id. The Zen gateway rejects
+    a sessionless request (HTTP 400 MissingSessionID); the plugin forwards it
+    through the tool call because a local MCP process is not handed one by the
+    host. It is sent only to a Zen endpoint and never logged.
+    """
     try:
         image = await _prepare_input(path)
-        return await _gateway(image, prompt or _DESCRIBE_PROMPT)
+    except Exception as exc:
+        return _error_message(exc)
+    key, _endpoint = _resolve_auth()
+    if not key:
+        return _local_vision_text(image)
+    try:
+        return await _gateway(image, prompt or _DESCRIBE_PROMPT, session_id=session_id)
     except Exception as exc:
         return _error_message(exc)
 
 
 @mcp.tool(description="Extract visible text from an image with OCR.")
-async def vision_ocr(path: str) -> str:
-    """Transcribe visible image text while preserving line formatting."""
+async def vision_ocr(path: str, session_id: str | None = None) -> str:
+    """Transcribe visible image text while preserving line formatting.
+
+    Falls back to local, best-effort OCR (metadata + pytesseract when installed)
+    when no gateway credential is configured. ``session_id`` reaches the Zen
+    gateway as the ``x-opencode-session`` header (see ``vision_describe``).
+    """
     try:
         image = await _prepare_input(path)
-        return await _gateway(image, _OCR_PROMPT)
+    except Exception as exc:
+        return _error_message(exc)
+    key, _endpoint = _resolve_auth()
+    if not key:
+        return _local_vision_text(image)
+    try:
+        return await _gateway(image, _OCR_PROMPT, session_id=session_id)
     except Exception as exc:
         return _error_message(exc)
 
@@ -585,11 +823,17 @@ async def vision_ocr(path: str) -> str:
 @mcp.tool(
     description="Analyze an image and return metadata, description, and OCR as JSON."
 )
-async def vision_analyze(path: str) -> str:
-    """Return local metadata plus one structured description/OCR gateway call."""
+async def vision_analyze(path: str, session_id: str | None = None) -> str:
+    """Return local metadata plus one structured description/OCR gateway call.
+
+    ``session_id`` reaches the Zen gateway as the ``x-opencode-session`` header
+    (see ``vision_describe``).
+    """
     try:
         image = await _prepare_input(path)
-        content = await _gateway(image, _ANALYZE_PROMPT, structured=True)
+        content = await _gateway(
+            image, _ANALYZE_PROMPT, structured=True, session_id=session_id
+        )
         parsed = _parse_json_object(content)
         if parsed is None:
             parsed = {"description": content, "ocr": "No structured OCR was returned."}

@@ -1069,7 +1069,7 @@ test('T27: applyPreset openai luna-fast fallback to luna low', () => {
 // ─── T28: resolveActivePreset returns vision fallback per preset ───────
 test('T28: resolveActivePreset returns vision for all 4 presets', () => {
   const expected = {
-    'go-free': { model: 'opencode/mimo-v2.5-free', reasoning_effort: 'low' },
+    'go-free': { model: 'opencode/mimo-v2.6-flash-free', reasoning_effort: 'low' },
     'go-fast': { model: 'opencode-go/mimo-v2.5', reasoning_effort: 'low' },
     'go-premium': { model: 'opencode-go/gpt-5.6-sol', reasoning_effort: 'high' },
     openai: { model: 'openai/gpt-5.6-sol', reasoning_effort: 'high' },
@@ -1097,6 +1097,7 @@ test('T29: hasVision matrix (image input per CAPABILITY_TABLE)', () => {
   assert.equal(presets.hasVision('opencode-go/qwen3.7-max'), false)
   assert.equal(presets.hasVision('opencode-go/minimax-m3'), true)
   assert.equal(presets.hasVision('opencode/mimo-v2.5-free'), true)
+  assert.equal(presets.hasVision('opencode/mimo-v2.6-flash-free'), true)
   assert.equal(presets.hasVision('opencode-go/glm-5.3-flash'), false)
   assert.equal(presets.hasVision('opencode-go/kimi-k2.7-code'), false)
   assert.equal(presets.hasVision('opencode-go/kimi-k3'), false)

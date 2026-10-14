@@ -21,7 +21,7 @@ manifest in `src/mcp/`.
 | **pantheon-code-mode** | 1 | 1 static + 1 template | Confined script execution from `.pantheon/code-mode/` |
 | **pantheon-memory** | 9 | 2 static | Persistent memory with FTS5 keyword search, recall, knowledge graph (6 `memory_*` + 3 `code_*`) |
 | **pantheon-persistence** | 14 | — | Namespaced key-value storage with FTS5 search and TTL (8 `kv_*`/`purge_*` + 6 `context_*`) |
-| **pantheon-vision** | 3 | — | Image description, OCR, and structured analysis through OpenCode |
+| **pantheon-vision** | 3 | — | Image description, OCR, and structured analysis through OpenCode, with a deterministic local fallback |
 
 ---
 
@@ -256,14 +256,56 @@ a second source copy under `scripts/`.
 
 | Tool | Description |
 |------|-------------|
-| `vision_describe(path, prompt?)` | Describe image content, text, layout, and objects |
-| `vision_ocr(path)` | Extract visible text |
-| `vision_analyze(path)` | Return metadata, description, and OCR as JSON |
+| `vision_describe(path, prompt?, session_id?)` | Describe image content, text, layout, and objects |
+| `vision_ocr(path, session_id?)` | Extract visible text |
+| `vision_analyze(path, session_id?)` | Return metadata, description, and OCR as JSON |
+
+`session_id` is the caller's OpenCode session id. This MCP runs in a separate
+process the host hands no session id to, so the plugin forwards it through the
+tool call; the server sends it to a Zen endpoint as the required
+`x-opencode-session` header (never to a non-Zen host, and never logged).
 
 The server resolves `PANTHEON_OPENCODE_API_KEY` or `OPENCODE_API_KEY`, then the
-standard OpenCode auth store. The plugin uses native vision as a fast-path and
-injects this MCP when native vision is unavailable. Bifrost is opt-in only via
-`PANTHEON_VISION_TOOL` or an explicit `imageAnalysisTool` configuration.
+standard OpenCode auth store. This server always talks to the OpenCode Zen
+endpoints, so that legacy precedence applies here; the plugin's native path only
+uses the shared env keys and the legacy `opencode-go` / `opencode` auth entries
+for Zen endpoints (a non-Zen endpoint uses its own auth-store entry). The plugin
+uses native vision as a fast-path and injects this MCP when native vision is
+unavailable. Bifrost is opt-in only via `PANTHEON_VISION_TOOL` or an explicit
+`imageAnalysisTool` configuration.
+
+### Model precedence and discovery
+
+When no model is configured explicitly, the native path resolves it in order:
+`PANTHEON_VISION_MODEL` env > `visionModel` in `opencode-vision.json` > the
+active preset's `vision.model` > automatic discovery in the host provider
+catalog (`GET /config/providers`) > the built-in default. Discovery keeps only
+image-capable, wire-compatible entries — a trusted Zen provider, or a provider
+whose `npm` package is `@ai-sdk/openai-compatible` / `@ai-sdk/openai` —
+excluding free-tier entries (`-free` id or `cost.input === 0`, which the direct
+gateway rejects with HTTP 403) and caching the catalog for 60 seconds per
+process. The base URL comes from the catalog entry (`api.url`); the legacy Zen
+endpoints remain the no-catalog fallback. Credentials follow the endpoint: a Zen
+endpoint may use the shared `PANTHEON_OPENCODE_API_KEY` / `OPENCODE_API_KEY` env
+keys and the legacy `opencode-go` / `opencode` auth entries, while a non-Zen
+endpoint uses ONLY its own auth-store entry (never the Zen env keys or legacy
+entries). An explicitly configured model always wins over discovery, and an
+incompatible model falls through to this MCP tool. A Zen request carries the
+`x-opencode-session` header (the gateway requires it); a non-Zen host never does.
+
+### Degradation chain
+
+Images flow through three rungs: native model → this MCP server → local. When
+native vision is unavailable and this server is not connected, the image is
+replaced by deterministic local extraction — dimensions, format and size from
+the PNG/JPEG/GIF/WebP header, dominant colors for RGB/RGBA PNG, and OCR only
+when a `tesseract` binary is on `PATH`. It reports only what the bytes contain
+and never fabricates content. The `vision_describe` and `vision_ocr` tools also
+degrade to that local mode when no gateway credential is configured, returning
+metadata (and best-effort OCR) instead of an error; no new dependency is added.
+
+Bifrost remains opt-in only, never the default, per the credential incident in
+[SECURITY.md](../SECURITY.md).
 
 ---
 
@@ -314,4 +356,5 @@ governs how you stop a process.
 | `memory_recall` returns empty | No entries stored yet | First call `memory_store` with some content |
 | Code-mode script not found | Wrong path | Script must be in `.pantheon/code-mode/` |
 | Vision server not connecting | Runtime script or Python dependency issue | Run `npm run setup`, then `npm run doctor` |
+| Vision returns metadata only | No gateway credential configured | Set `PANTHEON_OPENCODE_API_KEY` / `OPENCODE_API_KEY` or run `opencode auth login`; the tool degrades to local extraction until then |
 | Path traversal error | Invalid URI segment | Use flat filenames for `pantheon://memory-bank/{path}` (no nested `../`) |

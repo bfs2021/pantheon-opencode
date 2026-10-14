@@ -15,6 +15,8 @@ const returnContract = read('../src/instructions/agent-return-format.instruction
 const routing = read('../src/routing.yml')
 const subtaskPrompt = read('../prompts/subtask.prompt.md')
 const contextCompression = read('../src/skills/context-compression/SKILL.md')
+const zeusPrompt = read('../src/agents/zeus.md')
+const aphroditePrompt = read('../src/agents/aphrodite.md')
 
 function instructionBody(source) {
   return source.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim()
@@ -50,7 +52,25 @@ test('generated line counts use LF boundaries without assuming a final newline',
   assert.equal(logicalLineCount('one\ntwo'), 2)
   assert.equal(logicalLineCount('one'), 1)
   assert.equal(logicalLineCount(''), 0)
-  assert.equal(logicalLineCount(generated), 186)
+  assert.equal(logicalLineCount(generated), 202)
+})
+
+test('Zeus can call the least-privilege Pantheon vision tool for diagnostics', () => {
+  assert.match(zeusPrompt, /pantheon-vision:\s*\[vision_describe\]/)
+  assert.doesNotMatch(zeusPrompt, /pantheon-vision:\s*all/)
+  assert.match(zeusPrompt, /vision_describe:\s*allow/)
+  assert.match(aphroditePrompt, /vision_describe:\s*allow/)
+})
+
+test('Zeus forwards visual context to implementation agents without discarding unrelated work', () => {
+  assert.match(zeusPrompt, /image|screenshot/i)
+  assert.match(zeusPrompt, /vision_describe/)
+  assert.match(zeusPrompt, /Aphrodite/)
+  assert.match(zeusPrompt, /include[\s\S]*image[\s\S]*delegat/i)
+  assert.match(zeusPrompt, /preserv[\s\S]*(?:unrelated|existing)[\s\S]*(?:change|work)/i)
+  assert.match(zeusPrompt, /not[\s\S]*(?:authorize|permission)[\s\S]*delete/i)
+  assert.match(aphroditePrompt, /supplied image\/screenshot/i)
+  assert.match(aphroditePrompt, /preserve unrelated existing work/i)
 })
 
 test('delegation retry guidance uses one retry before protected fallbacks', () => {

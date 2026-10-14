@@ -69,6 +69,10 @@ def clear_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PANTHEON_OPENCODE_API_KEY", raising=False)
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     monkeypatch.delenv("PANTHEON_VISION_MODEL", raising=False)
+    # The default data dir honors XDG_DATA_HOME; clear it so the hermetic
+    # `Path.home` fixture (tmp_path) is the only base picked up.
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
     FakeClient.last_request = {}
     FakeClient.response = FakeResponse()
 
@@ -157,6 +161,191 @@ async def test_auth_store_fallback_and_gateway_request(
     assert body["messages"][0]["content"][1]["image_url"]["url"].startswith("https://")
 
 
+def test_is_zen_endpoint() -> None:
+    assert vision._is_zen_endpoint(vision.GO_ENDPOINT)
+    assert vision._is_zen_endpoint(vision.OPENCODE_ENDPOINT)
+    assert not vision._is_zen_endpoint("https://evil.test/v1/chat/completions")
+
+
+@pytest.mark.asyncio
+async def test_session_header_sent_for_zen_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session id reaches a Zen endpoint as ``x-opencode-session``."""
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+
+    result = await vision.mcp.call_tool(
+        "vision_describe",
+        {"path": "https://example.test/photo.jpg", "session_id": "session-zen"},
+    )
+    assert _tool_text(result) == "A description"
+    assert FakeClient.last_request["headers"][vision.SESSION_HEADER] == "session-zen"
+
+
+@pytest.mark.asyncio
+async def test_session_header_absent_without_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No session id → no header (the MCP never fabricates one)."""
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+
+    await vision.mcp.call_tool(
+        "vision_describe", {"path": "https://example.test/photo.jpg"}
+    )
+    assert vision.SESSION_HEADER not in FakeClient.last_request["headers"]
+
+
+@pytest.mark.asyncio
+async def test_session_header_absent_for_non_zen_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Zen endpoint must never receive the session identity."""
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        vision,
+        "_resolve_auth",
+        lambda: ("test-key", "https://other.test/v1/chat/completions"),
+    )
+
+    await vision.mcp.call_tool(
+        "vision_describe",
+        {"path": "https://example.test/photo.jpg", "session_id": "session-secret"},
+    )
+    assert vision.SESSION_HEADER not in FakeClient.last_request["headers"]
+
+
+@pytest.mark.asyncio
+async def test_session_id_is_never_logged(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failing gateway logs status/model/detail — never the session id."""
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+    FakeClient.response = FakeResponse(status_code=400, content="MissingSessionID")
+
+    result = await vision.mcp.call_tool(
+        "vision_describe",
+        {"path": "https://example.test/photo.jpg", "session_id": "session-do-not-log"},
+    )
+    assert "MissingSessionID" in _tool_text(result)
+    assert "session-do-not-log" not in capsys.readouterr().err
+
+
+def test_validated_session_id_accepts_tokens_and_rejects_header_injection() -> None:
+    """Only a trimmed, token-shaped, bounded id is accepted for the header."""
+    assert vision._validated_session_id("ses_abc123") == "ses_abc123"
+    assert vision._validated_session_id("  ses_abc123  ") == "ses_abc123"
+    assert vision._validated_session_id("session-zen") == "session-zen"
+    # Unusable values must be dropped, never copied into a header.
+    for bad in [
+        None,
+        "",
+        "   ",
+        "bad\r\nX-Injected: 1",
+        "bad\nX-Injected: 1",
+        'quote"id',
+        "has space",
+        "with\tcontrol",
+        "ctrl\x00null",
+        "a" * (vision._SESSION_ID_MAX_LENGTH + 1),
+        123,
+    ]:
+        assert vision._validated_session_id(bad) is None, f"accepted: {bad!r}"
+
+
+@pytest.mark.asyncio
+async def test_malicious_session_id_never_reaches_the_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CRLF/quote session id must not leak into the Zen header (no spoofing).
+
+    A raw CRLF would split the header and let the caller inject extra
+    headers/requests; a quote could break the header framing. The value is
+    validated first, so the header is simply omitted.
+    """
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+
+    for malicious in [
+        "inj\r\nX-Injected: 1",
+        'quote"id',
+        "with space",
+        "",
+        "   ",
+        "ctrl\x00null",
+    ]:
+        FakeClient.last_request = {}
+        await vision.mcp.call_tool(
+            "vision_describe",
+            {"path": "https://example.test/photo.jpg", "session_id": malicious},
+        )
+        headers = FakeClient.last_request["headers"]
+        assert vision.SESSION_HEADER not in headers, f"header spoofed by {malicious!r}"
+        assert not any(
+            "X-Injected" in key or "X-Injected" in str(value)
+            for key, value in headers.items()
+        ), f"injected header present for {malicious!r}"
+
+    # The positive control: a valid token still reaches the Zen header.
+    FakeClient.last_request = {}
+    await vision.mcp.call_tool(
+        "vision_describe",
+        {"path": "https://example.test/photo.jpg", "session_id": "ses_valid123"},
+    )
+    assert FakeClient.last_request["headers"][vision.SESSION_HEADER] == "ses_valid123"
+
+
+@pytest.mark.asyncio
+async def test_gateway_status_maps_to_actionable_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """400/403 gateway errors name the actionable cause."""
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+
+    FakeClient.response = FakeResponse(status_code=400, content="MissingSessionID")
+    missing = await vision.mcp.call_tool(
+        "vision_describe", {"path": "https://example.test/photo.jpg"}
+    )
+    assert "HTTP 400" in _tool_text(missing)
+    assert "MissingSessionID" in _tool_text(missing)
+
+    FakeClient.response = FakeResponse(status_code=403, content="free tier")
+    denied = await vision.mcp.call_tool(
+        "vision_describe", {"path": "https://example.test/photo.jpg"}
+    )
+    assert "HTTP 403" in _tool_text(denied)
+    assert "free-tier" in _tool_text(denied)
+
+
+@pytest.mark.asyncio
+async def test_empty_response_surfaces_finish_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning model cut off by max_tokens yields an actionable message."""
+
+    class _EmptyLengthResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "choices": [{"message": {"content": None}, "finish_reason": "length"}]
+            }
+
+    monkeypatch.setenv("PANTHEON_OPENCODE_API_KEY", "test-key")
+    monkeypatch.setattr(vision.httpx, "AsyncClient", FakeClient)
+    FakeClient.response = _EmptyLengthResponse()
+
+    result = await vision.mcp.call_tool(
+        "vision_describe", {"path": "https://example.test/photo.jpg"}
+    )
+    assert "finish_reason: length" in _tool_text(result)
+
+
 def _seed_credential_db(
     data_dir: Path, integration_id: str, key: str, active: int = 1
 ) -> None:
@@ -240,23 +429,136 @@ async def test_credential_store_falls_back_to_legacy_auth_json(
 
 
 @pytest.mark.asyncio
+async def test_credential_store_honors_opencode_db_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``OPENCODE_DB`` points at a relocated V2 store (e.g. a sandbox).
+
+    The default XDG ``<data dir>/opencode.db`` is absent here, so a resolution
+    proves the env-named file was read.
+    """
+    store_dir = tmp_path / "sandbox"
+    store_dir.mkdir(parents=True)
+    _seed_credential_db(store_dir, "opencode", "sandbox-key")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OPENCODE_DB", str(store_dir / "opencode.db"))
+
+    assert not (tmp_path / ".local" / "share" / "opencode" / "opencode.db").exists(), (
+        "precondition: the default XDG db is absent"
+    )
+    assert vision._resolve_auth() == ("sandbox-key", vision.OPENCODE_ENDPOINT)
+
+
+@pytest.mark.asyncio
+async def test_credential_store_defaults_to_xdg_without_opencode_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no ``OPENCODE_DB`` the default ``<data dir>/opencode.db`` is read."""
+    data_dir = tmp_path / ".local" / "share" / "opencode"
+    data_dir.mkdir(parents=True)
+    _seed_credential_db(data_dir, "opencode-go", "default-db-key")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+
+    assert vision._resolve_auth() == ("default-db-key", vision.GO_ENDPOINT)
+
+
+@pytest.mark.asyncio
+async def test_credential_store_honors_xdg_data_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``XDG_DATA_HOME`` relocates the default data dir (empty HOME is ignored)."""
+    home = tmp_path / "home"
+    xdg_data = tmp_path / "xdg-data"
+    data_dir = xdg_data / "opencode"
+    data_dir.mkdir(parents=True)
+    _seed_credential_db(data_dir, "opencode-go", "xdg-data-db-key")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+
+    assert not (home / ".local" / "share" / "opencode" / "opencode.db").exists(), (
+        "precondition: the HOME fallback db is absent"
+    )
+    assert vision._resolve_auth() == ("xdg-data-db-key", vision.GO_ENDPOINT)
+
+
+def test_local_fallback_note_names_effective_credential_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local-fallback guidance points at the EFFECTIVE db, not a hardcoded path."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Default: HOME-based data dir.
+    assert str(tmp_path / ".local" / "share" / "opencode" / "opencode.db") in (
+        vision._local_fallback_note()
+    )
+
+    # OPENCODE_DB (relocated store) must be reflected verbatim.
+    relocated = tmp_path / "sandbox" / "opencode-v2.db"
+    monkeypatch.setenv("OPENCODE_DB", str(relocated))
+    note = vision._local_fallback_note()
+    assert str(relocated) in note
+    assert "~/.local/share/opencode/opencode.db" not in note
+
+    # XDG_DATA_HOME is honored when OPENCODE_DB is absent.
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    xdg_data = tmp_path / "xdg-data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+    assert str(xdg_data / "opencode" / "opencode.db") in vision._local_fallback_note()
+
+
+@pytest.mark.asyncio
+async def test_local_fallback_text_carries_effective_db_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The degraded description embeds the effective db path (end-to-end)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(vision, "_ocr_bytes", lambda _data: None)
+    relocated = tmp_path / "sandbox" / "opencode-v2.db"
+    monkeypatch.setenv("OPENCODE_DB", str(relocated))
+
+    image = tmp_path / "image.png"
+    image.write_bytes(PNG_1X1)
+    result = await vision.mcp.call_tool("vision_describe", {"path": str(image)})
+    text = _tool_text(result)
+    assert "Imagem local" in text
+    assert str(relocated) in text
+    assert FakeClient.last_request == {}, "no gateway request in local mode"
+
+
+@pytest.mark.asyncio
 async def test_missing_credential_store_returns_none_and_logs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """No source at all is an explicit None plus an error log, not a silent 401.
+    """The graceful resolve is silent; only the fatal gateway path logs.
 
-    The module sets ``propagate = False`` with its own stderr handler, so the
-    log is observed through capsys rather than caplog.
+    ``_resolve_auth`` is called by ``vision_describe``/``vision_ocr`` before
+    they decide to degrade locally, so it must NOT spam stderr in local mode.
+    The error (naming the sources tried) belongs to ``_gateway``, where a
+    missing key is fatal. The module sets ``propagate = False`` with its own
+    stderr handler, so the log is observed through capsys rather than caplog.
     """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     assert vision._resolve_auth() == (
         None,
         vision._endpoint_for_model(vision._model()),
     )
+    assert "No OpenCode credential found" not in capsys.readouterr().err, (
+        "graceful resolve must not log the missing-credential error"
+    )
+
+    # The fatal path logs the paths/env vars tried.
+    result = await vision.mcp.call_tool(
+        "vision_analyze", {"path": "https://example.test/photo.jpg"}
+    )
     stderr = capsys.readouterr().err
     assert "No OpenCode credential found" in stderr
     assert "PANTHEON_OPENCODE_API_KEY" in stderr
     assert "opencode.db" in stderr
+    assert "opencode auth login" in stderr
+    assert "opencode auth login" in _tool_text(result), (
+        "the fatal credential error names the actionable `opencode auth login`"
+    )
 
 
 @pytest.mark.asyncio
@@ -289,6 +591,82 @@ async def test_missing_key_error_names_every_source(
     assert "PANTHEON_OPENCODE_API_KEY" in message
     assert "OPENCODE_API_KEY" in message
     assert "opencode.db" in message
+    assert "opencode auth login" in message
+
+
+@pytest.mark.asyncio
+async def test_describe_degrades_to_local_metadata_without_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No credential → deterministic local metadata, never a gateway call."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(vision, "_ocr_bytes", lambda _data: None)
+    image = tmp_path / "image.png"
+    image.write_bytes(PNG_1X1)
+
+    result = await vision.mcp.call_tool("vision_describe", {"path": str(image)})
+    text = _tool_text(result)
+    assert "Imagem local" in text
+    assert "1x1" in text
+    assert "image/png" in text
+    assert "Texto OCR: indisponível" in text
+    assert FakeClient.last_request == {}, "no gateway request in local mode"
+
+
+@pytest.mark.asyncio
+async def test_local_fallback_includes_ocr_when_pytesseract_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mocked pytesseract runner surfaces its text in the local block."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(vision, "_ocr_bytes", lambda _data: "Hello world")
+    image = tmp_path / "image.png"
+    image.write_bytes(PNG_1X1)
+
+    result = await vision.mcp.call_tool("vision_describe", {"path": str(image)})
+    text = _tool_text(result)
+    assert "Hello world" in text
+    assert "Texto OCR" in text
+
+
+@pytest.mark.asyncio
+async def test_local_fallback_never_invents_a_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote URL without a key yields declared metadata, not a description."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    result = await vision.mcp.call_tool(
+        "vision_describe", {"path": "https://example.test/photo.jpg"}
+    )
+    text = _tool_text(result)
+    assert "Imagem local" in text
+    assert "image/jpeg" in text
+    assert "PANTHEON_OPENCODE_API_KEY" in text
+    assert FakeClient.last_request == {}
+
+
+@pytest.mark.asyncio
+async def test_local_fallback_error_when_input_is_invalid() -> None:
+    """Unsupported input still fails clearly instead of degrading to metadata."""
+    result = await vision.mcp.call_tool(
+        "vision_describe", {"path": "data:text/plain;base64,SGk="}
+    )
+    assert "unsupported" in _tool_text(result).lower()
+
+
+@pytest.mark.asyncio
+async def test_ocr_degrades_locally_without_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vision_ocr also degrades to the local block when no key is configured."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(vision, "_ocr_bytes", lambda _data: "linha um")
+    image = tmp_path / "image.png"
+    image.write_bytes(PNG_1X1)
+
+    result = await vision.mcp.call_tool("vision_ocr", {"path": str(image)})
+    assert "linha um" in _tool_text(result)
+    assert FakeClient.last_request == {}
 
 
 @pytest.mark.asyncio

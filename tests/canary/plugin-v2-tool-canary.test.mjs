@@ -78,6 +78,17 @@
  * Skipped when no `opencode` binary is available, so `npm test` stays green on a
  * machine without a host. Override with `PANTHEON_TOOL_CANARY_BIN`.
  *
+ * ## Hermeticity scope
+ *
+ * The escape guard in the probe plugin replaces `globalThis.fetch` and nothing
+ * else. It therefore covers the native Vision path (which uses `fetch`), but NOT
+ * `node:http`/`node:https` — e.g. `readRemoteImage` — nor `dns.lookup`; those
+ * would leave the process without tripping the guard. The loopback allowlist is
+ * substring-based (`//127.0.0.1:`, `//localhost:`, `//[::1]:`), not a
+ * parsed-origin check, so it is an intent marker rather than a boundary. The
+ * guard's job is to fail loudly when the mocked model or the native path leaks,
+ * not to be a general network sandbox.
+ *
  * Isolation: a private `opencode serve` on a free port, a throwaway project
  * directory, and a private `HOME` / `XDG_*` / `OPENCODE_CONFIG*` set. The
  * developer's real config is never readable or writable from the host; the last
@@ -296,12 +307,35 @@ function treeDiff(before, after) {
  */
 async function startMockModel(scripts) {
   let turn = 0
+  const requestBodies = []
   const server = createServer((req, res) => {
-    // Drain the request. Without this the socket stalls and the host's first
-    // model call never completes — which surfaces as a 15 s timeout in
-    // `before` with no other symptom.
-    req.resume()
+    let requestBody = ''
+    req.on('data', (chunk) => {
+      requestBody += String(chunk)
+    })
     req.on('end', () => {
+      requestBodies.push(requestBody)
+      // The nested image-analysis session sends an image_url. Keep that call
+      // separate from the outer Code Mode script counter and answer it with a
+      // deterministic result, so this canary tests OpenCode's native session
+      // API without using a real provider or credential. The body is JSON, not
+      // SSE: `describeImagesNative` reads the reply with `response.json()` (the
+      // `@ai-sdk/openai-compatible` SSE shape is only for the outer chat turns).
+      if (requestBody.includes('image_url')) {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: 'CANARY-VISION-RESULT' },
+                finish_reason: 'stop',
+              },
+            ],
+          }),
+        )
+        return
+      }
       turn += 1
       // Alternating: every ODD turn is the scripted tool call, every EVEN turn
       // is the closing message that lets the session go idle. One script per
@@ -364,6 +398,29 @@ async function startMockModel(scripts) {
   return {
     baseURL: `http://127.0.0.1:${server.address().port}/v1`,
     turns: () => turn,
+    requestSummary: () =>
+      requestBodies.map((body) => {
+        let parsed
+        try {
+          parsed = JSON.parse(body)
+        } catch {
+          parsed = {}
+        }
+        const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+        const last = messages.at(-1)
+        const content = last?.content
+        return {
+          hasImageUrl: body.includes('image_url'),
+          hasImageData: body.includes('data:image'),
+          model: parsed.model,
+          chars: body.length,
+          messageKeys: last ? Object.keys(last) : [],
+          contentTypes: Array.isArray(content)
+            ? content.map((item) => ({ type: item?.type, keys: Object.keys(item ?? {}) }))
+            : typeof content,
+          lastText: typeof content === 'string' ? content.slice(-120) : undefined,
+        }
+      }),
     close: () => server.close(),
   }
 }
@@ -403,7 +460,11 @@ async function startHost(sandbox) {
   const port = await freePort()
   const server = spawn(BIN, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
     cwd: sandbox.projectDir,
-    env: hostEnv(sandbox, { PANTHEON_TOOL_CANARY_PROOF: sandbox.proofFile }),
+    env: hostEnv(sandbox, {
+      PANTHEON_TOOL_CANARY_PROOF: sandbox.proofFile,
+      PANTHEON_VISION_MODEL: 'opencode-go/mimo-v2.6-flash',
+      PANTHEON_OPENCODE_API_KEY: 'canary-key',
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 
@@ -487,6 +548,12 @@ async function startHost(sandbox) {
     async transcript() {
       return JSON.stringify(await request('GET', `/api/session/${created.data.id}/message`))
     },
+    async sessions() {
+      return request('GET', '/api/session')
+    },
+    async messages(sessionID) {
+      return request('GET', `/api/session/${sessionID}/message`)
+    },
     stop() {
       if (server.exitCode === null && server.signalCode === null) server.kill('SIGTERM')
     },
@@ -519,6 +586,31 @@ function writePlugins(sandbox, pluginSource) {
       '  async setup(ctx) {',
       '    const proof = process.env.PANTHEON_TOOL_CANARY_PROOF',
       '    if (!proof) return',
+      '    const visionRequests = []',
+      '    const escapedRequests = []',
+      '    const originalFetch = globalThis.fetch',
+      '    const isZenUrl = (url) => url.includes("opencode.ai/zen/")',
+      '    const isLoopback = (url) => url.includes("//127.0.0.1:") || url.includes("//localhost:") || url.includes("//[::1]:")',
+      '    globalThis.fetch = async (input, init) => {',
+      '      const url = typeof input === "string" ? input : (input && input.url) || String(input)',
+      '      if (isZenUrl(url)) {',
+      '        const body = JSON.parse(String(init?.body ?? "{}"))',
+      '        const headers = new Headers(init?.headers)',
+      '        visionRequests.push({',
+      '          url,',
+      '          model: body.model,',
+      '          messages: body.messages,',
+      '          authorization: headers.get("authorization"),',
+      '          session: headers.get("x-opencode-session"),',
+      '        })',
+      '        return Response.json({ choices: [{ message: { content: "CANARY-VISION-RESULT" } }] })',
+      '      }',
+      '      if (isLoopback(url)) {',
+      '        return Reflect.apply(originalFetch, globalThis, [input, init])',
+      '      }',
+      '      escapedRequests.push(url)',
+      '      return Response.json({ error: "canary blocked an un-intercepted network request" }, { status: 599 })',
+      '    }',
       '    const kind = (value) => (value === undefined ? "absent" : typeof value)',
       '    const domains = {',
       '      contextKeys: Object.keys(ctx).sort(),',
@@ -529,7 +621,18 @@ function writePlugins(sandbox, pluginSource) {
       '      },',
       '      event: { subscribe: kind(ctx.event && ctx.event.subscribe) },',
       '      permission: { hook: kind(ctx.permission && ctx.permission.hook) },',
-      '      session: { hook: kind(ctx.session && ctx.session.hook) },',
+      '      session: {',
+      '        hook: kind(ctx.session && ctx.session.hook),',
+      '        create: kind(ctx.session && ctx.session.create),',
+      '        generate: kind(ctx.session && ctx.session.generate),',
+      '        remove: kind(ctx.session && ctx.session.remove),',
+      '      },',
+      '      model: { list: kind(ctx.model && ctx.model.list) },',
+      '      aisdk: {',
+      '        type: kind(ctx.aisdk),',
+      '        hook: kind(typeof ctx.aisdk === "function" ? ctx.aisdk : (ctx.aisdk && ctx.aisdk.hook)),',
+      '      },',
+      '      generate: { text: kind(ctx.generate && ctx.generate.text) },',
       '      catalog: kind(ctx.catalog),',
       '    }',
       "    await ctx.tool.hook('execute.after', async () => {",
@@ -537,14 +640,31 @@ function writePlugins(sandbox, pluginSource) {
       '      try {',
       '        toolList = await ctx.tool.list()',
       '      } catch (err) {',
-      '        writeFileSync(proof, JSON.stringify({ domains, listError: String(err) }, null, 2))',
+      '        writeFileSync(proof, JSON.stringify({ domains, visionRequests, escapedRequests, listError: String(err) }, null, 2))',
       '        return',
+      '      }',
+      '      let models',
+      '      try {',
+      '        const result = await ctx.model.list()',
+      '        models = Array.isArray(result) ? result : (result?.data ?? [])',
+      '      } catch (err) {',
+      '        models = { error: String(err) }',
       '      }',
       '      writeFileSync(',
       '        proof,',
       '        JSON.stringify(',
       '          {',
       '            domains,',
+      '            visionRequests,',
+      '            escapedRequests,',
+      '            models: Array.isArray(models)',
+      '              ? models.map((model) => ({',
+      '                  id: model.id,',
+      '                  providerID: model.providerID,',
+      '                  input: model.capabilities?.input ?? model.input,',
+      '                  enabled: model.enabled,',
+      '                }))',
+      '              : models,',
       '            toolList: toolList.map((tool) => ({',
       '              name: tool.name,',
       '              id: tool.id,',
@@ -573,12 +693,44 @@ function writeProjectConfig(sandbox, modelBaseURL) {
         // Each entry must be a DIRECTORY holding a real index.ts on 2.0.22.
         plugins: ['./.opencode/plugins/real', './.opencode/plugins/probe'],
         provider: {
+          opencode: {
+            npm: '@ai-sdk/openai-compatible',
+            name: 'OpenCode Zen canary',
+            id: 'opencode',
+            options: { baseURL: modelBaseURL, apiKey: 'canary-key' },
+            models: {
+              'mimo-v2.6-flash-free': {
+                name: 'MiMo V2.6 Flash Free',
+                tool_call: true,
+                modalities: { input: ['text', 'image'], output: ['text'] },
+              },
+            },
+          },
+          'opencode-go': {
+            npm: '@ai-sdk/openai-compatible',
+            name: 'OpenCode Go canary',
+            id: 'opencode-go',
+            options: { baseURL: modelBaseURL, apiKey: 'canary-key' },
+            models: {
+              'mimo-v2.6-flash': {
+                name: 'MiMo V2.6 Flash',
+                tool_call: true,
+                modalities: { input: ['text', 'image'], output: ['text'] },
+              },
+            },
+          },
           canary: {
             npm: '@ai-sdk/openai-compatible',
             name: 'canary',
             id: 'canary',
             options: { baseURL: modelBaseURL, apiKey: 'canary-key' },
-            models: { 'canary-model': { name: 'canary-model', tool_call: true } },
+            models: {
+              'canary-model': {
+                name: 'canary-model',
+                tool_call: true,
+                modalities: { input: ['text', 'image'], output: ['text'] },
+              },
+            },
           },
         },
         model: 'canary/canary-model',
@@ -666,6 +818,17 @@ try {
 return JSON.stringify(out);
 `.trim()
 
+const VISION_IMAGE =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
+
+const visionScript = `
+const result = await tools.vision_describe({
+  path: ${JSON.stringify(VISION_IMAGE)},
+  prompt: 'Describe this canary image.',
+});
+return JSON.stringify({ result });
+`.trim()
+
 /**
  * The rendered text of every `execute` tool call, oldest first.
  *
@@ -699,9 +862,27 @@ function parseScriptResult(text) {
 }
 
 /**
+ * The rendered text of the Vision `execute` call, selected by CONTENT.
+ *
+ * Not by `time.created`: the host does not guarantee monotonic timestamps
+ * across turns, and the native Vision turn perturbs the ordering (its
+ * `session.generate` re-stamps neighbouring messages), so
+ * `executeTexts(...).at(-1)` returned a neighbouring turn's result on ~2-4% of
+ * runs — with the Zen request still intercepted and `CANARY-VISION-RESULT`
+ * still returned, i.e. a false negative. The Vision call is the only scripted
+ * turn whose output carries `CANARY-VISION-RESULT`, so matching that marker is
+ * order-independent. The catalog/bad/good observations are captured immediately
+ * after their own prompt, before Vision runs, and stay on `.at(-1)`.
+ */
+function visionExecuteText(transcript) {
+  return executeTexts(transcript).find((text) => text.includes('CANARY-VISION-RESULT')) ?? ''
+}
+
+/**
  * Run the whole canary against one plugin source and return the observations.
  *
- * Three chat turns on one session — catalog, rejected call, accepted call — so
+ * Four outer chat turns on one session — catalog, rejected call, accepted call,
+ * and native Vision — so
  * the target file can be observed between the two calls.
  */
 async function runCanary(pluginSource) {
@@ -711,6 +892,7 @@ async function runCanary(pluginSource) {
     CATALOG_SCRIPT,
     badRefScript(sandbox.targetFile),
     goodRefScript(sandbox.targetFile),
+    visionScript,
   ]
   const model = await startMockModel(scripts)
   writePlugins(sandbox, pluginSource)
@@ -736,8 +918,47 @@ async function runCanary(pluginSource) {
     observation.good = parseScriptResult(observation.goodText)
     observation.afterGoodRef = readFileSync(sandbox.targetFile, 'utf8')
 
+    try {
+      await host.prompt('describe this image with Pantheon Vision')
+    } catch (error) {
+      const sessions = await host.sessions().catch((cause) => ({ error: String(cause) }))
+      const sessionRows = Array.isArray(sessions) ? sessions : (sessions?.data ?? [])
+      const sessionDetails = await Promise.all(
+        sessionRows.map(async (session) => {
+          const sessionID = session?.id ?? session?.sessionID
+          if (!sessionID) return { session }
+          const result = await host.messages(sessionID).catch((cause) => ({ error: String(cause) }))
+          const rows = Array.isArray(result) ? result : (result?.data ?? [])
+          return {
+            sessionID,
+            parentID: session?.parentID,
+            title: session?.title,
+            rows: rows.slice(0, 4).map((row) => ({
+              type: row?.type,
+              role: row?.role ?? row?.info?.role,
+              agent: row?.agent ?? row?.info?.agent,
+              parts: (row?.parts ?? row?.content ?? []).map((part) => ({
+                type: part?.type,
+                name: part?.name ?? part?.tool,
+                status: part?.state?.status,
+                text: part?.text?.slice?.(0, 200),
+                error: part?.state?.error?.message,
+              })),
+            })),
+          }
+        }),
+      )
+      throw new Error(
+        `native vision prompt failed: ${String(error)}; model requests=${JSON.stringify(model.requestSummary())}; host=${host.diagnose()}; sessions=${JSON.stringify(sessionDetails)}`,
+      )
+    }
+    observation.visionText = visionExecuteText(await host.transcript())
+    observation.vision = parseScriptResult(observation.visionText)
+
     observation.transcript = await host.transcript()
     observation.turns = model.turns()
+    observation.modelRequests = model.requestSummary()
+    observation.sessions = await host.sessions()
     observation.observation = existsSync(sandbox.proofFile)
       ? JSON.parse(readFileSync(sandbox.proofFile, 'utf8'))
       : null
@@ -792,21 +1013,21 @@ test('the mutation really removes output from draft.add', () => {
 })
 
 test('the host drove every scripted turn', { skip: skipped }, () => {
-  // One `execute` tool call plus one closing message per chat turn.
-  assert.equal(live.turns, 6, `the mock model served ${live.turns} turns, expected 6`)
+  // One `execute` tool call plus one closing message per outer chat turn.
+  assert.equal(live.turns, 8, `the mock model served ${live.turns} turns, expected 8`)
   assert.equal(
     executeTexts(live.transcript).length,
-    3,
-    'the transcript is not the 3 scripted calls',
+    4,
+    'the transcript is not the 4 scripted calls',
   )
 })
 
-test('the host context exposes the four domains the plugin casts to reach', {
+test('the host context exposes the V2 model and session APIs Pantheon needs', {
   skip: skipped,
 }, () => {
   assert.ok(live.observation, `no probe dump was written: ${live.diagnose()}`)
   const { domains } = live.observation
-  for (const key of ['tool', 'event', 'permission', 'session']) {
+  for (const key of ['tool', 'event', 'permission', 'session', 'model']) {
     assert.ok(
       domains.contextKeys.includes(key),
       `ctx.${key} is absent on this host: ctx keys = ${domains.contextKeys.join(', ')}`,
@@ -819,8 +1040,45 @@ test('the host context exposes the four domains the plugin casts to reach', {
   assert.equal(domains.event.subscribe, 'function')
   assert.equal(domains.permission.hook, 'function')
   assert.equal(domains.session.hook, 'function')
+  assert.equal(domains.model.list, 'function', 'native model catalog API is required for V2 Vision')
+  assert.equal(domains.session.create, 'function')
+  assert.equal(domains.session.generate, 'function')
+  assert.equal(domains.session.remove, 'function')
+  assert.equal(domains.generate.text, 'function')
   // And the one the plugin has always claimed is host-absent really is absent.
   assert.equal(domains.catalog, 'absent')
+  assert.ok(Array.isArray(live.observation.models), 'the model catalog was not readable')
+  assert.ok(
+    live.observation.models.some(
+      (model) => model.providerID === 'canary' && model.id === 'canary-model',
+    ),
+    `ctx.model.list() omitted the configured canary model: ${JSON.stringify(live.observation.models)}`,
+  )
+  const canaryModel = live.observation.models.find(
+    (model) => model.providerID === 'canary' && model.id === 'canary-model',
+  )
+  assert.ok(
+    Array.isArray(canaryModel.input)
+      ? canaryModel.input.includes('image')
+      : canaryModel.input?.image === true,
+    `the live catalog lost the configured image modality: ${JSON.stringify(canaryModel)}`,
+  )
+  const freeVisionModel = live.observation.models.find(
+    (model) => model.providerID === 'opencode' && model.id === 'mimo-v2.6-flash-free',
+  )
+  assert.ok(freeVisionModel, 'the live catalog omitted opencode/mimo-v2.6-flash-free')
+  // The native path EXCLUDES free-tier models (the direct gateway rejects them
+  // with HTTP 403), so the paid Go model is the one that must be selectable.
+  const paidVisionModel = live.observation.models.find(
+    (model) => model.providerID === 'opencode-go' && model.id === 'mimo-v2.6-flash',
+  )
+  assert.ok(paidVisionModel, 'the live catalog omitted opencode-go/mimo-v2.6-flash')
+  assert.ok(
+    Array.isArray(paidVisionModel.input)
+      ? paidVisionModel.input.includes('image')
+      : paidVisionModel.input?.image === true,
+    `the live catalog did not mark Go MiMo as image-capable: ${JSON.stringify(paidVisionModel)}`,
+  )
 })
 
 test('hashline_edit is registered and its host-built descriptor carries output', {
@@ -838,6 +1096,68 @@ test('hashline_edit is registered and its host-built descriptor carries output',
   assert.ok(
     entry.hasOutput && entry.keys.includes('output'),
     `the host-built descriptor carries no output: keys=${entry.keys.join(', ')}`,
+  )
+})
+
+test('vision_describe is registered by the real V2 host with the output contract', {
+  skip: skipped,
+}, () => {
+  assert.ok(live.observation, `the probe wrote no dump: ${live.diagnose()}`)
+  const entry = live.observation.toolList.find((tool) => tool.name === 'vision_describe')
+  assert.ok(
+    entry,
+    `ctx.tool.list() has no vision_describe; host-built names: ${live.observation.toolList
+      .map((tool) => tool.name)
+      .join(', ')}`,
+  )
+  assert.equal(entry.id, 'vision_describe')
+  assert.ok(entry.hasOutput && entry.keys.includes('output'))
+})
+
+test('native V2 Vision sends image data to the live-catalog paid Go MiMo model', {
+  skip: skipped,
+}, () => {
+  // The intercept is the ONLY thing standing between this canary and the real
+  // Zen gateway, so it must have fired (a real request would have returned 401).
+  assert.ok(
+    Array.isArray(live.observation?.visionRequests),
+    `the probe did not record the Zen interceptor: ${live.diagnose()}`,
+  )
+  // Hermeticity first: the interceptor is the only path to the network, and the
+  // escape guard fails the run (naming the URL) if a real request left the
+  // sandbox. Checked before the request assertions so a leak reports its cause.
+  assert.deepEqual(
+    live.observation.escapedRequests,
+    [],
+    `the canary leaked a request to the network: ${JSON.stringify(live.observation.escapedRequests)}`,
+  )
+  const zenRequest = live.observation.visionRequests.find(
+    (request) =>
+      request.model === 'mimo-v2.6-flash' &&
+      JSON.stringify(request.messages).includes('data:image/png;base64,') &&
+      request.authorization === 'Bearer canary-key',
+  )
+  assert.ok(
+    zenRequest,
+    `no authenticated image request reached Go MiMo 2.6 Flash: ${JSON.stringify(live.observation.visionRequests)}`,
+  )
+  // The interceptor must have caught the REAL gateway URL the native path
+  // builds (zen/go/v1), not a mock stand-in.
+  assert.match(
+    String(zenRequest.url),
+    /^https:\/\/opencode\.ai\/zen\//,
+    `the intercepted request did not target the real Zen gateway: ${JSON.stringify(zenRequest.url)}`,
+  )
+  // The Zen gateway rejects a sessionless request (HTTP 400 MissingSessionID),
+  // so the intercepted call MUST carry the session header — and only Zen sees it.
+  assert.ok(
+    typeof zenRequest.session === 'string' && zenRequest.session.trim() !== '',
+    `the intercepted Zen request carried no x-opencode-session header: ${JSON.stringify(zenRequest)}`,
+  )
+  assert.match(
+    JSON.stringify(live.vision),
+    /CANARY-VISION-RESULT/,
+    `native V2 Vision did not return the intercepted response: ${live.visionText}; Zen requests=${JSON.stringify(live.observation.visionRequests)}`,
   )
 })
 

@@ -16,12 +16,15 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import { mock } from 'node:test'
 
 import { useTmpProjectDir } from './pantheon/helpers/tmp-dir.ts'
 
@@ -40,9 +43,12 @@ import { hasVision } from '../src/pantheon/presets.mjs'
 import {
   buildDescriptionCacheKey,
   buildNativeVisionPrompt,
+  buildOrientationHint,
   buildStructuredInjection,
   cleanupSessionTempImages,
+  computeNativeTimeoutMs,
   DESCRIPTION_CACHE_TTL_MS,
+  describeImagesNative,
   detectVisionIntent,
   enforceTempFileCap,
   escapeXml,
@@ -52,14 +58,20 @@ import {
   getVisionMode,
   hashContent,
   isImageFilePart,
+  isZenNativeTarget,
   matchesModelPattern,
   matchesWildcardPattern,
   modelAcceptsImages,
   modelMatchesAnyPattern,
+  nativeVisionFailureMessage,
+  PROVIDERS_CACHE_TTL_MS,
   parseStructuredVisionResponse,
+  payloadOrientation,
   providerIsTextOnly,
+  readExifOrientation,
   readOpencodeAuthToken,
   resolveNativeVisionConfig,
+  resolveNativeVisionTarget,
   saveDataUrlImage,
   setCachedDescription,
   stripProviderPrefix,
@@ -67,6 +79,7 @@ import {
   TEMP_MAX_FILES,
   tempFileLRU,
   touchTempFile,
+  writeTempImageSync,
 } from '../src/pantheon/vision.ts'
 
 // Isolation: importing src/plugin.ts runs getSharedBoard().recoverRunningJobs(),
@@ -108,6 +121,10 @@ const VISION_DIR = join(tmpdir(), 'pantheon-vision')
 const previousXdg = process.env.XDG_CONFIG_HOME
 const xdgDir = mkdtempSync(join(tmpdir(), 'pantheon-xdg-'))
 process.env.XDG_CONFIG_HOME = xdgDir
+// Hermetic: the default auth-store/data dir honors XDG_DATA_HOME. Clear it so
+// the hermetic HOME below is the only data root the auth-store tests pick up.
+const previousDataHome = process.env.XDG_DATA_HOME
+delete process.env.XDG_DATA_HOME
 // Hermetic HOME: isolate the opencode auth store default path
 // (~/.local/share/opencode/auth.json) so auth-store tests never touch the
 // developer's real `opencode auth login` credentials.
@@ -131,6 +148,16 @@ function makeTempDir() {
   const dir = mkdtempSync(join(tmpdir(), 'pantheon-cfg-'))
   tempDirs.push(dir)
   return dir
+}
+
+// node:sqlite backs the OpenCode V2 credential store; the production read is
+// best-effort, so these cases are skipped when the builtin is unavailable.
+const require = createRequire(import.meta.url)
+let sqliteAvailable = true
+try {
+  require('node:sqlite')
+} catch {
+  sqliteAvailable = false
 }
 
 // ─── Config hook: applies the active model preset (P1-1) ─────────────────
@@ -402,6 +429,29 @@ const defaultPrompt = generateInjectionPrompt(
 assert.ok(defaultPrompt.includes('/tmp/x.png'))
 assert.ok(defaultPrompt.includes('pantheon_vision_vision_describe'))
 assert.ok(defaultPrompt.includes('o que é isso?'))
+
+// Template-injection safety (Fase 2, explicit): variable literals inside the
+// user's text are DATA, never re-expanded — `{userText}` is substituted last
+// and the replacement value is never re-scanned (single-pass expansion).
+const injectionProbe = generateInjectionPrompt(
+  [{ path: '/tmp/x.png' }],
+  'veja {imageList} e {toolName} e {userText}',
+  'pantheon_vision_vision_describe',
+)
+assert.ok(
+  injectionProbe.includes('veja {imageList} e {toolName} e {userText}'),
+  'variable literals in userText stay verbatim',
+)
+assert.equal(
+  injectionProbe.split('/tmp/x.png').length - 1,
+  1,
+  '{imageList} in userText is not re-expanded (image path appears once)',
+)
+assert.equal(
+  injectionProbe.split('pantheon_vision_vision_describe').length - 1,
+  1,
+  '{toolName} in userText is not re-expanded (tool name appears once)',
+)
 
 // The prompt helper accepts zero, one, or multiple images, but rejects a
 // resolver contract violation instead of turning it into an empty image list.
@@ -941,6 +991,138 @@ assert.equal(stripProviderPrefix('opencode/deepseek-v4-flash'), 'deepseek-v4-fla
 assert.equal(stripProviderPrefix('opencode-go/team/mimo-v2.5'), 'mimo-v2.5')
 assert.equal(stripProviderPrefix('mimo-v2.5'), 'mimo-v2.5')
 
+// ─── Zen-only session header (x-opencode-session) ──────────────────────────
+// The Zen gateway rejects a sessionless request (HTTP 400 MissingSessionID),
+// so a Zen target with a session id carries the header; a non-Zen provider
+// NEVER does (no cross-provider session leak).
+
+assert.equal(
+  isZenNativeTarget({ modelID: 'opencode-go/mimo-v2.5', baseURL: 'https://opencode.ai/zen/go/v1' }),
+  true,
+  'opencode-go + zen/go is a Zen target',
+)
+assert.equal(
+  isZenNativeTarget({ modelID: 'opencode/mimo-v2.5', baseURL: 'https://opencode.ai/zen/v1' }),
+  true,
+  'opencode + zen/v1 is a Zen target',
+)
+assert.equal(
+  isZenNativeTarget({
+    modelID: 'anthropic/claude-sonnet',
+    baseURL: 'https://opencode.ai/zen/v1',
+  }),
+  false,
+  'a non-Zen provider is never a Zen target even on a Zen URL',
+)
+assert.equal(
+  isZenNativeTarget({ modelID: 'opencode-go/mimo-v2.5', baseURL: 'https://evil.test/v1' }),
+  false,
+  'a non-Zen URL is never a Zen target even for a Zen provider',
+)
+
+await (async () => {
+  // Zen target WITH a session id → header present.
+  const zenMock = installFetchMock(() => okJson('descrição zen'))
+  try {
+    const zenTarget = {
+      modelID: 'opencode-go/mimo-v2.5',
+      baseURL: 'https://opencode.ai/zen/go/v1',
+      apiKey: 'k',
+      sessionID: 'session-zen',
+    }
+    const text = await describeImagesNative([{ url: 'data:image/png;base64,ZmFrZQ==' }], zenTarget)
+    assert.equal(text, 'descrição zen')
+    assert.equal(
+      zenMock.calls[0].options.headers['x-opencode-session'],
+      'session-zen',
+      'x-opencode-session present on a Zen request',
+    )
+  } finally {
+    zenMock.restore()
+  }
+
+  // Zen target WITHOUT a session id → header absent (no fabricated id).
+  const noSessionMock = installFetchMock(() => okJson('descrição sem sessão'))
+  try {
+    await describeImagesNative([{ url: 'data:image/png;base64,ZmFrZQ==' }], {
+      modelID: 'opencode-go/mimo-v2.5',
+      baseURL: 'https://opencode.ai/zen/go/v1',
+      apiKey: 'k',
+    })
+    assert.equal(
+      'x-opencode-session' in noSessionMock.calls[0].options.headers,
+      false,
+      'no header when no session id is available',
+    )
+  } finally {
+    noSessionMock.restore()
+  }
+
+  // NON-Zen target WITH a session id → header absent (never leaks the session).
+  const nonZenMock = installFetchMock(() => okJson('descrição local'))
+  try {
+    await describeImagesNative([{ url: 'data:image/png;base64,ZmFrZQ==' }], {
+      modelID: 'anthropic/claude-sonnet',
+      baseURL: 'https://api.anthropic.test/v1',
+      apiKey: 'k',
+      sessionID: 'session-secret',
+    })
+    assert.equal(
+      'x-opencode-session' in nonZenMock.calls[0].options.headers,
+      false,
+      'x-opencode-session never sent to a non-Zen provider',
+    )
+  } finally {
+    nonZenMock.restore()
+  }
+})()
+
+// ─── Failure mapping (400 MissingSessionID / 403 / finish_reason) ──────────
+assert.match(nativeVisionFailureMessage({ reason: 'http', status: 400 }, 'x/y'), /HTTP 400/)
+assert.match(nativeVisionFailureMessage({ reason: 'http', status: 400 }, 'x/y'), /MissingSessionID/)
+assert.match(nativeVisionFailureMessage({ reason: 'http', status: 403 }, 'x/y'), /HTTP 403/)
+assert.match(nativeVisionFailureMessage({ reason: 'http', status: 403 }, 'x/y'), /free-tier/)
+assert.match(nativeVisionFailureMessage({ reason: 'http', status: 401 }, 'x/y'), /HTTP 401/)
+assert.match(
+  nativeVisionFailureMessage({ reason: 'empty', finishReason: 'length' }, 'x/y'),
+  /finish_reason: length/,
+)
+assert.match(
+  nativeVisionFailureMessage({ reason: 'empty', finishReason: 'length' }, 'x/y'),
+  /max_tokens/,
+)
+assert.match(nativeVisionFailureMessage({ reason: 'network' }, 'x/y'), /network/i)
+assert.match(
+  nativeVisionFailureMessage({ reason: 'timeout', timeoutMs: 60_000 }, 'x/y'),
+  /timed out after 60s/,
+)
+assert.match(nativeVisionFailureMessage({ reason: 'timeout' }, 'x/y'), /timed out/i)
+assert.match(nativeVisionFailureMessage({ reason: 'cancelled' }, 'x/y'), /cancel/i)
+assert.doesNotMatch(
+  nativeVisionFailureMessage({ reason: 'cancelled' }, 'x/y'),
+  /retry|network/i,
+  'an external cancellation must not read as a retryable network error',
+)
+assert.match(nativeVisionFailureMessage(undefined, 'x/y'), /no text or the request failed/i)
+
+// generateInjectionPrompt relays the session id to the MCP tool call (the MCP
+// is a separate process the host hands no session id to).
+const sessionInjection = generateInjectionPrompt(
+  [{ path: '/tmp/x.png' }],
+  'o que é?',
+  'pantheon_vision_vision_describe',
+  undefined,
+  'session-mcp',
+)
+assert.ok(
+  sessionInjection.includes('session_id="session-mcp"'),
+  'session id relayed to the MCP tool call',
+)
+assert.ok(
+  !generateInjectionPrompt([{ path: '/tmp/x.png' }], '', 'vision-tool').includes('session_id='),
+  'no session instruction when no session id is available',
+)
+
 // ─── Test N1: presets vision model resolution ──────────────────────────────
 
 await (async () => {
@@ -965,7 +1147,11 @@ await (async () => {
     PANTHEON_MODEL_PRESET: 'go-free',
     PANTHEON_OPENCODE_API_KEY: 'test-key',
   })
-  assert.equal(viaEnv.modelID, 'opencode/mimo-v2.5-free', 'env preset go-free → mimo-v2.5-free')
+  assert.equal(
+    viaEnv.modelID,
+    'opencode/mimo-v2.6-flash-free',
+    'env preset go-free → mimo-v2.6-flash-free',
+  )
   assert.equal(viaEnv.baseURL, 'https://opencode.ai/zen/v1', 'env preset uses zen v1')
 
   // opencode (Zen) provider → zen/v1 endpoint
@@ -1034,9 +1220,14 @@ await (async () => {
     assert.equal(call.url, 'https://opencode.ai/zen/go/v1/chat/completions', 'zen go chat URL')
     assert.equal(call.options.headers.Authorization, 'Bearer test-key-123', 'bearer key header')
     assert.equal(call.options.headers['Content-Type'], 'application/json')
+    assert.equal(
+      call.options.headers['x-opencode-session'],
+      'session-1',
+      'Zen endpoint carries the live session id',
+    )
     const body = bodyOf(call)
     assert.equal(body.model, 'mimo-v2.5', 'provider prefix stripped from gateway payload')
-    assert.equal(body.max_tokens, 500, 'max_tokens capped')
+    assert.equal(body.max_tokens, 2048, 'max_tokens ceiling raised for reasoning models')
     assert.equal(body.messages[0].role, 'user')
     assert.equal(body.messages[0].content[0].type, 'text', 'prompt text first')
     assert.equal(body.messages[0].content[1].type, 'image_url')
@@ -1102,7 +1293,7 @@ await (async () => {
   assert.match(injectedText(output.parts), /pantheon_vision_vision_describe/)
 })()
 
-// ─── Test N3c: detection throws → explicit safe failure, turn never breaks ──
+// ─── Test N3c: detection throws → local extraction fallback (native→tool→local) ──
 await (async () => {
   const hooks = await makeHooks({
     tool: {
@@ -1117,7 +1308,12 @@ await (async () => {
   })
   assert.equal(output.parts.some(isImageFilePart), false)
   assert.equal(JSON.stringify(output.parts).includes('image_url'), false)
-  assert.match(injectedText(output.parts), /vision fallback unavailable/i)
+  assert.match(injectedText(output.parts), /Imagem local/i)
+  assert.equal(
+    injectedText(output.parts).includes('pantheon_vision_vision_describe'),
+    false,
+    'undetected tool is not instructed',
+  )
 })()
 
 // ─── Test N3d: ids data undefined + MCP connected → canonical default ──
@@ -1135,11 +1331,11 @@ await (async () => {
   )
 })()
 
-// ─── Test N3e: NO MCP evidence → null ('Vision fallback unavailable') ──────
+// ─── Test N3e: NO MCP evidence → local extraction (native→tool→local) ──────
 // P2-3: with --no-mcp / an uninstalled MCP there is no evidence the
 // pantheon-vision MCP exists (no tool ids, no mcp.status entry). Defaulting
 // to the canonical tool would instruct the model to call a tool that does
-// not exist — return null so the safe failure message is used instead.
+// not exist — the chain now degrades to deterministic local extraction instead.
 await (async () => {
   const hooks = await makeHooks({ mcp: null }) // simulate --no-mcp / no MCP
   const output = await runTurn(hooks, [imagePart()], {
@@ -1150,8 +1346,8 @@ await (async () => {
   assert.equal(JSON.stringify(output.parts).includes('image_url'), false)
   assert.match(
     injectedText(output.parts),
-    /vision fallback unavailable/i,
-    'no MCP evidence → explicit unavailable message, not a phantom tool name',
+    /Imagem local/i,
+    'no MCP evidence → deterministic local extraction',
   )
   assert.equal(
     injectedText(output.parts).includes('pantheon_vision_vision_describe'),
@@ -1160,7 +1356,7 @@ await (async () => {
   )
 })()
 
-// ─── Test N3f: mcp.status reports disabled → null (not available) ──────────
+// ─── Test N3f: mcp.status reports disabled → local extraction ──────────
 await (async () => {
   const hooks = await makeHooks({
     mcp: {
@@ -1174,12 +1370,108 @@ await (async () => {
   assert.equal(output.parts.some(isImageFilePart), false, 'image still removed safely')
   assert.match(
     injectedText(output.parts),
-    /vision fallback unavailable/i,
-    'disabled MCP → no default tool',
+    /Imagem local/i,
+    'disabled MCP → local extraction, no phantom tool',
   )
 })()
 
 // ─── Test N4: native failure (500 / network error) → tool fallback ─────────
+
+// ─── Test N3g: full chain native → tool → local on a real PNG ─────────────
+// Native unavailable (no key) OR failing (key + HTTP 500), AND the MCP tool
+// absent → deterministic local extraction reads the real bytes: dimensions are
+// reported and the wire carries no image_url / FilePart for a text-only
+// provider.
+await (async () => {
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  )
+  const pngPath = join(tmpdir(), `pantheon-local-${Date.now()}.png`)
+  writeFileSync(pngPath, pngBytes)
+  try {
+    // no key + MCP absent
+    {
+      const hooks = await makeHooks({ mcp: null })
+      const output = await runTurn(hooks, [imagePart({ url: `file://${pngPath}` })], {
+        providerID: 'opencode-go',
+        modelID: 'deepseek-v4-flash',
+      })
+      const injected = injectedText(output.parts)
+      assert.equal(output.parts.some(isImageFilePart), false, 'image removed')
+      assert.equal(
+        JSON.stringify(output.parts).includes('image_url'),
+        false,
+        'no image_url on the wire',
+      )
+      assert.match(injected, /Imagem local/)
+      assert.match(injected, /1x1 PNG/)
+      assert.equal(
+        injected.includes('vision fallback unavailable'),
+        false,
+        'local extraction succeeded, not the bare unavailable message',
+      )
+    }
+
+    // native failure (key + HTTP 500) + MCP absent → local as well
+    const mock = installFetchMock(() => errResponse(500))
+    try {
+      await withEnv('PANTHEON_OPENCODE_API_KEY', 'test-key-123', async () => {
+        const hooks = await makeHooks({ mcp: null })
+        const output = await runTurn(hooks, [imagePart({ url: `file://${pngPath}` })], {
+          providerID: 'opencode-go',
+          modelID: 'deepseek-v4-flash',
+        })
+        assert.match(
+          injectedText(output.parts),
+          /Imagem local/,
+          'native failure + no MCP → local extraction',
+        )
+      })
+    } finally {
+      mock.restore()
+    }
+  } finally {
+    rmSync(pngPath, { force: true })
+  }
+})()
+
+// ─── Test N3h: local extraction caps + escapes the user text ───────────────
+// Consistency with the native path: `buildLocalInjection` reuses
+// `truncateUserText` + `escapeXml`, so a >2000-char question is clipped and
+// template-looking literals stay inert (never interpreted as placeholders).
+await (async () => {
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  )
+  const pngPath = join(tmpdir(), `pantheon-local-usertext-${Date.now()}.png`)
+  writeFileSync(pngPath, pngBytes)
+  try {
+    const hooks = await makeHooks({ mcp: null }) // no MCP → local extraction
+    const longTail = 'TAIL_MARKER_SHOULD_NOT_APPEAR'
+    const userText = `{imageList} {toolName} ${'x'.repeat(2100)} ${longTail}`
+    const output = await runTurn(
+      hooks,
+      [imagePart({ url: `file://${pngPath}` }), textPart(userText)],
+      { providerID: 'opencode-go', modelID: 'deepseek-v4-flash' },
+      'session-local-usertext',
+    )
+    const injected = injectedText(output.parts)
+    assert.match(injected, /Imagem local/, 'local extraction path used')
+    const requestLine = injected.split('\n').find((line) => line.startsWith("User's request:"))
+    assert.ok(requestLine, "User's request line present")
+    assert.ok(requestLine.includes('…'), 'user text clipped at the cap')
+    assert.ok(!requestLine.includes(longTail), 'excess user text does not leak')
+    assert.ok(requestLine.length < 2100, 'request line bounded by the cap')
+    assert.ok(
+      requestLine.includes('{imageList}') && requestLine.includes('{toolName}'),
+      'template-looking literals stay inert',
+    )
+  } finally {
+    rmSync(pngPath, { force: true })
+  }
+})()
 
 await (async () => {
   rmSync(VISION_DIR, { recursive: true, force: true })
@@ -1384,6 +1676,156 @@ assert.equal(
   'corrupted auth.json → null (no crash)',
 )
 clearAuthStore()
+
+// ─── V2 SQLite credential store: native path parity with the MCP ───────────
+// OpenCode V2 moved credentials into a `credential` table (the file named by
+// OPENCODE_DB when set, else <data dir>/opencode.db). The native path must
+// read the same store as the MCP and the picker so a V2 host — with no
+// auth.json — resolves every vision path without extra login.
+
+/** Create a V2 `credential` table in `dir/opencode.db` with the given rows. */
+function seedCredentialDb(dir, rows) {
+  const { DatabaseSync } = require('node:sqlite')
+  mkdirSync(dir, { recursive: true })
+  const db = new DatabaseSync(join(dir, 'opencode.db'))
+  try {
+    db.exec('CREATE TABLE credential (integration_id TEXT, active INTEGER, value TEXT)')
+    const insert = db.prepare(
+      'INSERT INTO credential (integration_id, active, value) VALUES (?, ?, ?)',
+    )
+    for (const row of rows) insert.run(row.integrationID, row.active, row.value)
+  } finally {
+    db.close()
+  }
+}
+
+/** A fresh temp dir registered for teardown. */
+function makeAuthDir(prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempDirs.push(dir)
+  return dir
+}
+
+if (!sqliteAvailable) {
+  console.log('⏭️  node:sqlite unavailable — V2 credential-store cases skipped')
+} else {
+  // V2 host: no auth.json, key only in opencode.db → native path resolves it.
+  const v2Dir = makeAuthDir('pantheon-v2auth-')
+  seedCredentialDb(v2Dir, [
+    {
+      integrationID: 'opencode-go',
+      active: 1,
+      value: JSON.stringify({ type: 'key', key: 'v2-db-go-key' }),
+    },
+  ])
+  assert.equal(
+    await readOpencodeAuthToken(['opencode-go'], v2Dir),
+    'v2-db-go-key',
+    'auth.json absent → V2 credential db supplies the token',
+  )
+  assert.equal(
+    await readOpencodeAuthToken(['opencode', 'opencode-go'], v2Dir),
+    'v2-db-go-key',
+    'db rows tried in providerIDs order (missing opencode → opencode-go used)',
+  )
+
+  // OPENCODE_DB names the db when the host relocated it (e.g. a sandbox).
+  const relocatedDb = join(makeAuthDir('pantheon-v2auth-'), 'opencode-v2.db')
+  const relocatedDir = makeAuthDir('pantheon-v2auth-empty-')
+  {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(relocatedDb)
+    try {
+      db.exec('CREATE TABLE credential (integration_id TEXT, active INTEGER, value TEXT)')
+      db.prepare('INSERT INTO credential (integration_id, active, value) VALUES (?, ?, ?)').run(
+        'opencode',
+        1,
+        JSON.stringify({ type: 'key', key: 'relocated-db-key' }),
+      )
+    } finally {
+      db.close()
+    }
+  }
+  assert.equal(
+    await readOpencodeAuthToken(['opencode'], relocatedDir, { OPENCODE_DB: relocatedDb }),
+    'relocated-db-key',
+    'OPENCODE_DB overrides the default XDG db path',
+  )
+
+  // Inactive rows are never used; a corrupt db degrades silently.
+  const inactiveDir = makeAuthDir('pantheon-v2auth-')
+  seedCredentialDb(inactiveDir, [
+    {
+      integrationID: 'opencode-go',
+      active: 0,
+      value: JSON.stringify({ type: 'key', key: 'stale' }),
+    },
+  ])
+  assert.equal(
+    await readOpencodeAuthToken(['opencode-go'], inactiveDir),
+    null,
+    'inactive credential row ignored',
+  )
+  const corruptDir = makeAuthDir('pantheon-v2auth-')
+  writeFileSync(join(corruptDir, 'opencode.db'), 'not a sqlite database')
+  assert.equal(
+    await readOpencodeAuthToken(['opencode-go'], corruptDir),
+    null,
+    'corrupt credential db → null (no crash)',
+  )
+
+  // Gating is preserved on the db path: a legacy Zen db token never leaks to a
+  // non-Zen provider, and a Zen endpoint resolves the same db credential.
+  const gateDir = makeAuthDir('pantheon-v2auth-')
+  seedCredentialDb(gateDir, [
+    {
+      integrationID: 'opencode-go',
+      active: 1,
+      value: JSON.stringify({ type: 'key', key: 'ZEN-DB-SECRET' }),
+    },
+  ])
+  const thirdPartyCatalog = {
+    providers: [
+      catalogProvider('gateway-x', [
+        catalogModel({ id: 'vision-x', providerID: 'gateway-x', costInput: 2 }),
+      ]),
+    ],
+  }
+  const leaked = await resolveNativeVisionTarget({
+    env: {},
+    authStatePath: gateDir,
+    catalog: thirdPartyCatalog,
+  })
+  assert.equal(leaked, null, 'non-Zen discovery + only Zen V2 db token → null (no leak)')
+
+  const zen = await resolveNativeVisionTarget({
+    preset: { vision: { model: 'opencode-go/mimo-v2.5' } },
+    env: {},
+    authStatePath: gateDir,
+  })
+  assert.equal(zen?.apiKey, 'ZEN-DB-SECRET', 'Zen endpoint resolves the V2 db credential')
+
+  // XDG_DATA_HOME relocates the default data dir: with no explicit statePath,
+  // readOpencodeAuthToken must read the db under $XDG_DATA_HOME/opencode
+  // (mirrors v2-vision.ts), while OPENCODE_DB still wins when set.
+  const xdgDataDir = makeAuthDir('pantheon-xdgdata-')
+  seedCredentialDb(join(xdgDataDir, 'opencode'), [
+    {
+      integrationID: 'opencode-go',
+      active: 1,
+      value: JSON.stringify({ type: 'key', key: 'xdg-data-db-key' }),
+    },
+  ])
+  await withEnv('OPENCODE_DB', undefined, async () => {
+    await withEnv('XDG_DATA_HOME', xdgDataDir, async () => {
+      assert.equal(
+        await readOpencodeAuthToken(['opencode-go']),
+        'xdg-data-db-key',
+        'XDG_DATA_HOME relocates the default credential db path',
+      )
+    })
+  })
+}
 
 // ─── Test N9: env key wins over auth store ─────────────────────────────────
 
@@ -1651,6 +2093,30 @@ await (async () => {
       )
       assert.equal(mock.calls.length, 2, 'new prompt about the same image re-calls')
       assert.ok(injectedText(out3.parts).includes('descrição cacheada'))
+      // Explicit (Fase 2): the QUESTION rides in the gateway prompt — call 1
+      // carried 'pergunta A', call 2 carried 'pergunta B' (same image both
+      // times), so the cache key (prompt + image hashes) varies with the
+      // question by construction and each question gets a fresh describe.
+      const gatewayPromptText = (call) => {
+        const body = JSON.parse(call.options.body)
+        return body.messages[0].content.find((part) => part.type === 'text').text
+      }
+      assert.ok(
+        gatewayPromptText(mock.calls[0]).includes('pergunta A'),
+        'first describe prompt carries question A',
+      )
+      assert.ok(
+        !gatewayPromptText(mock.calls[0]).includes('pergunta B'),
+        'first describe prompt does not contain question B',
+      )
+      assert.ok(
+        gatewayPromptText(mock.calls[1]).includes('pergunta B'),
+        're-describe prompt carries the new question B',
+      )
+      assert.ok(
+        !gatewayPromptText(mock.calls[1]).includes('pergunta A'),
+        're-describe prompt does not contain the old question A',
+      )
     })
   } finally {
     mock.restore()
@@ -1892,6 +2358,75 @@ await (async () => {
   tempFileLRU.clear()
 })()
 
+// Atomic write (temp + rename) + dedup + failure safety.
+// A content-hash name used to be written directly, so a crash mid-write could
+// leave a TRUNCATED file that a later dedup reused as valid. The write is now a
+// sibling `.tmp-<pid>` write + atomic rename in the SAME dir: a failure can
+// leave at most a stray temp file, never a partial destination.
+await (async () => {
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  tempFileLRU.clear()
+  const data = Buffer.from('atomic-bytes')
+  const path = writeTempImageSync(data, 'image/png')
+  const expected = join(VISION_DIR, `${hashContent(data)}.png`)
+  assert.equal(path, expected, 'destination is the content-hash path')
+  assert.equal(readFileSync(path).equals(data), true, 'destination holds the exact bytes')
+  assert.equal(statSync(path).mode & 0o777, 0o600, 'atomic destination stays 0600')
+  assert.equal(statSync(VISION_DIR).mode & 0o777, 0o700, 'temp dir stays 0700')
+  assert.equal(
+    readdirSync(VISION_DIR).some((name) => name.includes('.tmp-')),
+    false,
+    'no temp file survives a successful rename',
+  )
+  // Dedup: identical bytes reuse the same file WITHOUT rewriting it (mtime
+  // unchanged), so a file another session may be reading is never disturbed.
+  const before = statSync(path).mtimeMs
+  const again = writeTempImageSync(data, 'image/png')
+  assert.equal(again, path, 'dedup reuses the same path')
+  assert.equal(statSync(path).mtimeMs, before, 'dedup skips the rewrite (mtime unchanged)')
+  // Simulated write failure: a DIRECTORY occupies the sibling temp path, so the
+  // write fails before any rename. The destination must be ABSENT — never a
+  // truncated/partial file a later dedup would trust.
+  const failData = Buffer.from('atomic-fail-bytes')
+  const failPath = join(VISION_DIR, `${hashContent(failData)}.png`)
+  const failTemp = `${failPath}.tmp-${process.pid}`
+  mkdirSync(failTemp, { recursive: true })
+  assert.throws(
+    () => writeTempImageSync(failData, 'image/png'),
+    'a failed write surfaces the error',
+  )
+  assert.equal(existsSync(failPath), false, 'failed write leaves NO destination (not partial)')
+  rmSync(failTemp, { recursive: true, force: true })
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  tempFileLRU.clear()
+})()
+
+// data URI parameters: `data:<mime>;param=value;base64,…` decodes (a browser or
+// clipboard may decorate the mime with parameters); malformed URIs → null.
+await (async () => {
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  tempFileLRU.clear()
+  const plain = await saveDataUrlImage('data:image/png;base64,ZmFrZQ==', 'image/png')
+  const withParams = await saveDataUrlImage(
+    'data:image/png;charset=utf-8;base64,ZmFrZQ==',
+    'image/png',
+  )
+  assert.ok(plain && withParams, 'both URIs decode')
+  assert.equal(withParams, plain, 'URI parameters decode to the same bytes/path')
+  assert.equal(
+    await saveDataUrlImage('data:image/png;base64=', 'image/png'),
+    null,
+    'empty payload → null',
+  )
+  assert.equal(
+    await saveDataUrlImage('data:image/png;base64', 'image/png'),
+    null,
+    'missing comma → null (malformed)',
+  )
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  tempFileLRU.clear()
+})()
+
 // LRU: beyond the cap the oldest old files are evicted, young files survive.
 await (async () => {
   tempFileLRU.clear()
@@ -2043,6 +2578,40 @@ for (const [count, text, expected] of intentCases) {
   assert.ok(
     buildNativeVisionPrompt('', 1).includes('sem pedido explícito'),
     'user text vazio → placeholder',
+  )
+
+  // ── Fase 2: pergunta contextualizada com bounds de payload ────────────────
+  // userText é truncado no teto de 2000 chars INCLUINDO o marcador "…"; o
+  // excedente não entra no prompt enviado ao gateway.
+  const longTail = 'CAUDA-LONGA-INVISIVEL-9f3a'
+  const truncated = buildNativeVisionPrompt(`${'a'.repeat(5000)} ${longTail}`, 1)
+  assert.ok(
+    truncated.includes(`${'a'.repeat(1999)}…`),
+    'user text truncado no teto de 2000 chars (1999 + "…" = 2000)',
+  )
+  assert.ok(
+    !truncated.includes(`${'a'.repeat(2000)}…`),
+    'o marcador "…" conta no teto: nunca 2001 chars',
+  )
+  assert.ok(!truncated.includes(longTail), 'excedente do user text não vaza no prompt')
+  assert.ok(
+    !buildNativeVisionPrompt('b'.repeat(1999), 1).includes('…'),
+    'texto dentro do teto não ganha marcador de truncamento',
+  )
+
+  // userText vazio/whitespace → prompt genérico de hoje (sem pedido explícito),
+  // semanticamente idêntico ao comportamento pré-Fase 2.
+  const emptyPrompt = buildNativeVisionPrompt('', 1)
+  assert.ok(
+    emptyPrompt.includes(
+      "User's request: (sem pedido explícito — descreva as imagens com precisão)",
+    ),
+    'vazio → linha de pedido com placeholder',
+  )
+  assert.equal(
+    buildNativeVisionPrompt('   \n\t  ', 1),
+    emptyPrompt,
+    'whitespace-only é tratado exatamente como vazio',
   )
 }
 
@@ -2222,6 +2791,886 @@ await (async () => {
   )
 })()
 
+// ─── Fase 1: descoberta de modelo pelo catálogo do host ────────────────────
+// Quando NENHUM modelo explícito está configurado (env PANTHEON_VISION_MODEL >
+// config visionModel > preset vision.model), o plugin descobre um modelo
+// image-capable via GET /config/providers (client.config.providers). Gate de
+// compatibilidade: só modelos com wire-format OpenAI (api.npm na allowlist) ou
+// providers Zen; o resultado é cacheado por processo/cliente com TTL curto
+// (sem refetch por request). Catálogo ausente/vazio/erro → comportamento atual
+// (DEFAULT_VISION_MODEL + endpoints Zen) — o catálogo nunca bloqueia.
+
+/** Model fixture shaped like the SDK `Model` (defensive subset). */
+function catalogModel({
+  id,
+  providerID = 'opencode-go',
+  npm = '@ai-sdk/openai-compatible',
+  url = `https://catalog.test/${providerID}/v1`,
+  image = true,
+  costInput = 0.5,
+  status = 'active',
+}) {
+  return {
+    id,
+    providerID,
+    status,
+    api: { url, npm },
+    capabilities: { input: { text: true, image } },
+    cost: { input: costInput, output: 1 },
+  }
+}
+
+/** Provider fixture shaped like the SDK `Provider` (models as record). */
+function catalogProvider(id, models) {
+  return { id, models: Object.fromEntries(models.map((m) => [m.id, m])) }
+}
+
+/** Mock client exposing client.config.providers (GET /config/providers). */
+function providersClient(providers) {
+  const calls = { count: 0 }
+  return {
+    client: {
+      config: {
+        providers: async () => {
+          calls.count++
+          return { data: { providers } }
+        },
+      },
+    },
+    calls,
+  }
+}
+
+const CATALOG_AUTH = { PANTHEON_OPENCODE_API_KEY: 'catalog-key' }
+
+// TTL do cache do catálogo: curto (minutos), nunca "vida do processo".
+assert.equal(typeof PROVIDERS_CACHE_TTL_MS, 'number', 'providers cache TTL exported')
+assert.ok(
+  PROVIDERS_CACHE_TTL_MS > 0 && PROVIDERS_CACHE_TTL_MS <= 5 * 60_000,
+  'providers cache TTL is short (minutes)',
+)
+
+// ── Unidade: descoberta escolhe image-capable PAGO, mais barato, URL do catálogo ──
+await (async () => {
+  const catalog = {
+    providers: [
+      catalogProvider('opencode-go', [
+        catalogModel({ id: 'paid-vision', costInput: 2 }),
+        catalogModel({ id: 'free-vision', costInput: 0, url: 'https://free.test/v1' }),
+        catalogModel({ id: 'text-only', image: false }),
+      ]),
+    ],
+  }
+  const target = await resolveNativeVisionTarget({
+    env: CATALOG_AUTH,
+    authStatePath: authStoreDir,
+    catalog,
+  })
+  assert.equal(
+    target?.modelID,
+    'opencode-go/paid-vision',
+    'discovery skips the free-tier image model and picks the paid one',
+  )
+  assert.equal(
+    target?.baseURL,
+    'https://catalog.test/opencode-go/v1',
+    'baseURL from catalog api.url',
+  )
+  assert.equal(target?.apiKey, 'catalog-key', 'env key still used')
+})()
+
+// determinismo: empate de custo → ordem lexicográfica por providerID/id
+await (async () => {
+  const catalog = {
+    providers: [
+      catalogProvider('opencode-go', [
+        catalogModel({ id: 'b-vision', costInput: 1 }),
+        catalogModel({ id: 'a-vision', costInput: 1 }),
+      ]),
+    ],
+  }
+  const target = await resolveNativeVisionTarget({
+    env: CATALOG_AUTH,
+    authStatePath: authStoreDir,
+    catalog,
+  })
+  assert.equal(target?.modelID, 'opencode-go/a-vision', 'cost tie → lexicographic order')
+})()
+
+// ── Unidade: config explícita vence a descoberta (env > config > preset) ────
+await (async () => {
+  const catalog = {
+    providers: [
+      catalogProvider('opencode-go', [
+        catalogModel({ id: 'env-model', url: 'https://env.test/v1' }),
+        catalogModel({ id: 'discovered', costInput: 0, url: 'https://discovered.test/v1' }),
+      ]),
+    ],
+  }
+  const base = { authStatePath: authStoreDir, catalog }
+
+  const viaEnv = await resolveNativeVisionTarget({
+    ...base,
+    env: { ...CATALOG_AUTH, PANTHEON_VISION_MODEL: 'opencode-go/env-model' },
+  })
+  assert.equal(viaEnv?.modelID, 'opencode-go/env-model', 'env beats discovery')
+  assert.equal(viaEnv?.baseURL, 'https://env.test/v1', 'env model URL from catalog')
+
+  const viaConfig = await resolveNativeVisionTarget({
+    ...base,
+    env: CATALOG_AUTH,
+    config: { visionModel: 'opencode-go/env-model' },
+  })
+  assert.equal(viaConfig?.modelID, 'opencode-go/env-model', 'config beats discovery')
+  assert.equal(viaConfig?.baseURL, 'https://env.test/v1', 'config model URL from catalog')
+
+  const viaPreset = await resolveNativeVisionTarget({
+    ...base,
+    env: CATALOG_AUTH,
+    preset: { vision: { model: 'opencode-go/env-model' } },
+  })
+  assert.equal(viaPreset?.modelID, 'opencode-go/env-model', 'preset beats discovery')
+  assert.equal(viaPreset?.baseURL, 'https://env.test/v1', 'preset model URL from catalog')
+})()
+
+// ── Unidade: gate de compatibilidade (npm OpenAI-compatible) ────────────────
+await (async () => {
+  const base = { env: CATALOG_AUTH, authStatePath: authStoreDir }
+
+  // descoberta ignora modelo image-capable com npm incompatível, mesmo free
+  // (o gate npm vale para providers desconhecidos; providers Zen são
+  // OpenAI-compatíveis por definição e permanecem na allowlist — Q2)
+  const mixed = {
+    providers: [
+      catalogProvider('opencode-go', [catalogModel({ id: 'paid-compat', costInput: 3 })]),
+      catalogProvider('weird-x', [
+        catalogModel({
+          id: 'free-incompat',
+          providerID: 'weird-x',
+          costInput: 0,
+          npm: '@ai-sdk/anthropic',
+        }),
+      ]),
+    ],
+  }
+  const gated = await resolveNativeVisionTarget({ ...base, catalog: mixed })
+  assert.equal(
+    gated?.modelID,
+    'opencode-go/paid-compat',
+    'npm gate: incompatible free model skipped',
+  )
+
+  // só incompatíveis → descoberta vazia → DEFAULT + Zen fallback (nunca o incompatível)
+  const onlyIncompat = {
+    providers: [
+      catalogProvider('custom-x', [
+        catalogModel({ id: 'img', providerID: 'custom-x', npm: '@ai-sdk/anthropic', costInput: 0 }),
+      ]),
+    ],
+  }
+  const fallback = await resolveNativeVisionTarget({ ...base, catalog: onlyIncompat })
+  assert.equal(
+    fallback?.modelID,
+    'opencode-go/mimo-v2.5',
+    'no compatible discovery → DEFAULT (last fallback)',
+  )
+  assert.equal(fallback?.baseURL, 'https://opencode.ai/zen/go/v1', 'DEFAULT → Zen fallback URL')
+
+  // explícito incompatível → null → fallback tool
+  const explicitIncompat = {
+    providers: [
+      catalogProvider('anthropic', [
+        catalogModel({ id: 'claude-vision', providerID: 'anthropic', npm: '@ai-sdk/anthropic' }),
+      ]),
+    ],
+  }
+  const rejected = await resolveNativeVisionTarget({
+    ...base,
+    env: { ...CATALOG_AUTH, PANTHEON_VISION_MODEL: 'anthropic/claude-vision' },
+    catalog: explicitIncompat,
+  })
+  assert.equal(rejected, null, 'explicit incompatible model → null (tool fallback)')
+
+  // provedor não-Zen com npm compatível → descobrível (fase 2 via catálogo),
+  // mas NUNCA herda a credencial Zen (env nem auth store legacy).
+  const thirdParty = {
+    providers: [
+      catalogProvider('gateway-x', [
+        catalogModel({ id: 'vision-x', providerID: 'gateway-x', costInput: 2 }),
+      ]),
+    ],
+  }
+
+  // (1) só a env Zen setada → null (sem vazamento cross-provider)
+  const leakedEnv = await resolveNativeVisionTarget({ ...base, catalog: thirdParty })
+  assert.equal(
+    leakedEnv,
+    null,
+    'non-Zen discovery + only Zen env key → null (no cross-provider leak)',
+  )
+
+  // (2) só o token legacy Zen no auth store (sem env) → null
+  writeAuthStore({ 'opencode-go': { access: 'ZEN-SECRET-TOKEN', expires: 0 } })
+  const leakedStore = await resolveNativeVisionTarget({
+    ...base,
+    env: {},
+    catalog: thirdParty,
+  })
+  assert.equal(leakedStore, null, 'non-Zen discovery + only legacy Zen auth-store token → null')
+
+  // (4) com credencial PRÓPRIA no auth store → usa ela, ignorando env/legacy Zen
+  writeAuthStore({
+    'opencode-go': { access: 'ZEN-SECRET-TOKEN', expires: 0 },
+    'gateway-x': { access: 'gateway-own-token', expires: 0 },
+  })
+  const opened = await resolveNativeVisionTarget({ ...base, catalog: thirdParty })
+  assert.equal(
+    opened?.modelID,
+    'gateway-x/vision-x',
+    'non-Zen provider discoverable via npm allowlist',
+  )
+  assert.equal(opened?.baseURL, 'https://catalog.test/gateway-x/v1', 'third-party catalog URL')
+  assert.equal(
+    opened?.apiKey,
+    'gateway-own-token',
+    'non-Zen uses ONLY its own auth-store credential (Zen env/legacy ignored)',
+  )
+  clearAuthStore()
+})()
+
+// ── Unidade: catálogo ausente/vazio/corrompido → comportamento atual ────────
+await (async () => {
+  const base = { env: CATALOG_AUTH, authStatePath: authStoreDir }
+  const cases = [
+    undefined,
+    null,
+    {},
+    { providers: [] },
+    { providers: [null] },
+    { providers: 'nope' },
+    { models: [null] },
+  ]
+  for (const catalog of cases) {
+    const t = await resolveNativeVisionTarget({ ...base, catalog })
+    assert.equal(
+      t?.modelID,
+      'opencode-go/mimo-v2.5',
+      `no usable catalog (${JSON.stringify(catalog)}) → DEFAULT model`,
+    )
+    assert.equal(t?.baseURL, 'https://opencode.ai/zen/go/v1', '…and Zen fallback endpoint')
+  }
+})()
+
+// ── Unidade: auth store — providerID resolvido antes dos legacy ─────────────
+await (async () => {
+  writeAuthStore({
+    'opencode-go': { access: 'legacy-go-token', expires: 0 },
+    opencode: { access: 'resolved-zen-token', expires: 0 },
+  })
+  const resolvedFirst = await resolveNativeVisionTarget({
+    preset: { vision: { model: 'opencode/mimo-x' } },
+    env: {},
+    authStatePath: authStoreDir,
+  })
+  assert.equal(
+    resolvedFirst?.apiKey,
+    'resolved-zen-token',
+    'resolved providerID entry tried BEFORE legacy list',
+  )
+
+  // legacy ainda alcançável quando o provider resolvido não tem entrada
+  writeAuthStore({ opencode: { access: 'zen-only-token', expires: 0 } })
+  const legacy = await resolveNativeVisionTarget({
+    preset: { vision: { model: 'opencode-go/mimo-y' } },
+    env: {},
+    authStatePath: authStoreDir,
+  })
+  assert.equal(legacy?.apiKey, 'zen-only-token', 'legacy entries remain a fallback')
+  clearAuthStore()
+})()
+
+// ── Wire: descoberta no turno — URL do catálogo, cache por processo/TTL ─────
+await (async () => {
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  const { client, calls: providersCalls } = providersClient([
+    catalogProvider('opencode-go', [
+      catalogModel({ id: 'wire-model', url: 'https://wire.test/v1', costInput: 2 }),
+    ]),
+  ])
+  const mock = installFetchMock(() => okJson('descrição via catálogo'))
+  try {
+    await withEnv('PANTHEON_OPENCODE_API_KEY', 'catalog-key', async () => {
+      const hooks = await makeHooks(client)
+      const out1 = await runTurn(hooks, [imagePart()], undefined, 'session-catalog-1')
+      assert.ok(
+        injectedText(out1.parts).includes('descrição via catálogo'),
+        'discovered model answered the first turn',
+      )
+      const out2 = await runTurn(hooks, [imagePart()], undefined, 'session-catalog-2')
+      assert.ok(
+        injectedText(out2.parts).includes('descrição via catálogo'),
+        'second turn still native',
+      )
+      assert.equal(mock.calls.length, 2, 'two native calls (one per turn)')
+      for (const call of mock.calls) {
+        assert.equal(
+          call.url,
+          'https://wire.test/v1/chat/completions',
+          'native call routes to catalog api.url',
+        )
+        assert.equal(call.url.includes('bifrost'), false, 'discovery never routes via bifrost')
+      }
+      assert.equal(
+        bodyOf(mock.calls[0]).model,
+        'wire-model',
+        'provider prefix stripped for discovered model',
+      )
+      assert.equal(
+        providersCalls.count,
+        1,
+        'catalog fetched ONCE per client (TTL cache, no refetch per request)',
+      )
+    })
+  } finally {
+    mock.restore()
+  }
+})()
+
+// ── Wire: client.config.providers ausente/erro → comportamento atual ────────
+await (async () => {
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  const mock = installFetchMock(() => okJson('fallback sem catálogo'))
+  try {
+    await withEnv('PANTHEON_OPENCODE_API_KEY', 'catalog-key', async () => {
+      const throwing = {
+        config: {
+          providers: async () => {
+            throw new Error('providers exploded')
+          },
+        },
+      }
+      const hooks = await makeHooks(throwing)
+      const output = await runTurn(hooks, [imagePart()], undefined, 'session-nocatalog')
+      assert.ok(
+        injectedText(output.parts).includes('fallback sem catálogo'),
+        'providers error → current behavior (DEFAULT native)',
+      )
+      assert.equal(
+        mock.calls[0]?.url,
+        'https://opencode.ai/zen/go/v1/chat/completions',
+        'Zen fallback endpoint without catalog',
+      )
+    })
+  } finally {
+    mock.restore()
+  }
+})()
+
+// ── Wire: catálogo rejeitando o modelo explícito (npm incompatível) → tool ──
+await (async () => {
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  const { client } = providersClient([
+    catalogProvider('anthropic', [
+      catalogModel({ id: 'claude-vision', providerID: 'anthropic', npm: '@ai-sdk/anthropic' }),
+    ]),
+  ])
+  const mock = installFetchMock(() => {
+    throw new Error('no native call may happen for an incompatible explicit model')
+  })
+  try {
+    await withEnv('PANTHEON_OPENCODE_API_KEY', 'catalog-key', async () => {
+      await withEnv('PANTHEON_VISION_MODEL', 'anthropic/claude-vision', async () => {
+        const hooks = await makeHooks(client)
+        const output = await runTurn(hooks, [imagePart()], undefined, 'session-incompat')
+        assert.equal(output.parts.some(isImageFilePart), false, 'image removed')
+        assert.equal(
+          JSON.stringify(output.parts).includes('image_url'),
+          false,
+          'no image_url reaches the provider',
+        )
+        assert.ok(
+          injectedText(output.parts).includes('pantheon_vision_vision_describe'),
+          'incompatible explicit model → tool instruction',
+        )
+      })
+    })
+    assert.equal(mock.calls.length, 0, 'no native call for incompatible model')
+  } finally {
+    mock.restore()
+  }
+})()
+
+// ─── Fase 3: robustez barata — timeout dinâmico + EXIF orientation ─────────
+
+// ─── F3-T1: computeNativeTimeoutMs — função pura de timeout ────────────────
+// Base = NATIVE_TIMEOUT_MS atual (60s); escala por MB de payload; teto 300s
+// (referência showlotus/opencode-image-vision: 120s→300s, adaptado à base).
+{
+  const base = 60_000 // NATIVE_TIMEOUT_MS (margem para reasoning do mimo)
+  const perMb = 10_000
+  assert.equal(computeNativeTimeoutMs(0), base, '0 bytes → base')
+  assert.equal(computeNativeTimeoutMs(1), base, 'payload mínimo → base')
+  assert.equal(computeNativeTimeoutMs(1024 * 1024 - 1), base, 'sub-1MB → base')
+  assert.equal(
+    computeNativeTimeoutMs(5 * 1024 * 1024),
+    base + 5 * perMb,
+    '5MB → cresce proporcional',
+  )
+  assert.equal(
+    computeNativeTimeoutMs(10 * 1024 * 1024),
+    base + 10 * perMb,
+    '10MB → cresce proporcional',
+  )
+  assert.equal(computeNativeTimeoutMs(1024 ** 3), 300_000, '1GB → teto exato 300s')
+  assert.equal(
+    computeNativeTimeoutMs(Number.MAX_SAFE_INTEGER),
+    300_000,
+    'valor enorme → teto exato 300s (nunca passa)',
+  )
+  assert.ok(
+    computeNativeTimeoutMs(25 * 1024 * 1024) <= 300_000,
+    'maior imagem válida (25MB) nunca excede o teto',
+  )
+  assert.equal(computeNativeTimeoutMs(-5), base, 'negativo → base (fail-safe)')
+}
+
+// ─── F3-T2: fetch respeita o timeout dinâmico (AbortSignal escalado) ───────
+// Mock timers (node:test) observam QUANDO o AbortSignal dispara, sem esperar
+// tempo real. A assinatura é preservada: o fetch continua recebendo um signal.
+await (async () => {
+  const target = {
+    modelID: 'opencode-go/mimo-v2.5',
+    baseURL: 'https://opencode.ai/zen/go/v1',
+    apiKey: 'k',
+  }
+  // data URI com ~mb megabytes decodificados (4/3 de overhead base64).
+  const payloadOfMb = (mb) => ({
+    url: `data:image/jpeg;base64,${'A'.repeat(Math.ceil((mb * 1024 * 1024 * 4) / 3))}`,
+  })
+  const fetchMock = installFetchMock(
+    (call) =>
+      new Promise((_resolve, reject) => {
+        call.options.signal.addEventListener('abort', () => reject(new Error('aborted')))
+      }),
+  )
+  try {
+    // payload pequeno → aborta exatamente no timeout base (60s)
+    mock.timers.enable({ apis: ['setTimeout'] })
+    let aborted = false
+    let p = describeImagesNative([{ url: 'data:image/png;base64,ZmFrZQ==' }], target)
+    fetchMock.calls[0].options.signal.addEventListener('abort', () => {
+      aborted = true
+    })
+    mock.timers.tick(59_999)
+    assert.equal(aborted, false, 'payload pequeno não aborta antes do timeout base')
+    mock.timers.tick(1)
+    assert.equal(aborted, true, 'payload pequeno aborta exatamente no timeout base (60s)')
+    assert.equal(await p, null, 'request abortado → null')
+    mock.timers.reset()
+
+    // 10MB → timeout dinâmico > base (60s + 10×10s = 160s)
+    mock.timers.enable({ apis: ['setTimeout'] })
+    aborted = false
+    p = describeImagesNative([payloadOfMb(10)], target)
+    fetchMock.calls[1].options.signal.addEventListener('abort', () => {
+      aborted = true
+    })
+    mock.timers.tick(60_000)
+    assert.equal(aborted, false, 'payload 10MB sobrevive ao timeout base')
+    mock.timers.tick(100_000)
+    assert.equal(aborted, true, 'payload 10MB aborta no timeout dinâmico (160s)')
+    assert.equal(await p, null)
+    mock.timers.reset()
+
+    // dois payloads de 10MB → soma (20MB) → 60s + 200s = 260s
+    mock.timers.enable({ apis: ['setTimeout'] })
+    aborted = false
+    p = describeImagesNative([payloadOfMb(10), payloadOfMb(10)], target)
+    fetchMock.calls[2].options.signal.addEventListener('abort', () => {
+      aborted = true
+    })
+    mock.timers.tick(200_000)
+    assert.equal(aborted, false, 'timeout considera a SOMA dos payloads')
+    mock.timers.tick(60_000)
+    assert.equal(aborted, true, 'payloads somados abortam em 260s')
+    assert.equal(await p, null)
+    mock.timers.reset()
+
+    // 29MB → teto exato de 300s (nunca passa)
+    mock.timers.enable({ apis: ['setTimeout'] })
+    aborted = false
+    p = describeImagesNative([payloadOfMb(29)], target)
+    fetchMock.calls[3].options.signal.addEventListener('abort', () => {
+      aborted = true
+    })
+    mock.timers.tick(299_999)
+    assert.equal(aborted, false, 'payload enorme não aborta antes do teto')
+    mock.timers.tick(1)
+    assert.equal(aborted, true, 'payload enorme aborta exatamente no teto de 300s')
+    assert.equal(await p, null)
+    mock.timers.reset()
+  } finally {
+    mock.timers.reset()
+    fetchMock.restore()
+  }
+})()
+
+// ─── F3-T2b: describeImagesNative failure classification (onFailure) ──────
+// The native describe must not collapse three DIFFERENT causes into one
+// misleading message: OUR budget expiring (timeout), a genuine transport drop
+// (network), and an EXTERNAL cancellation (cancelled — e.g. ToolContext.signal,
+// which must NEVER advertise a "retry").
+await (async () => {
+  const target = {
+    modelID: 'opencode-go/mimo-v2.5',
+    baseURL: 'https://opencode.ai/zen/go/v1',
+    apiKey: 'k',
+  }
+  const payload = [{ url: 'data:image/png;base64,ZmFrZQ==' }]
+
+  // (1) Our dynamic budget elapses → 'timeout' (+ the elapsed budget).
+  {
+    const fetchMock = installFetchMock(
+      (call) =>
+        new Promise((_resolve, reject) => {
+          call.options.signal.addEventListener('abort', () => reject(new Error('aborted')))
+        }),
+    )
+    try {
+      mock.timers.enable({ apis: ['setTimeout'] })
+      let failure
+      const p = describeImagesNative(payload, target, undefined, undefined, undefined, (f) => {
+        failure = f
+      })
+      mock.timers.tick(60_000)
+      assert.equal(await p, null, 'timed-out request → null')
+      assert.equal(failure?.reason, 'timeout', 'own budget → reason timeout')
+      assert.equal(failure?.timeoutMs, 60_000, 'timeout carries the elapsed budget')
+      assert.match(
+        nativeVisionFailureMessage(failure, target.modelID),
+        /timed out/i,
+        'timeout message names the timeout',
+      )
+    } finally {
+      mock.timers.reset()
+      fetchMock.restore()
+    }
+  }
+
+  // (2) Genuine transport drop → 'network'.
+  {
+    const fetchMock = installFetchMock(() => Promise.reject(new Error('ECONNRESET')))
+    try {
+      let failure
+      const result = await describeImagesNative(
+        payload,
+        target,
+        undefined,
+        undefined,
+        undefined,
+        (f) => {
+          failure = f
+        },
+      )
+      assert.equal(result, null, 'network failure → null')
+      assert.equal(failure?.reason, 'network', 'transport drop → reason network')
+      assert.match(
+        nativeVisionFailureMessage(failure, target.modelID),
+        /network/i,
+        'network message names the network error',
+      )
+    } finally {
+      fetchMock.restore()
+    }
+  }
+
+  // (3) External cancellation → 'cancelled' with a neutral, retry-free message.
+  {
+    const fetchMock = installFetchMock(
+      (call) =>
+        new Promise((_resolve, reject) => {
+          call.options.signal.addEventListener('abort', () => reject(new Error('aborted')))
+        }),
+    )
+    try {
+      const controller = new AbortController()
+      let failure
+      const p = describeImagesNative(
+        payload,
+        target,
+        undefined,
+        undefined,
+        controller.signal,
+        (f) => {
+          failure = f
+        },
+      )
+      controller.abort()
+      assert.equal(await p, null, 'external abort → null')
+      assert.equal(failure?.reason, 'cancelled', 'external abort → reason cancelled')
+      const message = nativeVisionFailureMessage(failure, target.modelID)
+      assert.match(message, /cancel/i, 'cancelled message names the cancellation')
+      assert.doesNotMatch(message, /retry/i, 'cancelled message never says retry')
+      assert.doesNotMatch(message, /network/i, 'cancelled is not misreported as a network drop')
+    } finally {
+      fetchMock.restore()
+    }
+  }
+})()
+
+// ─── F3-Fixtures: JPEG sintético com APP1 EXIF (zero-dep, bytes no teste) ──
+
+/**
+ * Constrói um JPEG mínimo sintético: SOI + [APP0 JFIF] + APP1/Exif (IFD0 com
+ * os tags informados) + EOI. `entries` são entradas IFD cruas (12 bytes cada).
+ */
+function buildExifJpeg({ byteOrder = 'II', jfifFirst = true, entries } = {}) {
+  const little = byteOrder === 'II'
+  const u16 = (v) => (little ? [v & 0xff, (v >> 8) & 0xff] : [(v >> 8) & 0xff, v & 0xff])
+  const u16be = (v) => [(v >> 8) & 0xff, v & 0xff] // comprimento de segmento JPEG é SEMPRE big-endian
+  const u32 = (v) =>
+    little
+      ? [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff]
+      : [(v >>> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+  // IFD0
+  const ifd = [...u16(entries.length), ...entries.flat()]
+  // TIFF header: byte-order + magic 42 + offset do IFD0 (8)
+  const tiff = [...(little ? [0x49, 0x49] : [0x4d, 0x4d]), ...u16(42), ...u32(8), ...ifd]
+  // APP1 payload: "Exif\0\0" + TIFF
+  const exifPayload = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00, ...tiff]
+  const bytes = [0xff, 0xd8] // SOI
+  if (jfifFirst) {
+    // APP0 JFIF: len 16, "JFIF\0", v1.1, unidades 0, densidade 1×1, thumb 0
+    bytes.push(
+      0xff,
+      0xe0,
+      0x00,
+      0x10,
+      0x4a,
+      0x46,
+      0x49,
+      0x46,
+      0x00,
+      0x01,
+      0x01,
+      0x00,
+      0x00,
+      0x01,
+      0x00,
+      0x01,
+      0x00,
+      0x00,
+    )
+  }
+  bytes.push(0xff, 0xe1, ...u16be(exifPayload.length + 2), ...exifPayload)
+  bytes.push(0xff, 0xd9) // EOI
+  return Uint8Array.from(bytes)
+}
+
+/** Entrada IFD do tag Orientation (0x0112, SHORT, count 1, valor inline). */
+function orientationEntry(orientation, byteOrder = 'II') {
+  const little = byteOrder === 'II'
+  const u16 = (v) => (little ? [v & 0xff, (v >> 8) & 0xff] : [(v >> 8) & 0xff, v & 0xff])
+  const u32 = (v) =>
+    little
+      ? [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff]
+      : [(v >>> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+  const value = little
+    ? [orientation & 0xff, 0x00, 0x00, 0x00]
+    : [0x00, orientation & 0xff, 0x00, 0x00]
+  return [...u16(0x0112), ...u16(3), ...u32(1), ...value]
+}
+
+/** Entrada IFD Make (0x010F, ASCII, count 2, valor inline "X\0") — enche o IFD. */
+function makeEntry(byteOrder = 'II') {
+  const little = byteOrder === 'II'
+  const u16 = (v) => (little ? [v & 0xff, (v >> 8) & 0xff] : [(v >> 8) & 0xff, v & 0xff])
+  const u32 = (v) =>
+    little
+      ? [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff]
+      : [(v >>> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+  return [...u16(0x010f), ...u16(2), ...u32(2), 0x58, 0x00, 0x00, 0x00]
+}
+
+const jpegDataUri = (bytes) => `data:image/jpeg;base64,${Buffer.from(bytes).toString('base64')}`
+
+// ─── F3-T3: readExifOrientation — detector APP1 mínimo ─────────────────────
+
+assert.equal(
+  readExifOrientation(buildExifJpeg({ entries: [orientationEntry(6)] })),
+  6,
+  'JPEG com APP1 EXIF (II) → orientation 6',
+)
+assert.equal(
+  readExifOrientation(buildExifJpeg({ byteOrder: 'MM', entries: [orientationEntry(3, 'MM')] })),
+  3,
+  'byte-order big-endian (MM) → orientation 3',
+)
+assert.equal(
+  readExifOrientation(buildExifJpeg({ entries: [makeEntry(), orientationEntry(8)] })),
+  8,
+  'IFD com múltiplos tags → acha 0x0112',
+)
+assert.equal(
+  readExifOrientation(buildExifJpeg({ jfifFirst: false, entries: [orientationEntry(6)] })),
+  6,
+  'APP1 como primeiro segmento → orientation 6',
+)
+assert.equal(
+  readExifOrientation(buildExifJpeg({ entries: [orientationEntry(1)] })),
+  1,
+  'orientation 1 é um valor válido',
+)
+
+// JPEG sem EXIF → null
+assert.equal(
+  readExifOrientation(
+    Uint8Array.from([
+      0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+      0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+    ]),
+  ),
+  null,
+  'JPEG sem APP1 EXIF → null',
+)
+// APP1 sem header "Exif\0\0" (ex.: XMP) → null
+assert.equal(
+  readExifOrientation(
+    Uint8Array.from([
+      0xff, 0xd8, 0xff, 0xe1, 0x00, 0x14, 0x68, 0x74, 0x74, 0x70, 0x3a, 0x2f, 0x2f, 0x78, 0x6d,
+      0x70, 0x2e, 0x6f, 0x72, 0x67, 0x00, 0x00, 0xff, 0xd9,
+    ]),
+  ),
+  null,
+  'APP1 não-EXIF (XMP) → null',
+)
+// Payload não-JPEG (PNG) → null, sem tentativa de parse
+assert.equal(
+  readExifOrientation(
+    Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]),
+  ),
+  null,
+  'PNG → null',
+)
+// Bytes malformados/truncados → null, NUNCA throw (fail-safe)
+for (const [label, bad] of Object.entries({
+  vazio: Uint8Array.from([]),
+  'só SOI': Uint8Array.from([0xff, 0xd8]),
+  'SOI + marcador solto': Uint8Array.from([0xff, 0xd8, 0xff]),
+  'não-JPEG': Uint8Array.from([0x00, 0x01, 0x02, 0x03]),
+  'só EOI': Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]),
+  'APP1 truncado': Uint8Array.from([0xff, 0xd8, 0xff, 0xe1, 0x00, 0x50, 0x45, 0x78]),
+  'TIFF truncado': Uint8Array.from([
+    0xff, 0xd8, 0xff, 0xe1, 0x00, 0x0c, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00, 0x49, 0x49,
+  ]),
+  'TIFF magic inválido': Uint8Array.from([
+    0xff, 0xd8, 0xff, 0xe1, 0x00, 0x10, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00, 0x49, 0x49, 0x00, 0x2b,
+    0x08, 0x00,
+  ]),
+})) {
+  assert.equal(readExifOrientation(bad), null, `malformado (${label}) → null, sem throw`)
+}
+
+// ─── F3-T4: payloadOrientation — orientação por payload (fail-safe) ────────
+
+assert.equal(
+  payloadOrientation({ url: jpegDataUri(buildExifJpeg({ entries: [orientationEntry(6)] })) }),
+  6,
+  'data URI JPEG com EXIF → 6',
+)
+assert.equal(
+  payloadOrientation({ url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==' }),
+  null,
+  'data URI PNG → null (sem parse)',
+)
+assert.equal(payloadOrientation({ url: 'https://example.com/foto.jpg' }), null, 'URL remota → null')
+
+// ─── F3-T5: buildOrientationHint — hint textual por imagem ─────────────────
+
+assert.equal(buildOrientationHint([null]), '', 'sem orientação → hint vazio')
+assert.equal(buildOrientationHint([1]), '', 'orientation 1 → hint vazio')
+assert.equal(buildOrientationHint([1, null]), '', 'só valores neutros → hint vazio')
+const hint6 = buildOrientationHint([6])
+assert.ok(hint6.includes('image 1'), 'hint menciona a imagem 1')
+assert.ok(hint6.includes('90-degree clockwise'), 'hint descreve a correção de orientation 6')
+const hintMixed = buildOrientationHint([1, 8, null, 3])
+assert.ok(hintMixed.includes('image 2'), 'hint menciona só a imagem rotacionada (2)')
+assert.ok(hintMixed.includes('counter-clockwise'), 'orientation 8 → rotação anti-horária')
+assert.ok(!hintMixed.includes('image 1:'), 'image 1 (orientation 1) fora do hint')
+assert.ok(!hintMixed.includes('image 3:'), 'image 3 (sem EXIF) fora do hint')
+assert.ok(hintMixed.includes('image 4:'), 'image 4 (orientation 3) no hint')
+
+// ─── F3-T6: prompt com/sem hint + participação na chave de cache ───────────
+
+const f3BasePrompt = buildNativeVisionPrompt('o que é?', 1)
+assert.equal(
+  f3BasePrompt.includes('IMAGE ORIENTATION'),
+  false,
+  'sem hint → prompt idêntico ao atual (sem bloco de orientação)',
+)
+assert.equal(
+  buildNativeVisionPrompt('o que é?', 1, 'describe', ''),
+  f3BasePrompt,
+  'hint vazio → saída byte-idêntica à sem argumento',
+)
+const f3HintedPrompt = buildNativeVisionPrompt('o que é?', 1, 'describe', buildOrientationHint([6]))
+assert.ok(f3HintedPrompt.includes('IMAGE ORIENTATION'), 'orientation ≠ 1 → prompt contém o hint')
+assert.ok(f3HintedPrompt.includes('90-degree clockwise'), 'hint no prompt descreve a correção')
+assert.ok(f3HintedPrompt.includes('o que é?'), 'userText preservado com hint presente')
+assert.ok(
+  f3HintedPrompt.includes('{userText}') === false,
+  'hint não re-expande template variables (escape da F2 intacto)',
+)
+// O hint DEVE entrar na chave do cache: mesmo payload + prompts diferentes →
+// chaves diferentes (evita hit stale se a detecção variar entre chamadas).
+const f3Payload = { url: 'data:image/png;base64,ZmFrZQ==' }
+assert.notEqual(
+  buildDescriptionCacheKey(f3HintedPrompt, [f3Payload]),
+  buildDescriptionCacheKey(f3BasePrompt, [f3Payload]),
+  'hint de orientação participa da chave do cache (via prompt)',
+)
+
+// ─── F3-T7: integração end-to-end — hint no prompt do gateway ──────────────
+
+await (async () => {
+  rmSync(VISION_DIR, { recursive: true, force: true })
+  clearAuthStore()
+  const jpegRotated = jpegDataUri(buildExifJpeg({ entries: [orientationEntry(6)] }))
+  const jpegUpright = jpegDataUri(buildExifJpeg({ entries: [orientationEntry(1)] }))
+  const prompts = []
+  const mock = installFetchMock((call) => {
+    prompts.push(bodyOf(call).messages[0].content[0].text)
+    return okJson('<item id="1"><description>foto descrita</description></item>')
+  })
+  try {
+    await withEnv('PANTHEON_OPENCODE_API_KEY', 'test-key-123', async () => {
+      const hooks = await makeHooks()
+      // Turno 1: JPEG rotacionado (orientation 6) → hint no prompt do gateway
+      const out1 = await runTurn(hooks, [
+        imagePart({ mime: 'image/jpeg', filename: 'rotada.jpg', url: jpegRotated }),
+        textPart('descreva'),
+      ])
+      assert.equal(out1.parts.some(isImageFilePart), false, 'imagem removida do turno')
+      assert.ok(JSON.stringify(out1.parts).includes('foto descrita'), 'descrição nativa injetada')
+      // Turno 2: JPEG upright (orientation 1) → prompt sem hint
+      await runTurn(hooks, [
+        imagePart({ mime: 'image/jpeg', filename: 'reta.jpg', url: jpegUpright }),
+        textPart('descreva'),
+      ])
+    })
+    assert.equal(mock.calls.length, 2, 'duas chamadas nativas (payloads distintos → cache miss)')
+    assert.ok(prompts[0].includes('IMAGE ORIENTATION'), 'turno 1: hint de orientação no prompt')
+    assert.ok(prompts[0].includes('90-degree clockwise'), 'turno 1: correção descrita no hint')
+    assert.equal(
+      prompts[1].includes('IMAGE ORIENTATION'),
+      false,
+      'turno 2: orientation 1 → prompt sem hint',
+    )
+  } finally {
+    mock.restore()
+  }
+})()
+
 // ─── Teardown ──────────────────────────────────────────────────────────────
 
 rmSync(VISION_DIR, { recursive: true, force: true })
@@ -2233,6 +3682,8 @@ if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME
 else process.env.XDG_CONFIG_HOME = previousXdg
 if (previousHome === undefined) delete process.env.HOME
 else process.env.HOME = previousHome
+if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+else process.env.XDG_DATA_HOME = previousDataHome
 if (previousOpenCodeKey === undefined) delete process.env.PANTHEON_OPENCODE_API_KEY
 else process.env.PANTHEON_OPENCODE_API_KEY = previousOpenCodeKey
 if (previousOaiKey === undefined) delete process.env.OPENCODE_API_KEY

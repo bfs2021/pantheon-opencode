@@ -3,7 +3,7 @@ presets:
   go-free:
     description: "Free-tier lineup via OpenCode Zen 2026: big-pickle orchestrator, nemotron-3-super-free planner, qwen3.6-plus-free reviewer, deepseek-v4-flash-free implementers, mimo-v2.5-free scouts. Only -free suffix models; quota, availability and pricing depend on Zen account. 2026 pricing verified."
     vision:
-      model: opencode/mimo-v2.5-free
+      model: opencode/mimo-v2.6-flash-free
       reasoning_effort: low
     providers:
       opencode:
