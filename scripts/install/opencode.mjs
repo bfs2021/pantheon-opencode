@@ -1706,6 +1706,22 @@ export async function installOpenCode(
     writeActivePreset(target, opts.preset, { source: 'cli' })
   }
 
+  // -----------------------------------------------------------------------
+  // 5.5 Optional vision prompt (interactive TTY only). The default — automatic
+  //     discovery — writes nothing, and non-interactive flows (no TTY, --yes,
+  //     --headless, automated sandboxes) never reach this block, so no run
+  //     blocks on stdin and the default behavior is unchanged. A failure here
+  //     must never fail the install: vision stays optional.
+  // -----------------------------------------------------------------------
+  if (interactive && !dryRun && !autoYes) {
+    const { runVisionPrompt } = await import('./vision-prompt.mjs')
+    try {
+      await runVisionPrompt({ logger: console })
+    } catch (err) {
+      warning(`Vision setup skipped: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   // Fail-closed: accumulated stats.errors (bad sources, missing requirements,
   // failed health checks) must never masquerade as a successful installation.
   if (stats.errors > 0) {

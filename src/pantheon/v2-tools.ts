@@ -40,6 +40,7 @@ import { createCostCommand } from './cost-command.ts'
 import { createHashlineEditTool, type HashlineToolResult } from './hashline/tool.ts'
 import { createModelCommand } from './model-command.ts'
 import type { ToolContextLike } from './tool-context.ts'
+import { createV2VisionTool, type V2VisionRuntime } from './v2-vision.ts'
 
 // ─── Contract types ─────────────────────────────────────────────────────
 
@@ -388,8 +389,8 @@ async function executeModel(
  * performs filesystem or database work at construction, so importing this
  * module stays side-effect free.
  */
-export function createV2ToolDefinitions(): V2ToolDef[] {
-  return [
+export function createV2ToolDefinitions(visionRuntime?: V2VisionRuntime): V2ToolDef[] {
+  const definitions: V2ToolDef[] = [
     {
       name: 'hashline_edit',
       description:
@@ -423,4 +424,6 @@ export function createV2ToolDefinitions(): V2ToolDef[] {
       execute: executeModel,
     },
   ]
+  if (visionRuntime) definitions.push(createV2VisionTool(visionRuntime))
+  return definitions
 }

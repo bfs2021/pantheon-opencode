@@ -3,8 +3,10 @@
  *
  * Registers:
  * - 3 self-sufficient tools via V2 tool.transform (hashline_edit,
- *   pantheon_cost, pantheon_model — see ./pantheon/v2-tools.ts; the goal tools
- *   need V1 infrastructure and are absent from this surface)
+ *   pantheon_cost, pantheon_model) plus native `vision_describe` when the host
+ *   exposes the V2 model catalog; Vision resolves OpenCode Zen auth and sends
+ *   images directly to the selected multimodal model.
+ *   The goal tools need V1 infrastructure and are absent from this surface.
  * - 5 event subscriptions (session.created, idle, deleted, error, compacted)
  * - Session hooks (prompt, context, compaction)
  * - A tool `execute.before` hook that ENFORCES read-only sessions: the agent
@@ -26,7 +28,7 @@
  * `execute` MUST resolve to a value carrying `output`. The host enforces the
  * two as a pair — see `V2ToolDraft` for the exact contract.
  *
- * ## The four domains the SDK types do not carry
+ * ## The host domains the SDK types do not carry
  *
  * `@opencode-ai/plugin` 1.18.33 types `PluginContext` as exactly:
  *   options · agent · aisdk · catalog · command · integration · plugin ·
@@ -35,7 +37,7 @@
  * same, so following the stable SDK line does not resolve this: it is a
  * STRUCTURAL DECLARATION task, not a pin reconciliation.
  *
- * A live opencode 2.0.22 host DOES have all four, with the shapes this module
+ * A live opencode 2.0.22+ host DOES have these domains, with the shapes this module
  * uses. Measured by `tests/canary/plugin-v2-tool-canary.test.mjs`, which loads
  * this file through the real loader and records `Object.keys(ctx)` from inside
  * the host:
@@ -62,7 +64,7 @@
  * for the others. The cast is not a licence to assume: the canary above is what
  * proves the domains exist on a real host, and it fails if they stop existing.
  *
- * If the SDK ever exposes these four, replacing `hostDomains` with the real
+ * If the SDK ever exposes these host domains, replacing `hostDomains` with the real
  * type is a one-line change. Do NOT make that change while 1.18.x lacks them.
  *
  * V2_UNSUPPORTED_FEATURES distinguishes adapter limitations from observed
@@ -103,6 +105,7 @@ import {
 import { createV2ExecuteAfter, resolveV2SandboxConfig } from './pantheon/v2-execute-after.ts'
 import { createV2ToolDefinitions, type V2ToolResult } from './pantheon/v2-tools.ts'
 import { V2_UNSUPPORTED_FEATURE_SEED } from './pantheon/v2-unsupported.mjs'
+import { buildV2VisionPromptContext, type V2VisionRuntime } from './pantheon/v2-vision.ts'
 import { type HookPayload, type HookResult, runHook } from './plugins/hook-runner.ts'
 
 // ─── Unsupported Features Registry ───────────────────────────────────────
@@ -250,12 +253,22 @@ interface V2SessionDomain {
   get?: (input: { sessionID: string }) => Promise<unknown>
 }
 
-/** `PluginContext` plus the four domains 1.18.x omits. See the module header. */
+interface V2ModelDomain {
+  list?: V2VisionRuntime['model']['list']
+}
+
+interface V2GenerateDomain {
+  text?: (input: { model: { providerID: string; id: string }; prompt: string }) => Promise<unknown>
+}
+
+/** `PluginContext` plus the host domains 1.18.x omits. See the module header. */
 interface HostPluginContext extends PluginContext {
   tool?: V2ToolDomain
   event?: V2EventDomain
   permission?: V2PermissionDomain
   session?: V2SessionDomain
+  model?: V2ModelDomain
+  generate?: V2GenerateDomain
 }
 
 /**
@@ -416,7 +429,8 @@ function transformReferences(draft: ReferenceDraft): void {
  * Returns true if tools were registered, false if the API is unavailable.
  */
 async function registerV2Tools(context: PluginContext): Promise<boolean> {
-  const toolCtx = hostDomains(context).tool
+  const host = hostDomains(context)
+  const toolCtx = host.tool
 
   if (!toolCtx?.transform) {
     return false
@@ -426,7 +440,11 @@ async function registerV2Tools(context: PluginContext): Promise<boolean> {
     // Tool definitions carry their own `output` declaration; the draft requires
     // it, and the host rejects a definition whose result shape cannot satisfy
     // the declaration it makes.
-    const toolDefs = createV2ToolDefinitions()
+    const model = host.model
+    const visionReady = typeof model?.list === 'function'
+    if (!visionReady) markUnsupported('vision-tool')
+    const visionRuntime = visionReady ? ({ model } as V2VisionRuntime) : undefined
+    const toolDefs = createV2ToolDefinitions(visionRuntime)
 
     await toolCtx.transform((draft: V2ToolDraft) => {
       // Catalog grouping only. The host computes a tool's registration id as
@@ -566,6 +584,22 @@ async function onSessionCreated(_event: V2SessionEvent): Promise<void> {
 }
 
 async function onSessionIdle(_event: V2SessionEvent): Promise<void> {
+  // Temp-image sweep on the V2-only path: DELIBERATELY DEFERRED.
+  //
+  // V1 unlinks a session's temp images on `session.idle`/`session.deleted`
+  // (`cleanupSessionTempImages`, grace-guarded and refcounted). V2 cannot reuse
+  // it: `saveDataUrlImageSync` (the V2 materialization path) receives no session
+  // id, so there is no per-session `path → createdAt` map to sweep, and the
+  // content-hash temp dir is refcounted ONLY on the V1 path. The one reusable
+  // piece, `enforceTempFileCap`, is already invoked off every V2 save
+  // (`saveDataUrlImageSync`), so disk usage is bounded without an idle pass —
+  // re-running it here would be redundant, and a GLOBAL age-based unlink fired
+  // by one session's idle could delete a file another live session still
+  // references. Delivery is also best-effort: with no `ctx.event.subscribe`
+  // the stream is unsupported (`markUnsupported('event-stream')`) and no idle
+  // ever arrives. Implementing this safely needs V2-side session threading
+  // first; until then it stays deferred rather than approximated.
+  //
   // Idle continuation — goal loop / todo enforcer dispatch. This one really
   // does delegate: `bridge.todoEnforcer` is the V1 enforcer instance, reached
   // only in a process that also loaded V1. On a V2-only install the bridge
@@ -712,12 +746,31 @@ async function registerV2SessionHooks(context: PluginContext): Promise<boolean> 
   }
 
   try {
-    // "prompt" hook — vision message interception
-    await sessionCtx.hook('prompt', (_event: unknown) => {
-      // Vision interception. No V2-side implementation: the handler lives in
-      // the V1 path (`vision.chatMessage`), which is not loaded on a V2-only
-      // install. This is a permanent no-op there, not a graceful degradation —
-      // nothing is delegated, because there is nothing here to delegate to.
+    // "prompt" hook — preserve attached image references and add model-visible
+    // instructions so Zeus can inspect visual context and pass it to the
+    // implementation specialist before editing.
+    await sessionCtx.hook('prompt', (event: unknown) => {
+      try {
+        // 2.0.29 host payload: `{ sessionID, messageID, prompt: { text,
+        // files, agents, skills }, metadata, delivery }`. The session id is
+        // top-level (verified against the host's `SessionPrompt.prepare`), so a
+        // data: attachment's panic-free moment also relays it to the MCP.
+        const admission = event as {
+          sessionID?: unknown
+          prompt?: { text?: unknown; files?: unknown }
+        } | null
+        const prompt = admission?.prompt
+        if (!prompt || typeof prompt.text !== 'string') return
+        if (prompt.text.includes('<!-- pantheon-v2-visual-context -->')) return
+        const sessionID =
+          typeof admission?.sessionID === 'string' && admission.sessionID.trim() !== ''
+            ? admission.sessionID
+            : undefined
+        const visualContext = buildV2VisionPromptContext(prompt.files, prompt.text, sessionID)
+        if (visualContext) prompt.text = `${prompt.text}\n\n${visualContext}`
+      } catch {
+        // Fail-open: malformed/unsupported prompt shapes must not block input.
+      }
     })
     registered = true
   } catch {
@@ -823,6 +876,93 @@ function appendV2HookLog(line: string): boolean {
     return true
   } catch {
     return false
+  }
+}
+
+// ─── BENCH Hook Timing (beta-10 latency slice, Phase 0) ────────────────
+
+/**
+ * BENCH INSTRUMENTATION — observation only, zero behavior change.
+ *
+ * The beta-10 latency slice measures the V2 tool hook chain. These helpers
+ * record the start/end of `execute.before` and `execute.after` per tool call
+ * and append one single-line `[bench]` entry per hook end to the EXISTING
+ * hooks.log channel (same appendV2HookLog path as every other line: masked,
+ * stamped, best-effort, never throwing). The lines are consumed by
+ * bench/lib/hooklog.mjs.
+ *
+ * Deliberate properties:
+ *   - the log call happens in `finally`, so denied calls (read-only guard,
+ *     secret block) are timed too, and the denial still propagates unchanged
+ *   - the join key is the host callID (`event.id`); a TTL-bounded map prunes
+ *     stale entries so a background/never-after call cannot leak memory
+ *   - `since_before_ms=unavailable` when no before record exists — the bench
+ *     contract never lets "unavailable" be encoded as 0
+ */
+
+/** Entries older than this are pruned (a task tool result may never fire after). */
+const BENCH_TIMING_TTL_MS = 5 * 60_000
+/** Hard cap — mirrors the V1 delegationStarts bound. */
+const BENCH_TIMING_MAX = 256
+
+const benchTimings = new Map<string, number>()
+
+function pruneBenchTimings(now: number): void {
+  for (const [callID, startedAt] of benchTimings) {
+    if (now - startedAt > BENCH_TIMING_TTL_MS) benchTimings.delete(callID)
+  }
+  while (benchTimings.size >= BENCH_TIMING_MAX) {
+    let oldestID: string | null = null
+    let oldestAt = Number.POSITIVE_INFINITY
+    for (const [id, at] of benchTimings) {
+      if (at < oldestAt) {
+        oldestAt = at
+        oldestID = id
+      }
+    }
+    if (oldestID === null) break
+    benchTimings.delete(oldestID)
+  }
+}
+
+/** Read `{tool, id}` off a V2 tool event without assuming its exact shape. */
+function benchEventIdentity(event: unknown): { tool: string; callID: string } {
+  if (event === null || typeof event !== 'object') return { tool: '', callID: '' }
+  const payload = event as { tool?: unknown; id?: unknown }
+  return {
+    tool: typeof payload.tool === 'string' ? payload.tool : '',
+    callID: typeof payload.id === 'string' ? payload.id : '',
+  }
+}
+
+/**
+ * Append one `[bench]` timing line for a finished hook phase. Best-effort and
+ * exception-free by construction (appendV2HookLog never throws).
+ */
+function logBenchHookTiming(phase: 'before' | 'after', event: unknown, startedAt: number): void {
+  try {
+    const { tool, callID } = benchEventIdentity(event)
+    const endedAt = Date.now()
+    if (phase === 'before') {
+      if (callID !== '') {
+        benchTimings.set(callID, startedAt)
+        pruneBenchTimings(startedAt)
+      }
+      appendV2HookLog(
+        `[bench] tool.execute.before end tool=${tool} callID=${callID} ` +
+          `started_at=${new Date(startedAt).toISOString()} duration_ms=${endedAt - startedAt}`,
+      )
+      return
+    }
+    const beforeAt = callID !== '' ? benchTimings.get(callID) : undefined
+    if (beforeAt !== undefined) benchTimings.delete(callID)
+    const sinceBefore = beforeAt === undefined ? 'unavailable' : String(endedAt - beforeAt)
+    appendV2HookLog(
+      `[bench] tool.execute.after end tool=${tool} callID=${callID} ` +
+        `duration_ms=${endedAt - startedAt} since_before_ms=${sinceBefore}`,
+    )
+  } catch {
+    // Instrumentation must never affect the hook chain.
   }
 }
 
@@ -1058,63 +1198,69 @@ async function registerV2ToolHooks(context: PluginContext): Promise<boolean> {
     // here; without it the tools registered by registerV2Tools would be a live
     // write path in every session, including read-only ones.
     await toolCtx.hook('execute.before', async (event: unknown) => {
+      const benchStartedAt = Date.now()
       const { input, output, agent } = adaptV2ExecuteBeforeEvent(event)
-      // V2's equivalent of V1's `chat.params` trigger: the host puts the active
-      // agent on the event itself, so registering here needs no separate hook
-      // and no session→agent map. A non-read-only (or absent) agent revokes the
-      // registration, which also covers an in-session agent switch.
-      syncReadOnlySession(readOnlyRegistry, input.sessionID, agent)
-      // Deliberately OUTSIDE the try/catch below: a read-only denial must keep
-      // propagating to the host, not be swallowed as a scanner failure.
-      await v2EnforcementGuard(input, output)
-
-      // High-confidence secret scan (scripts/hooks/scan-secrets.sh). This is the
-      // ONLY hard block on the V2 surface, and it exists here — rather than via
-      // `src/plugins/pantheon-hooks.ts` — because that module is a separate
-      // plugin that is never loaded on a V2-only install: opencode.json
-      // `plugins` declares only `src/plugin-v2`. V1's scan-secrets block was
-      // therefore inert by construction, not by misconfiguration.
-      //
-      // exit 0 → allow. exit 1 with a valid scanner report → advisory, logged
-      // only. exit 2 (high-confidence match) → deny. A scanner that does NOT
-      // produce a trustworthy verdict — missing/unexecutable script, timeout,
-      // killed child, spawn/serialization failure, malformed or unexpected
-      // output — is fail-CLOSED: this pending tool call is denied, the session
-      // is not. (runHook resolves a structured result instead of rejecting, so
-      // the exit-code-only reading below cannot lean on an exception.)
-      let blockError: Error | null = null
       try {
-        const payload: HookPayload = {
-          tool_name: input.tool,
-          tool_input: output.args ?? {},
-          agent_id: typeof agent === 'string' ? agent : '',
-          session_id: input.sessionID,
-        }
-        const scan = await secretScanRunner(payload)
-        const decision = evaluateSecretScanResult(scan)
-        if (decision.action === 'block') {
-          appendV2HookLog(SECRET_BLOCK_MESSAGE)
-          appendV2HookLog(scan.stderr)
-          blockError = new Error(SECRET_BLOCK_MESSAGE)
-        } else if (decision.action === 'advisory') {
-          // Advisory: log only, never block.
-          appendV2HookLog(scan.stderr)
-        } else if (decision.action === 'fail-closed') {
-          // Sanitized failure category only — never the scanner's raw stderr,
-          // which on a failure path is unverified and may carry the very
-          // payload the scan exists to keep out of logs.
-          appendV2HookLog(`${SECRET_SCAN_UNAVAILABLE_MESSAGE} (${decision.reason})`)
+        // V2's equivalent of V1's `chat.params` trigger: the host puts the active
+        // agent on the event itself, so registering here needs no separate hook
+        // and no session→agent map. A non-read-only (or absent) agent revokes the
+        // registration, which also covers an in-session agent switch.
+        syncReadOnlySession(readOnlyRegistry, input.sessionID, agent)
+        // Deliberately OUTSIDE the try/catch below: a read-only denial must keep
+        // propagating to the host, not be swallowed as a scanner failure.
+        await v2EnforcementGuard(input, output)
+
+        // High-confidence secret scan (scripts/hooks/scan-secrets.sh). This is the
+        // ONLY hard block on the V2 surface, and it exists here — rather than via
+        // `src/plugins/pantheon-hooks.ts` — because that module is a separate
+        // plugin that is never loaded on a V2-only install: opencode.json
+        // `plugins` declares only `src/plugin-v2`. V1's scan-secrets block was
+        // therefore inert by construction, not by misconfiguration.
+        //
+        // exit 0 → allow. exit 1 with a valid scanner report → advisory, logged
+        // only. exit 2 (high-confidence match) → deny. A scanner that does NOT
+        // produce a trustworthy verdict — missing/unexecutable script, timeout,
+        // killed child, spawn/serialization failure, malformed or unexpected
+        // output — is fail-CLOSED: this pending tool call is denied, the session
+        // is not. (runHook resolves a structured result instead of rejecting, so
+        // the exit-code-only reading below cannot lean on an exception.)
+        let blockError: Error | null = null
+        try {
+          const payload: HookPayload = {
+            tool_name: input.tool,
+            tool_input: output.args ?? {},
+            agent_id: typeof agent === 'string' ? agent : '',
+            session_id: input.sessionID,
+          }
+          const scan = await secretScanRunner(payload)
+          const decision = evaluateSecretScanResult(scan)
+          if (decision.action === 'block') {
+            appendV2HookLog(SECRET_BLOCK_MESSAGE)
+            appendV2HookLog(scan.stderr)
+            blockError = new Error(SECRET_BLOCK_MESSAGE)
+          } else if (decision.action === 'advisory') {
+            // Advisory: log only, never block.
+            appendV2HookLog(scan.stderr)
+          } else if (decision.action === 'fail-closed') {
+            // Sanitized failure category only — never the scanner's raw stderr,
+            // which on a failure path is unverified and may carry the very
+            // payload the scan exists to keep out of logs.
+            appendV2HookLog(`${SECRET_SCAN_UNAVAILABLE_MESSAGE} (${decision.reason})`)
+            blockError = new Error(SECRET_SCAN_UNAVAILABLE_MESSAGE)
+          }
+        } catch {
+          // The runner is contracted to resolve a structured result, so this only
+          // guards an unexpected throw (including a future change to the runner).
+          // A scanner that cannot run is fail-CLOSED: deny this call rather than
+          // let it through with no scan at all.
+          appendV2HookLog(SECRET_SCAN_UNAVAILABLE_MESSAGE)
           blockError = new Error(SECRET_SCAN_UNAVAILABLE_MESSAGE)
         }
-      } catch {
-        // The runner is contracted to resolve a structured result, so this only
-        // guards an unexpected throw (including a future change to the runner).
-        // A scanner that cannot run is fail-CLOSED: deny this call rather than
-        // let it through with no scan at all.
-        appendV2HookLog(SECRET_SCAN_UNAVAILABLE_MESSAGE)
-        blockError = new Error(SECRET_SCAN_UNAVAILABLE_MESSAGE)
+        if (blockError !== null) throw blockError
+      } finally {
+        // BENCH instrumentation — observation only; runs on the deny paths too.
+        logBenchHookTiming('before', event, benchStartedAt)
       }
-      if (blockError !== null) throw blockError
     })
     registered = true
   } catch {
@@ -1134,7 +1280,16 @@ async function registerV2ToolHooks(context: PluginContext): Promise<boolean> {
     const v2ExecuteAfter = createV2ExecuteAfter({
       sandbox: resolveV2SandboxConfig(context.options),
     })
-    await toolCtx.hook('execute.after', (event: unknown) => v2ExecuteAfter(event))
+    await toolCtx.hook('execute.after', async (event: unknown) => {
+      const benchStartedAt = Date.now()
+      try {
+        await v2ExecuteAfter(event)
+      } finally {
+        // BENCH instrumentation — observation only; the awaited call means the
+        // duration covers the whole parity chain, not just its dispatch.
+        logBenchHookTiming('after', event, benchStartedAt)
+      }
+    })
     registered = true
   } catch {
     // Tool after-hook not supported
@@ -1326,7 +1481,7 @@ export const plugin = define({
     // is registered here — that is a Pantheon scope choice, not a host gap.
     // ctx.catalog is the one domain the host does not provide.
     // Phase 1 registers against the SDK-typed `context.agent` / `.command` /
-    // `.reference` directly; the four domains the SDK omits are reached only
+    // `.reference` directly; the host domains the SDK omits are reached only
     // through `hostDomains` (see the module header).
     const phase1Transforms: Array<{ feature: string; register: () => Promise<unknown> }> = [
       { feature: 'agent-transform', register: () => context.agent.transform(transformAgents) },

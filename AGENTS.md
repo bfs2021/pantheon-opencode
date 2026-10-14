@@ -80,6 +80,22 @@ For investigation agents (Apollo, Athena), return structured findings with:
 - File paths with line numbers
 - Relevant code snippets (max 3 lines each)
 
+### Athena Plan Handoff
+
+When Athena is delegated to create a plan, its final task result MUST contain
+the complete Markdown plan, not just a summary, artifact path, or approval
+question. Include the goal, scope and assumptions, actionable phases, affected
+files or areas, dependencies, verification, risks, open questions, and
+acceptance criteria; mark unknowns instead of guessing. When called by Zeus,
+this plan contract supersedes the generic structured-findings format above.
+Athena must not call `agent/askQuestions`, pause for user input, or ask for
+approval in the child session. Zeus must publish the returned full plan as a
+normal message in the main conversation before triggering any approval UI;
+the plan and approval question must not be bundled or reversed. If the runtime
+cannot guarantee this order, Zeus asks for approval in plain text after the
+plan and waits for the next user message. For direct Athena invocations, show
+the complete plan in the current conversation before requesting approval.
+
 ## Council Specialist Response Format
 
 When responding to a `/pantheon` council synthesis invocation, specialists MUST return this structured format:

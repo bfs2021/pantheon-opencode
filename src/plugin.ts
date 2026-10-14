@@ -238,15 +238,18 @@ function adaptTodoEnforcerClient(client: PluginInput['client']): TodoEnforcerCli
 
 /**
  * Pantheon plugin for OpenCode. Pasted images are intercepted via the
- * `chat.message` hook (proven to fire in opencode 1.18.11). When a provider
- * key is available — env PANTHEON_OPENCODE_API_KEY / OPENCODE_API_KEY, or the
- * opencode auth store for `opencode auth login` users — the image is
- * described NATIVELY by the multimodal model via the opencode Zen
- * OpenAI-compatible endpoint, and replaced with the text description — no MCP
- * tool required. Without a key the legacy pattern applies: the image is
- * replaced with a text instruction telling the model to call a vision MCP tool
- * (default `pantheon_vision_vision_describe`). Either way the image never reaches
- * the main provider, so text-only models cannot fail with an `image_url` error.
+ * `chat.message` hook (proven to fire in opencode 1.18.11). Credentials follow
+ * the endpoint: a Zen endpoint (`opencode` / `opencode-go*`) may use the shared
+ * `PANTHEON_OPENCODE_API_KEY` / `OPENCODE_API_KEY` env keys and the legacy
+ * `opencode-go` / `opencode` auth-store entries, while a non-Zen endpoint uses
+ * ONLY its own auth-store entry (never the Zen env keys or legacy entries).
+ * When a credential is available the image is described NATIVELY by the
+ * multimodal model via the endpoint's OpenAI-compatible API, and replaced with
+ * the text description — no MCP tool required. Without a credential the legacy
+ * pattern applies: the image is replaced with a text instruction telling the
+ * model to call a vision MCP tool (default `pantheon_vision_vision_describe`).
+ * Either way the image never reaches the main provider, so text-only models
+ * cannot fail with an `image_url` error.
  *
  * The canonical `pantheon-vision` MCP owns the standalone describe/OCR/analyze
  * tools. The installed OpenCode plugin API exposes no stable pre-provider

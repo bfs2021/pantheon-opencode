@@ -286,15 +286,15 @@ async function main(): Promise<void> {
     assert.equal(typeof context.skill.transform, 'function')
   })
 
-  test('the four SDK-missing domains are declared, not cast ad hoc', () => {
+  test('the host APIs missing from the SDK are declared, not cast ad hoc', () => {
     // `hostDomains` is the single documented cast for tool/event/permission/
-    // session. This test pins that the declaration survives and that the
+    // session/model. This test pins that the declaration survives and that the
     // anonymous casts it replaced do not come back.
     assert.match(pluginSource, /interface HostPluginContext extends PluginContext/)
     assert.match(pluginSource, /function hostDomains\(context: PluginContext\): HostPluginContext/)
     // Six call sites: registerV2Tools, subscribeV2Events, registerV2SessionHooks,
     // registerV2ToolHooks, registerV2PermissionHook, and Phase 7's compaction
-    // hook. One more means a new phase started bypassing the declaration.
+    // hook. One more means a new phase bypassed the declaration.
     assert.equal(
       (pluginSource.match(/hostDomains\(context\)/g) ?? []).length,
       6,
@@ -305,7 +305,7 @@ async function main(): Promise<void> {
       /as unknown as Record<string, unknown>\)\.(tool|event|permission|session)/,
       'an ad-hoc cast crept back in; use hostDomains()',
     )
-    for (const domain of ['tool', 'event', 'permission', 'session']) {
+    for (const domain of ['tool', 'event', 'permission', 'session', 'model']) {
       assert.match(
         pluginSource,
         new RegExp(`\\b${domain}\\?: V2\\w*Domain`),
@@ -448,6 +448,50 @@ async function main(): Promise<void> {
       ...overrides,
     }
   }
+
+  test('V2 prompt admission exposes attached image references to Zeus without copying inline bytes', async () => {
+    let promptHandler: ((event: unknown) => void | Promise<void>) | undefined
+    await plugin.setup(
+      makeBaseContext({
+        session: {
+          hook: async (name: string, handler: typeof promptHandler) => {
+            if (name === 'prompt') promptHandler = handler
+            return { dispose: async () => {} }
+          },
+        },
+      }) as never,
+    )
+    assert.equal(typeof promptHandler, 'function')
+
+    const admission = {
+      sessionID: 'ses_contract_123',
+      prompt: {
+        text: 'Atualize esta tela usando a referência visual.',
+        files: [
+          { uri: 'file:///workspace/reference.png', mime: 'image/png', filename: 'reference.png' },
+          { uri: 'data:image/png;base64,PRIVATE_IMAGE_BYTES', mime: 'image/png' },
+        ],
+      },
+    }
+    await promptHandler?.(admission)
+    assert.match(admission.prompt.text, /reference\.png/)
+    assert.match(admission.prompt.text, /vision_describe/)
+    assert.match(admission.prompt.text, /@aphrodite/)
+    assert.match(admission.prompt.text, /não autoriza apagar nem reverter/i)
+    // O session id do evento do host é repassado à instrução do MCP (o MCP é um
+    // processo separado sem session id; sem o repasse o gateway Zen responde
+    // HTTP 400 MissingSessionID).
+    assert.match(admission.prompt.text, /session_id="ses_contract_123"/)
+    assert.doesNotMatch(admission.prompt.text, /PRIVATE_IMAGE_BYTES/)
+
+    const previousText = admission.prompt.text
+    await promptHandler?.(admission)
+    assert.equal(
+      admission.prompt.text,
+      previousText,
+      'prompt retry must not duplicate visual context',
+    )
+  })
 
   test('permission hook denies disallowed V2 delegation using authoritative session identity', async () => {
     let permissionHandler: ((event: unknown) => void | Promise<void>) | undefined

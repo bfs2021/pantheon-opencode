@@ -15,8 +15,15 @@ Structured, checkpointed workflow for complex multi-step tasks spanning multiple
 ## Workflow
 
 ```
-Phase 0: SCOPING
-  └─ Zeus + Athena define scope, phases, acceptance criteria → PLAN.md
+Phase 0: PLAN AND APPROVAL
+  └─ @athena returns the complete, detailed Markdown plan to Zeus
+  └─ Zeus publishes the full plan as a normal message in the main conversation (not only in the child-agent transcript)
+  └─ GATE 1: open the approval UI only after that plan message is visible; never bundle or reverse the two
+  └─ If the runtime cannot guarantee that order, ask for approval in plain text after the plan and wait
+  └─ Wait for explicit approval or requested changes
+  └─ For requested changes, redisplay the entire revised plan and repeat Gate 1
+  └─ Do not start discovery or implementation before approval
+  └─ After approval, persist the approved plan as PLAN.md through the artifact workflow
 
 Phase 1: DISCOVERY
   └─ @apollo maps relevant codebase areas → DISCOVERY.md
@@ -44,7 +51,11 @@ Usage:  --resume <slug> | --status <slug> | --list
 
 ## Full-Auto Mode (`--full-auto`)
 
-> ⚠️ Bypasses human review gates. Tier 1 gates (plan, commit, deploy) still require approval.
+> ⚠️ Automates only eligible review gates. Gate 1 and commit/deploy gates still require approval.
+
+`--full-auto` does not hide the plan or skip Gate 1: Zeus still displays the
+complete plan in the main conversation and waits for explicit approval before
+discovery or implementation. It only affects the later gates described below.
 
 **Themis auto-approves non-blocking reviews** — only stops on **BLOCKING** verdict. No waiting between phases. Checkpoints saved at every boundary.
 

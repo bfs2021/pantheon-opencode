@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { chmod, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { readFile, unlink } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,6 +21,7 @@ import {
   resolveActivePreset,
   visionBrokenOnGateway,
 } from './presets.mjs'
+import { buildLocalVisionBlock } from './vision-local.ts'
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -82,22 +91,76 @@ const PROMPT_TEMPLATE_VARIABLES = [
 
 // ─── Native vision (provider-direct, OpenAI-compatible) ─────────────────────
 // Preferred path: when an API key is available the plugin calls the multimodal
-// model DIRECTLY via the opencode Zen OpenAI-compatible endpoint, so any user
-// with a provider key gets vision WITHOUT an MCP tool. The MCP tool pattern
+// model DIRECTLY via an OpenAI-compatible endpoint and the image is replaced
+// by the returned text description (no MCP tool). The MCP tool pattern
 // (imageAnalysisTool) remains the fallback for missing keys / provider errors.
 //
-// MVP scope: only opencode-go / opencode providers (the user's stack).
-// anthropic/openai native vision is phase 2 — those presets fall back to the
-// MCP tool pattern.
+// Model + endpoint come from the host catalog (GET /config/providers) when no
+// explicit model is configured (env > config > preset > discovery > DEFAULT);
+// the Zen endpoints stay as the no-catalog fallback. anthropic/openai native
+// vision works only when their catalog entries declare an OpenAI-compatible
+// wire format (see NATIVE_VISION_NPM_ALLOWLIST) — otherwise they fall back to
+// the MCP tool pattern.
 
 const DEFAULT_VISION_MODEL = 'opencode-go/mimo-v2.5'
 const ZEN_BASE_URL = 'https://opencode.ai/zen/v1'
 const ZEN_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
 const NATIVE_PROMPT =
   'Descreva fielmente esta imagem em detalhes (texto visível, cores, layout, objetos).'
-const NATIVE_TIMEOUT_MS = 20_000
-const NATIVE_MAX_TOKENS = 500
+/**
+ * Base timeout for the native vision gateway call (small/unknown payloads).
+ * 60s, not 20s: the vision model is a REASONING model (mimo-v2.6-flash) and a
+ * measured round-trip for a ~380 KB image spends 1.0k–1.2k tokens on reasoning
+ * alone, completing in 20–30s. A 20s base aborted legitimate completed
+ * descriptions as `network`/timeout (observed at exactly 20000ms). The per-MB
+ * term below still scales larger payloads; THIS base carries the reasoning
+ * overhead that no payload term captures.
+ */
+const NATIVE_TIMEOUT_MS = 60_000
+/** Extra timeout per whole MB of image payload (linear scaling from the base). */
+const NATIVE_TIMEOUT_PER_MB_MS = 10_000
+/** Hard ceiling for the native vision gateway call (showlotus reference: 300s). */
+const NATIVE_TIMEOUT_MAX_MS = 300_000
+const BYTES_PER_MB = 1024 * 1024
+/**
+ * Completion-token ceiling for the native vision call. The model spends this
+ * budget on REASONING tokens FIRST: measured 1023 reasoning tokens against a
+ * 1024 cap (content came back null with finish_reason "length"), while 2048
+ * finished normally (`stop`) with a complete description. The former 500
+ * truncated EVERY reasoning call. Exported so the V2 tool surface shares one
+ * value instead of hard-coding its own copy.
+ */
+export const NATIVE_MAX_TOKENS = 2048
 const MAX_NATIVE_IMAGE_BYTES = 25 * 1024 * 1024
+
+/**
+ * Dynamic timeout for a native vision call, scaled by the payload size
+ * (adapted from showlotus/opencode-image-vision's 120s→300s scheme to this
+ * codebase's 60s base): base for small/unknown payloads, +10s per whole MB,
+ * hard-capped at 300s. Large base64 uploads take measurably longer to
+ * reach/read on the gateway side, and the previous fixed 20s budget dropped
+ * legitimate large-image descriptions as timeouts.
+ */
+export function computeNativeTimeoutMs(totalBytes: number): number {
+  const bytes = Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0
+  const mb = Math.floor(bytes / BYTES_PER_MB)
+  return Math.min(NATIVE_TIMEOUT_MAX_MS, NATIVE_TIMEOUT_MS + mb * NATIVE_TIMEOUT_PER_MB_MS)
+}
+
+/**
+ * Approximate decoded byte size of every payload in the call, summed.
+ * Data URIs are measured by their base64 length (×3/4); remote http(s) URLs
+ * contribute 0 — their size is unknown without a network round-trip, so they
+ * get the base budget (fail-safe, not optimistic).
+ */
+function estimateNativePayloadsBytes(payloads: readonly NativeImagePayload[]): number {
+  let total = 0
+  for (const payload of payloads) {
+    const match = /^data:[^;,]+;base64,([A-Za-z0-9+/=]+)$/.exec(payload.url)
+    total += match ? Math.ceil(((match[1]?.length ?? 0) * 3) / 4) : 0
+  }
+  return total
+}
 
 /**
  * Descriptions produced by the native path are cached per session, keyed by
@@ -120,9 +183,186 @@ type VisionConfig = {
 
 export type ModelInfo = { providerID: string; modelID: string }
 
-export type NativeVisionTarget = { modelID: string; baseURL: string; apiKey: string }
+export type NativeVisionTarget = {
+  modelID: string
+  baseURL: string
+  apiKey: string
+  /**
+   * OpenCode session id, sent as the `x-opencode-session` header — and ONLY on
+   * Zen endpoints (`https://opencode.ai/zen/...`). The Zen gateway rejects a
+   * request without it (HTTP 400 `MissingSessionID`). Optional: callers attach
+   * it at the request site (`{ ...target, sessionID }`); a target without it
+   * never carries the header. Non-Zen providers must never receive it.
+   */
+  sessionID?: string
+}
+
+/**
+ * Non-sensitive reason a native describe produced no text. Carries ONLY the
+ * HTTP status and the model's `finish_reason` (never the key, payload, or
+ * gateway body) so a caller can build an actionable error without leaking
+ * anything.
+ */
+export type NativeVisionFailure = {
+  reason: 'http' | 'network' | 'timeout' | 'empty' | 'cancelled'
+  status?: number
+  /**
+   * OpenAI-compatible `finish_reason` (e.g. `length` when a reasoning model was
+   * cut off by `max_tokens`) — surfaced so a "no text" failure becomes
+   * actionable instead of opaque.
+   */
+  finishReason?: string
+  /**
+   * The budget that elapsed when OUR dynamic timer aborted the request. Set
+   * only for `reason: 'timeout'`; a genuine transport drop stays `network`, so
+   * a timed-out reasoning call no longer reads as a vague "network error".
+   */
+  timeoutMs?: number
+}
 
 type NativeVisionEndpoint = { modelID: string; baseURL: string }
+
+// ─── Model catalog (host discovery, GET /config/providers) ──────────────────
+// Defensive subset of the SDK `Model`/`Provider` shapes (see
+// node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts). Parsed with optional
+// chaining — a malformed catalog entry is skipped, never a crash.
+
+export type VisionCatalogModel = {
+  id?: unknown
+  providerID?: unknown
+  status?: unknown
+  capabilities?: { input?: { image?: unknown } } | undefined
+  api?: { url?: unknown; npm?: unknown } | undefined
+  cost?: { input?: unknown } | undefined
+}
+
+export type VisionCatalogProvider = {
+  id?: unknown
+  models?: unknown
+}
+
+/** Body of GET /config/providers (defensive subset), or any garbage. */
+export type VisionCatalog =
+  | {
+      providers?: unknown
+      models?: unknown
+    }
+  | null
+  | undefined
+
+/**
+ * npm provider packages whose wire format is OpenAI-compatible
+ * (`POST {base}/chat/completions` with `image_url` content parts) — the only
+ * shape `describeImagesNative` speaks. `@ai-sdk/openai-compatible` is what
+ * opencode's Zen providers use; `@ai-sdk/openai` is the same wire format.
+ * Packages like `@ai-sdk/anthropic` are NOT compatible and must never be
+ * picked by discovery (Q2 conservative allowlist).
+ */
+const NATIVE_VISION_NPM_ALLOWLIST: ReadonlySet<string> = new Set([
+  '@ai-sdk/openai-compatible',
+  '@ai-sdk/openai',
+])
+
+/**
+ * Legacy Zen auth-store provider IDs. Zen endpoints ONLY — a non-Zen provider
+ * resolved through the npm allowlist must use its own auth-store entry, never
+ * these. The historical Zen order is kept as a fallback for Zen models.
+ */
+const LEGACY_VISION_AUTH_PROVIDER_IDS: readonly string[] = ['opencode-go', 'opencode']
+
+/**
+ * Whether `providerID` is an OpenCode-hosted (Zen) provider. Only Zen providers
+ * may use the shared credential sources — the `PANTHEON_OPENCODE_API_KEY` /
+ * `OPENCODE_API_KEY` env keys and the legacy `opencode-go` / `opencode` auth
+ * entries. A non-Zen provider (discovered or explicit) must resolve its OWN
+ * auth-store entry, else the native path returns null and the image falls
+ * through the tool→local chain.
+ */
+function isZenProvider(providerID: string): boolean {
+  return providerID === 'opencode' || providerID.startsWith('opencode-go')
+}
+
+/** Provider prefix of a qualified `provider/model` id (the id itself if bare). */
+function providerOf(modelID: string): string {
+  const slash = modelID.indexOf('/')
+  return slash === -1 ? modelID : modelID.slice(0, slash)
+}
+
+/**
+ * Whether a resolved native target points at an OpenCode Zen endpoint. The
+ * gateway host is the security boundary for the `x-opencode-session` header
+ * (the header travels to `baseURL`, not to the model id): the session identity
+ * must reach `https://opencode.ai/zen/...` and NOTHING else. A target qualifies
+ * only when BOTH the model's provider is Zen AND the base URL is a Zen
+ * endpoint — a mismatch degrades to "no header" (the gateway then answers with
+ * its actionable HTTP 400, never a cross-provider leak).
+ */
+export function isZenNativeTarget(
+  target: Pick<NativeVisionTarget, 'modelID' | 'baseURL'>,
+): boolean {
+  if (!isZenProvider(providerOf(target.modelID))) return false
+  return /^https:\/\/opencode\.ai\/zen\//i.test(target.baseURL)
+}
+
+/**
+ * Build an actionable, non-sensitive message for a failed native describe.
+ * Maps the gateway status/`finish_reason` to the known Zen failures —
+ * 400 `MissingSessionID` (session header absent), 403 (free-tier model usable
+ * only from inside OpenCode, or the account has no paid access), 401
+ * (credential/model) — separates OUR budget expiring (`timeout`) from a genuine
+ * transport drop (`network`), and surfaces `finish_reason` when the model
+ * returned no text (e.g. `length` = truncated by `max_tokens`). An EXTERNAL
+ * cancellation (`cancelled`, e.g. a `ToolContext.signal` abort) gets a neutral
+ * message with no "retry" guidance — the abort was deliberate, not transient.
+ * Never includes the credential, image payload, or session id.
+ */
+export function nativeVisionFailureMessage(
+  failure: NativeVisionFailure | undefined,
+  modelID: string,
+): string {
+  if (failure?.reason === 'timeout') {
+    const budget = failure.timeoutMs ? ` after ${Math.round(failure.timeoutMs / 1000)}s` : ''
+    return `the multimodal model request timed out${budget}: the image-description budget elapsed before a response — retry, or raise the timeout budget`
+  }
+  if (failure?.reason === 'cancelled') {
+    return 'the multimodal model request was cancelled before it completed'
+  }
+  if (failure?.reason === 'network') {
+    return 'the multimodal model request failed (network error): the connection was dropped before the description completed — retry the describe'
+  }
+  const status = failure?.reason === 'http' ? failure.status : undefined
+  if (status === 400) {
+    return 'the Zen gateway rejected the request (HTTP 400 MissingSessionID): the x-opencode-session header is missing — the request must carry a real OpenCode session id'
+  }
+  if (status === 401) {
+    return `the OpenCode Zen gateway rejected the credential (HTTP 401); verify the credential and that ${modelID} supports image input on its endpoint`
+  }
+  if (status === 403) {
+    return `the OpenCode Zen gateway denied access (HTTP 403) to ${modelID}: the model may be free-tier (usable only from inside OpenCode) or this account has no paid access to it`
+  }
+  if (status !== undefined) {
+    return `the Zen gateway rejected the request (HTTP ${status}) for ${modelID}`
+  }
+  if (failure?.reason === 'empty') {
+    const finish = failure.finishReason
+    if (finish === 'length') {
+      return 'the model returned no text (finish_reason: length) — the response was truncated by max_tokens; raise max_tokens or choose a non-reasoning image model'
+    }
+    if (finish) {
+      return `the model returned no text (finish_reason: ${finish})`
+    }
+    return 'the multimodal model returned no text'
+  }
+  return 'the multimodal model returned no text or the request failed'
+}
+
+/**
+ * How long a fetched providers catalog stays cached, per client (process).
+ * Short TTL: the catalog is one HTTP round-trip to the local opencode server
+ * and must NOT be refetched on every user turn, yet must pick up model
+ * changes within a session without a restart.
+ */
+export const PROVIDERS_CACHE_TTL_MS = 60_000
 
 export type VisionMode = 'native' | 'tool' | 'auto'
 
@@ -169,52 +409,362 @@ type SavedImage = {
 
 type NativeImagePayload = { url: string }
 
-// ─── Config loading (project > user) ──────────────────────────────────────
+// ─── Catalog parsing & discovery ───────────────────────────────────────────
 
-// ─── OpenCode auth store (fallback credential source) ────────────────────
-// `opencode auth login` stores provider tokens in <data dir>/auth.json.
-// The vision plugin reads that store so connected users don't need to export
-// any env var. Mirrors the usage-bar pattern (src/plugins/tui) but stays
-// local to this module — no TUI imports.
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
 
-function defaultAuthStorePath(): string {
-  return join(homedir(), '.local', 'share', 'opencode', 'auth.json')
+type CatalogEntry = {
+  /** Qualified id: `providerID/modelID`. */
+  modelID: string
+  providerID: string
+  image: boolean
+  url: string | null
+  npm: string | null
+  costInput: number | null
+  deprecated: boolean
+}
+
+/** Parse one catalog model defensively; null when the entry has no usable id. */
+function parseCatalogEntry(raw: Record<string, unknown>, providerID: string): CatalogEntry | null {
+  const id = typeof raw.id === 'string' && raw.id.trim() !== '' ? raw.id.trim() : null
+  if (!id) return null
+  const entryProvider =
+    typeof raw.providerID === 'string' && raw.providerID.trim() !== ''
+      ? raw.providerID.trim()
+      : providerID
+  if (!entryProvider) return null
+  const api = asRecord(raw.api)
+  const url = typeof api?.url === 'string' && api.url.trim() !== '' ? api.url.trim() : null
+  const npm = typeof api?.npm === 'string' && api.npm.trim() !== '' ? api.npm.trim() : null
+  const input = asRecord(asRecord(raw.capabilities)?.input)
+  const cost = asRecord(raw.cost)
+  return {
+    modelID: `${entryProvider}/${id}`,
+    providerID: entryProvider,
+    image: input?.image === true,
+    url,
+    npm,
+    costInput: typeof cost?.input === 'number' && Number.isFinite(cost.input) ? cost.input : null,
+    deprecated: raw.status === 'deprecated',
+  }
 }
 
 /**
- * Read a provider token from opencode's auth store (`opencode auth login`).
- * `statePath` is the opencode data dir (default ~/.local/share/opencode); the
- * auth.json inside it maps provider IDs to `{ access, expires, ... }`.
- * Returns the first non-expired `access` token across `providerIDs`, or null
- * when the file is missing/corrupted or no entry has a usable token — callers
- * fall back to the MCP tool pattern. The token is never logged.
+ * Flatten a catalog payload into entries. Accepts the canonical
+ * `{ providers: [{ id, models: { [id]: Model } }] }` shape and, defensively,
+ * a top-level `{ models: Model[] }` array.
+ */
+function catalogEntries(catalog: unknown): CatalogEntry[] {
+  const root = asRecord(catalog)
+  if (!root) return []
+  const entries: CatalogEntry[] = []
+  if (Array.isArray(root.providers)) {
+    for (const provider of root.providers) {
+      const p = asRecord(provider)
+      if (!p) continue
+      const pid = typeof p.id === 'string' ? p.id : ''
+      const models = asRecord(p.models)
+      if (!models) continue
+      for (const model of Object.values(models)) {
+        const m = asRecord(model)
+        if (!m) continue
+        const entry = parseCatalogEntry(m, pid)
+        if (entry) entries.push(entry)
+      }
+    }
+  }
+  if (Array.isArray(root.models)) {
+    for (const model of root.models) {
+      const m = asRecord(model)
+      if (!m) continue
+      const entry = parseCatalogEntry(m, '')
+      if (entry) entries.push(entry)
+    }
+  }
+  return entries
+}
+
+/**
+ * Whether the provider speaks an OpenAI-compatible wire format the native
+ * vision call can use: the known Zen providers, or an npm package on the
+ * conservative allowlist. Unknown/incompatible → false → callers fall back
+ * to the MCP tool pattern (Q2).
+ */
+function providerSupportsNativeVision(providerID: string, npm: string | null): boolean {
+  if (isZenProvider(providerID)) return true
+  return npm !== null && NATIVE_VISION_NPM_ALLOWLIST.has(npm)
+}
+
+/**
+ * Whether a catalog entry is FREE-TIER. Free-tier Zen models are rejected by
+ * the direct gateway (HTTP 403 "free tier can only be used from within
+ * OpenCode"), so they must never be picked on the native describe path. Two
+ * conservative signals: an explicit `cost.input <= 0`, OR a `-free` id suffix.
+ * `<= 0` (not `=== 0`) matches V2's `isFreeVisionModel` so a malformed negative
+ * cost can never be treated as paid on one path and free on the other.
+ */
+function catalogEntryIsFree(entry: CatalogEntry): boolean {
+  return (entry.costInput !== null && entry.costInput <= 0) || /-free$/i.test(entry.modelID)
+}
+
+/**
+ * Pick the vision model from a host catalog: image-capable, wire-compatible,
+ * not deprecated, and NOT free-tier (cheapest first, ties broken
+ * lexicographically for determinism). Free-tier models are excluded because the
+ * direct gateway cannot use them. Returns the qualified model ID and its
+ * catalog base URL, or null when nothing qualifies (callers then use
+ * DEFAULT_VISION_MODEL with the legacy Zen endpoint).
+ */
+export function discoverVisionModel(catalog: unknown): { modelID: string; baseURL: string } | null {
+  const candidates = catalogEntries(catalog).filter(
+    (entry) =>
+      entry.image &&
+      !entry.deprecated &&
+      !catalogEntryIsFree(entry) &&
+      providerSupportsNativeVision(entry.providerID, entry.npm) &&
+      entry.url !== null &&
+      /^https?:\/\//i.test(entry.url),
+  )
+  if (candidates.length === 0) return null
+  candidates.sort((left, right) => {
+    const price = (entry: CatalogEntry): number =>
+      entry.costInput === null ? Number.POSITIVE_INFINITY : entry.costInput
+    return price(left) - price(right) || left.modelID.localeCompare(right.modelID)
+  })
+  const pick = candidates[0]
+  return pick?.url ? { modelID: pick.modelID, baseURL: pick.url } : null
+}
+
+/**
+ * Catalog base URL for an EXPLICITLY configured model, honoring the same
+ * compatibility gate. Returns null when the model is absent from the catalog
+ * or its entry is unusable — the caller then applies the legacy Zen mapping
+ * (the catalog never gates a Zen model that the old code already supported).
+ */
+function catalogEndpointFor(modelID: string, catalog: unknown): string | null {
+  const slash = modelID.indexOf('/')
+  if (slash < 1) return null
+  for (const entry of catalogEntries(catalog)) {
+    if (entry.modelID !== modelID) continue
+    if (!providerSupportsNativeVision(entry.providerID, entry.npm)) return null
+    return entry.url !== null && /^https?:\/\//i.test(entry.url) ? entry.url : null
+  }
+  return null
+}
+
+/**
+ * Historical hardcoded Zen endpoint mapping (opencode-go* → zen/go/v1,
+ * opencode → zen/v1, else null). Fallback only — used when there is no
+ * catalog (or the model is not in it) so existing setups keep working.
+ */
+function legacyZenBaseURL(modelID: string): string | null {
+  const providerID = modelID.slice(0, modelID.indexOf('/'))
+  if (providerID.startsWith('opencode-go')) return ZEN_GO_BASE_URL
+  if (providerID === 'opencode') return ZEN_BASE_URL
+  return null
+}
+
+const providersCatalogCache = new WeakMap<object, { payload: unknown; at: number }>()
+
+/**
+ * Fetch (and TTL-cache per client) the host provider catalog via
+ * `client.config.providers()` (GET /config/providers). Never throws: any
+ * failure — client absent, HTTP error, malformed payload — yields null, and
+ * the null itself is cached so a broken server is not hammered per request.
+ * Discovery talks ONLY to the local opencode server — never via bifrost.
+ */
+export async function fetchProvidersCatalog(
+  client: PluginInput['client'] | undefined | null,
+): Promise<unknown> {
+  if (!client || typeof client !== 'object') return null
+  const cached = providersCatalogCache.get(client)
+  const now = Date.now()
+  if (cached && now - cached.at < PROVIDERS_CACHE_TTL_MS) return cached.payload
+  let payload: unknown = null
+  try {
+    const providers = asRecord(client)?.config as
+      | { providers?: (options?: unknown) => Promise<unknown> }
+      | undefined
+    if (typeof providers?.providers === 'function') {
+      const response = await providers.providers()
+      payload = asRecord(response)?.data ?? null
+    }
+  } catch {
+    payload = null
+  }
+  providersCatalogCache.set(client, { payload, at: now })
+  return payload
+}
+
+// ─── Config loading (project > user) ──────────────────────────────────────
+
+// ─── OpenCode auth store (fallback credential source) ────────────────────
+// `opencode auth login` stores provider tokens in <data dir>/auth.json on V1
+// and in a `credential` table inside <data dir>/opencode.db on V2. The vision
+// plugin reads BOTH stores so a connected user needs no exported env var, and
+// so every vision path (plugin native, MCP, picker) resolves the same
+// credential. Mirrors the usage-bar pattern (src/plugins/tui) but stays local
+// to this module — no TUI imports.
+
+function defaultAuthStateDir(): string {
+  // Honor XDG_DATA_HOME so a relocated data root resolves the same auth store
+  // (auth.json) and V2 credential db (opencode.db) as the plugin and the MCP.
+  // Mirrors v2-vision.ts; OPENCODE_DB still names the exact db file.
+  const dataHome = process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share')
+  return join(dataHome, 'opencode')
+}
+
+/**
+ * Path to the OpenCode V2 credential database. `OPENCODE_DB` names the exact
+ * file when the host relocated it (e.g. a sandbox with its own db); otherwise
+ * the default `<data dir>/opencode.db` sibling of `auth.json` is used.
+ */
+function v2CredentialDbPath(stateDir: string, env: Record<string, string | undefined>): string {
+  const override = env.OPENCODE_DB?.trim()
+  return override ? override : join(stateDir, 'opencode.db')
+}
+
+/**
+ * Credential field names accepted in an OpenCode auth entry. V1 OAuth entries
+ * carry `access`; V1/V2 API-key entries carry `key`/`apiKey`. Mirrors the
+ * Pantheon Vision MCP's `_extract_key` so the native path sees the same
+ * credential shapes as the tool path.
+ */
+const AUTH_TOKEN_FIELDS: readonly string[] = [
+  'access',
+  'key',
+  'apiKey',
+  'api_key',
+  'token',
+  'accessToken',
+  'access_token',
+]
+
+/**
+ * Extract a usable token from an OpenCode credential value (a raw string or a
+ * JSON object), skipping an expired OAuth entry. Returns null when no field
+ * carries a non-empty token. The token is never logged.
+ */
+function extractAuthToken(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() === '' ? null : value
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  const expires = record.expires
+  if (typeof expires === 'number' && expires > 0 && Date.now() >= expires) return null
+  for (const field of AUTH_TOKEN_FIELDS) {
+    const candidate = record[field]
+    if (typeof candidate === 'string' && candidate.trim() !== '') return candidate
+  }
+  return null
+}
+
+/**
+ * Extract a token from a V2 `credential.value` cell: the cell is JSON text
+ * (e.g. `{"type":"key","key":"..."}` or an OAuth blob), so it is parsed first.
+ * A non-JSON or unusable value yields null. The token is never logged.
+ */
+function extractCredentialCellToken(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  try {
+    return extractAuthToken(JSON.parse(value))
+  } catch {
+    return null // not JSON → not a usable credential cell
+  }
+}
+
+/**
+ * Read a provider token from the OpenCode V2 SQLite credential store
+ * (`<data dir>/opencode.db`, table `credential`). OpenCode V2 moved credentials
+ * out of `auth.json`; a V2 host has no JSON file, so an auth.json-only read left
+ * the native path unresolvable even though the MCP (which reads this table) and
+ * the picker both worked.
+ *
+ * Best-effort and READ-ONLY (`mode=ro`): a missing `node:sqlite` builtin, a
+ * missing/locked database, or a missing row yields null and the caller falls
+ * back to the tool→local chain. Rows are tried in `providerIDs` order; the
+ * stored value is never logged.
+ */
+async function readV2CredentialToken(
+  providerIDs: readonly string[],
+  stateDir: string,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  const dbPath = v2CredentialDbPath(stateDir, env)
+  if (!existsSync(dbPath)) return null
+  let sqlite: typeof import('node:sqlite') | undefined
+  try {
+    sqlite = await import('node:sqlite')
+  } catch {
+    return null // runtime without node:sqlite → no V2 store to read
+  }
+  const DatabaseSync = sqlite.DatabaseSync
+  if (typeof DatabaseSync !== 'function') return null
+  let db: import('node:sqlite').DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true })
+    const statement = db.prepare(
+      'SELECT value FROM credential WHERE integration_id = ? AND active = 1 LIMIT 1',
+    )
+    for (const id of providerIDs) {
+      const row = statement.get(id) as { value?: unknown } | undefined
+      const token = extractCredentialCellToken(row?.value)
+      if (token) return token
+    }
+    return null
+  } catch {
+    return null // missing table / locked / corrupt → no crash
+  } finally {
+    try {
+      db?.close()
+    } catch {
+      // best-effort close
+    }
+  }
+}
+
+/**
+ * Read a provider token from opencode's credential stores.
+ *
+ * `statePath` is the opencode data dir (default `$XDG_DATA_HOME/opencode`, else
+ * `~/.local/share/opencode`). The
+ * V1 `auth.json` inside it maps provider IDs to `{ access | key, expires }`;
+ * the V2 `opencode.db` (or the file named by `OPENCODE_DB`) holds the same
+ * secrets in a `credential` table. The V1 file is read first (it is absent on a
+ * V2 host), then the V2 store.
+ *
+ * Returns the first non-expired token across `providerIDs`, or null when both
+ * stores are missing/corrupted or no entry has a usable token — callers fall
+ * back to the MCP tool pattern. The token is never logged.
  */
 export async function readOpencodeAuthToken(
   providerIDs: readonly string[],
   statePath?: string,
+  env: Record<string, string | undefined> = process.env,
 ): Promise<string | null> {
-  const authPath = statePath ? join(statePath, 'auth.json') : defaultAuthStorePath()
-  let raw: string
-  try {
-    raw = await readFile(authPath, 'utf8')
-  } catch {
-    return null // missing/unreadable → no crash
+  const stateDir = statePath ?? defaultAuthStateDir()
+  const raw = await readFile(join(stateDir, 'auth.json'), 'utf8').catch(() => null)
+  if (raw !== null) {
+    let auth: Record<string, unknown> | null = null
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        auth = parsed as Record<string, unknown>
+      }
+    } catch {
+      auth = null // corrupted → treat as absent, then try the V2 store
+    }
+    if (auth) {
+      for (const id of providerIDs) {
+        const token = extractAuthToken(auth[id])
+        if (token) return token
+      }
+    }
   }
-  let auth: Record<string, { access?: unknown; expires?: unknown } | undefined>
-  try {
-    auth = JSON.parse(raw) as typeof auth
-  } catch {
-    return null // corrupted → no crash
-  }
-  for (const id of providerIDs) {
-    const entry = auth[id]
-    const access = typeof entry?.access === 'string' ? entry.access.trim() : ''
-    if (access === '') continue
-    const expires = entry?.expires
-    if (typeof expires === 'number' && expires > 0 && Date.now() >= expires) continue
-    return access
-  }
-  return null
+  return readV2CredentialToken(providerIDs, stateDir, env)
 }
 
 function userConfigPath(): string {
@@ -439,24 +989,103 @@ export async function enforceTempFileCap(
   return evicted
 }
 
-export async function saveDataUrlImage(dataUrl: string, mime: string): Promise<string | null> {
-  const match = /^data:([^;,]+);base64,(.+)$/s.exec(dataUrl)
+/**
+ * Decode a base64 image data URI to its bytes. The regex accepts OPTIONAL
+ * parameters between the mime type and the `;base64` marker (e.g.
+ * `data:image/png;charset=utf-8;base64,…`), so a URI a browser or clipboard
+ * decorates with parameters still decodes. The declared mime and its parameters
+ * are ignored: callers pass the authoritative mime separately (an explicit
+ * filename/mime wins over the data URI's own declaration). Never throws;
+ * returns null for malformed input or an empty payload.
+ */
+function decodeDataUrlImage(dataUrl: string): Buffer | null {
+  const match = /^data:([^;,]+)(?:;[^;,]*)*;base64,(.+)$/s.exec(dataUrl)
   if (!match) return null
   const data = Buffer.from(match[2] ?? '', 'base64')
   if (data.length === 0) return null
+  return data
+}
+
+/**
+ * Atomically write `data` to `filePath` via a sibling temp file + rename.
+ *
+ * The temp file lives in the SAME directory, so `rename` is an atomic
+ * same-filesystem replace that overwrites any existing destination. A crash
+ * mid-write can therefore leave at most a stray `<name>.tmp-<pid>` file —
+ * never a truncated destination that a later content-hash dedup would trust.
+ * Private mode 0600 is forced AFTER creation to beat a permissive umask.
+ */
+function writeFileAtomicSync(filePath: string, data: Buffer): void {
+  const tempPath = `${filePath}.tmp-${process.pid}`
+  try {
+    writeFileSync(tempPath, data, { mode: 0o600 })
+    chmodSync(tempPath, 0o600)
+    renameSync(tempPath, filePath)
+  } catch (err) {
+    try {
+      unlinkSync(tempPath)
+    } catch {
+      // The temp file may not exist yet (the write failed first) — best effort.
+    }
+    throw err
+  }
+}
+
+/** Whether `filePath` already holds exactly `data` (dedup fast path). */
+function fileHasContent(filePath: string, data: Buffer): boolean {
+  try {
+    return readFileSync(filePath).equals(data)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Write decoded image bytes to the shared temp dir under a content-hash
+ * filename (dedup: identical re-pasted images reuse one file), with private
+ * modes forced AFTER creation. The write is ATOMIC (sibling temp + rename) so
+ * an interrupted process can never leave a truncated file that a later dedup
+ * would reuse as valid. Registers the path as most-recently-used in the LRU
+ * registry. Screenshots may hold sensitive content, so modes are 0700/0600
+ * regardless of a permissive umask; the bytes are never logged.
+ */
+export function writeTempImageSync(data: Buffer, mime: string): string {
   const dir = join(tmpdir(), TEMP_DIR_NAME)
-  // Screenshots may hold sensitive content: force private modes even under a
-  // permissive umask. mkdir/writeFile honor the umask, so chmod is applied
-  // AFTER creation to guarantee 0700/0600 regardless of the environment.
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  await chmod(dir, 0o700)
-  // Content-hash filename: identical re-pasted images reuse the same file
-  // (dedup — less disk, and it stabilizes the per-image description cache).
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
   const filePath = join(dir, `${hashContent(data)}.${getExtensionForMime(mime)}`)
-  if (!existsSync(filePath)) await writeFile(filePath, data, { mode: 0o600 })
-  await chmod(filePath, 0o600)
+  // Dedup: a content-hash name whose bytes already match is the object every
+  // other session expects — skip the rewrite. Different bytes under the same
+  // name (or an unreadable/truncated leftover) are healed by the atomic write.
+  if (!fileHasContent(filePath, data)) writeFileAtomicSync(filePath, data)
+  chmodSync(filePath, 0o600)
   touchTempFile(filePath)
+  return filePath
+}
+
+/** Async temp materialization used by the V1 chat hook (awaits the LRU cap). */
+export async function saveDataUrlImage(dataUrl: string, mime: string): Promise<string | null> {
+  const data = decodeDataUrlImage(dataUrl)
+  if (!data) return null
+  const filePath = writeTempImageSync(data, mime)
   await enforceTempFileCap()
+  return filePath
+}
+
+/**
+ * Synchronous sibling of `saveDataUrlImage` for callers that run inside a
+ * synchronous host hook — namely the V2 `prompt` admission, which must hand a
+ * path-based vision tool/MCP a real reference for an inline (clipboard)
+ * attachment whose bytes exist only in memory as a data URI. Bytes go to the
+ * SAME temp dir + LRU registry, so V1 and V2 attachment cleanup share one
+ * mechanism. The global cap is enforced best-effort (a sync caller cannot await
+ * it): the eviction runs off the returned tick and never rejects.
+ */
+export function saveDataUrlImageSync(dataUrl: string, mime: string): string | null {
+  const data = decodeDataUrlImage(dataUrl)
+  if (!data) return null
+  const filePath = writeTempImageSync(data, mime)
+  void enforceTempFileCap().catch(() => undefined)
   return filePath
 }
 
@@ -497,60 +1126,93 @@ function firstNonEmpty(fallback: string, ...values: Array<string | undefined>): 
 }
 
 /**
- * Resolve the native vision endpoint: model ID + Zen base URL (no key I/O).
+ * Resolve the native vision endpoint: model ID + base URL (no key I/O).
  *
  * Model precedence: env PANTHEON_VISION_MODEL > config file `visionModel` >
- * active preset `vision.model` > DEFAULT_VISION_MODEL. Returns null when the
- * model's provider is not opencode-go/opencode (anthropic/openai are phase 2).
+ * active preset `vision.model` > catalog discovery > DEFAULT_VISION_MODEL.
+ * When an explicit model is set, its base URL comes from the catalog entry
+ * (`api.url`) when present, else the legacy Zen mapping. Discovery (no
+ * explicit model) only picks wire-compatible image-capable models and uses
+ * their `api.url`; with no qualifying entry it falls back to
+ * DEFAULT_VISION_MODEL + Zen. Returns null when the model's provider has no
+ * usable endpoint (unknown providers without a catalog — anthropic/openai
+ * stay phase 2).
  */
 function resolveNativeVisionEndpoint(
   preset: Pick<ResolvedPreset, 'vision'> | null | undefined,
   env: Record<string, string | undefined>,
   configVisionModel?: string,
+  catalog?: unknown,
 ): NativeVisionEndpoint | null {
   const resolved = preset ?? resolveActivePreset({ env, candidates: activePresetCandidates() })
-  const modelID = firstNonEmpty(
-    DEFAULT_VISION_MODEL,
+  // Explicit model wins over discovery; empty string = nothing configured.
+  const explicitModel = firstNonEmpty(
+    '',
     env.PANTHEON_VISION_MODEL,
     configVisionModel,
     resolved?.vision?.model,
   )
-  const providerID = modelID.slice(0, modelID.indexOf('/'))
-  let baseURL: string | null = null
-  if (providerID.startsWith('opencode-go')) baseURL = ZEN_GO_BASE_URL
-  else if (providerID === 'opencode') baseURL = ZEN_BASE_URL
+  if (explicitModel) {
+    const baseURL = catalogEndpointFor(explicitModel, catalog) ?? legacyZenBaseURL(explicitModel)
+    if (!baseURL) return null
+    return { modelID: explicitModel, baseURL }
+  }
+  const discovered = discoverVisionModel(catalog)
+  if (discovered) return discovered
+  const modelID = DEFAULT_VISION_MODEL
+  const baseURL = legacyZenBaseURL(modelID)
   if (!baseURL) return null
   return { modelID, baseURL }
 }
 
 /**
- * Resolve the native vision target: model + Zen endpoint + API key.
+ * Resolve the native vision target: model + endpoint + API key.
  *
- * Key comes from env only (PANTHEON_OPENCODE_API_KEY then OPENCODE_API_KEY).
- * Returns null when the model's provider is not opencode-go/opencode or when
- * no env key is set — callers fall back to the MCP tool. For the auth-store
- * fallback (`opencode auth login`) use `resolveNativeVisionTarget`.
+ * The key comes from the shared Zen env keys only (`PANTHEON_OPENCODE_API_KEY`
+ * then `OPENCODE_API_KEY`), and only when the resolved endpoint is Zen. `catalog`
+ * (optional, shape of GET /config/providers) enables discovery when no explicit
+ * model is configured (env > config > preset > discovery > DEFAULT). Returns
+ * null when the model has no usable endpoint, is non-Zen, or no env key is set —
+ * callers fall back to the MCP tool. For the auth-store fallback (`opencode auth
+ * login`) use `resolveNativeVisionTarget`.
  */
 export function resolveNativeVisionConfig(
   preset: Pick<ResolvedPreset, 'vision'> | null | undefined = undefined,
   env: Record<string, string | undefined> = process.env,
   configVisionModel?: string,
+  catalog?: unknown,
 ): NativeVisionTarget | null {
-  const endpoint = resolveNativeVisionEndpoint(preset, env, configVisionModel)
+  const endpoint = resolveNativeVisionEndpoint(preset, env, configVisionModel, catalog)
   if (!endpoint) return null
+  // Non-Zen endpoints never receive the shared Zen env keys (cross-provider
+  // credential leak); they must resolve their own auth store via the async path.
+  const providerID = endpoint.modelID.slice(0, endpoint.modelID.indexOf('/'))
+  if (!isZenProvider(providerID)) return null
   const apiKey = env.PANTHEON_OPENCODE_API_KEY ?? env.OPENCODE_API_KEY
   if (!apiKey || apiKey.trim() === '') return null
   return { ...endpoint, apiKey }
 }
 
 /**
- * Full native-vision target resolution for the chat hook (async): model +
- * endpoint via `resolveNativeVisionConfig`, then the API key from env
- * (PANTHEON_OPENCODE_API_KEY ?? OPENCODE_API_KEY) falling back to the opencode
- * auth store (`opencode auth login`) — 'opencode-go' entry first, then
- * 'opencode' — so connected users don't need to export anything. Returns null
- * when the provider isn't opencode-go/opencode or no usable key exists —
- * callers fall back to the MCP tool.
+ * Full native-vision resolution for the chat hook (async): model + endpoint
+ * via `resolveNativeVisionConfig` (env > config > preset > catalog discovery
+ * > DEFAULT), then the API key.
+ *
+ * Credential precedence:
+ * - Zen endpoints (`opencode` / `opencode-go*`): the env keys
+ *   (`PANTHEON_OPENCODE_API_KEY` ?? `OPENCODE_API_KEY`) first, then the auth
+ *   store (`auth.json` on V1, the V2 `opencode.db` credential table) — the
+ *   resolved provider entry first, then the legacy Zen entries (`opencode-go`,
+ *   then `opencode`) — so connected users don't need to export anything.
+ * - Non-Zen endpoints (discovered or explicit via the npm allowlist): ONLY the
+ *   resolved provider's own auth-store entry. The shared env keys and the legacy
+ *   Zen entries are never attached to a non-Zen base URL; absent an own
+ *   credential this returns null and the caller falls back to the tool→local
+ *   chain (no cross-provider credential leak).
+ *
+ * `catalog` enables host-catalog discovery; without it the behavior is exactly
+ * the pre-discovery one. Returns null when the model has no usable endpoint or
+ * no usable key exists — callers fall back to the MCP tool.
  */
 export async function resolveNativeVisionTarget(
   input: {
@@ -558,14 +1220,28 @@ export async function resolveNativeVisionTarget(
     env?: Record<string, string | undefined>
     config?: VisionConfig | null
     authStatePath?: string
+    catalog?: unknown
   } = {},
 ): Promise<NativeVisionTarget | null> {
   const env = input.env ?? process.env
-  const endpoint = resolveNativeVisionEndpoint(input.preset, env, input.config?.visionModel)
+  const endpoint = resolveNativeVisionEndpoint(
+    input.preset,
+    env,
+    input.config?.visionModel,
+    input.catalog,
+  )
   if (!endpoint) return null
-  const envKey = env.PANTHEON_OPENCODE_API_KEY ?? env.OPENCODE_API_KEY
-  if (envKey && envKey.trim() !== '') return { ...endpoint, apiKey: envKey }
-  const authToken = await readOpencodeAuthToken(['opencode-go', 'opencode'], input.authStatePath)
+  const resolvedProvider = endpoint.modelID.slice(0, endpoint.modelID.indexOf('/'))
+  const zen = isZenProvider(resolvedProvider)
+  if (zen) {
+    const envKey = env.PANTHEON_OPENCODE_API_KEY ?? env.OPENCODE_API_KEY
+    if (envKey && envKey.trim() !== '') return { ...endpoint, apiKey: envKey }
+  }
+  // Own provider entry always; the legacy Zen entries ONLY for a Zen endpoint.
+  const authProviderIDs = [
+    ...new Set(zen ? [resolvedProvider, ...LEGACY_VISION_AUTH_PROVIDER_IDS] : [resolvedProvider]),
+  ].filter((id) => Boolean(id))
+  const authToken = await readOpencodeAuthToken(authProviderIDs, input.authStatePath, env)
   if (!authToken) return null
   return { ...endpoint, apiKey: authToken }
 }
@@ -644,6 +1320,15 @@ export function stripProviderPrefix(modelID: string): string {
  * `prompt` overrides the default describe prompt (e.g. OCR extraction);
  * `maxTokens` caps the completion (OCR needs more headroom); `signal` links
  * an external abort (e.g. the plugin-tool ToolContext.abort) to the request.
+ *
+ * When `target.sessionID` is set AND the target is Zen (`isZenNativeTarget`),
+ * the request carries the `x-opencode-session` header — the Zen gateway rejects
+ * a sessionless request with HTTP 400 `MissingSessionID`. The header is NEVER
+ * sent to a non-Zen provider (no cross-provider session leak).
+ *
+ * The abort budget is DYNAMIC (see `computeNativeTimeoutMs`): it scales with
+ * the total decoded size of `payloads` so large images are not dropped as
+ * timeouts by the fixed base budget.
  */
 export async function describeImagesNative(
   payloads: readonly NativeImagePayload[],
@@ -651,21 +1336,54 @@ export async function describeImagesNative(
   prompt: string = NATIVE_PROMPT,
   maxTokens: number = NATIVE_MAX_TOKENS,
   signal?: AbortSignal,
+  onFailure?: (failure: NativeVisionFailure) => void,
 ): Promise<string | null> {
+  const report = (failure: NativeVisionFailure): void => {
+    try {
+      onFailure?.(failure)
+    } catch {
+      // A diagnostic sink must never break the describe result.
+    }
+  }
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${target.apiKey}`,
+  }
+  // Zen-only session header: the gateway requires it for `opencode-go*` and
+  // `opencode` models, and a non-Zen host must never see the session identity.
+  if (target.sessionID && isZenNativeTarget(target)) {
+    headers['x-opencode-session'] = target.sessionID
+  }
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), NATIVE_TIMEOUT_MS)
-  const onExternalAbort = () => controller.abort()
+  const budgetMs = computeNativeTimeoutMs(estimateNativePayloadsBytes(payloads))
+  // Track WHICH abort fired: our budget expiring (a timeout the caller can act
+  // on), an EXTERNAL cancellation (a deliberate `ToolContext.signal` abort), or
+  // a genuine transport drop. Collapsing all three into `network` is what made
+  // a timed-out reasoning call read as the vague "network error" the agent then
+  // paraphrased — and is what made an external cancellation advertise a bogus
+  // "retry". External cancellation wins: it is deliberate, never transient.
+  let timedOut = false
+  let cancelled = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, budgetMs)
+  const onExternalAbort = () => {
+    cancelled = true
+    controller.abort()
+  }
   if (signal) {
-    if (signal.aborted) controller.abort()
-    else signal.addEventListener('abort', onExternalAbort, { once: true })
+    if (signal.aborted) {
+      cancelled = true
+      controller.abort()
+    } else {
+      signal.addEventListener('abort', onExternalAbort, { once: true })
+    }
   }
   try {
     const response = await fetch(`${target.baseURL}/chat/completions`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${target.apiKey}`,
-      },
+      headers,
       body: JSON.stringify({
         model: stripProviderPrefix(target.modelID),
         messages: [
@@ -684,14 +1402,38 @@ export async function describeImagesNative(
       }),
       signal: controller.signal,
     })
-    if (!response.ok) return null
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>
+    if (!response.ok) {
+      report({ reason: 'http', status: response.status })
+      return null
     }
-    const content = data.choices?.[0]?.message?.content
-    if (typeof content !== 'string' || content.trim() === '') return null
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>
+    }
+    const choice = data.choices?.[0]
+    const content = choice?.message?.content
+    if (typeof content !== 'string' || content.trim() === '') {
+      // Surface finish_reason (e.g. `length`) so a reasoning model cut off by
+      // max_tokens yields an actionable message instead of a bare "no text".
+      report({
+        reason: 'empty',
+        ...(typeof choice?.finish_reason === 'string'
+          ? { finishReason: choice.finish_reason }
+          : {}),
+      })
+      return null
+    }
     return content.trim()
   } catch {
+    // Our dynamic budget elapsed → `timeout` (with the budget for the message);
+    // an external abort → `cancelled` (deliberate, no "retry" guidance);
+    // anything else (connection reset, TLS, JSON parse) → `network`.
+    report(
+      cancelled
+        ? { reason: 'cancelled' }
+        : timedOut
+          ? { reason: 'timeout', timeoutMs: budgetMs }
+          : { reason: 'network' },
+    )
     return null
   } finally {
     clearTimeout(timer)
@@ -716,10 +1458,13 @@ export function hashContent(content: string | Buffer): string {
 /**
  * Composite cache key: hash of the user prompt + the sorted content hashes of
  * every image payload. The prompt is part of the key so a NEW question about
- * the same image never reuses a stale description; sorting makes the key
- * order-insensitive (the same image set in any order maps to one key). For
- * data-URI/local payloads the URL encodes both mime and bytes, so hashing it
- * covers "mime+bytes"; remote URLs hash the URL itself.
+ * the same image never reuses a stale description — same image + new question
+ * means a NEW gateway describe call (by design, aligned with the council's
+ * describe-once-per-turn flow); only an identical re-ask within the TTL hits
+ * the cache. Sorting makes the key order-insensitive (the same image set in
+ * any order maps to one key). For data-URI/local payloads the URL encodes both
+ * mime and bytes, so hashing it covers "mime+bytes"; remote URLs hash the URL
+ * itself.
  */
 export function buildDescriptionCacheKey(
   prompt: string,
@@ -763,31 +1508,37 @@ export function generateInjectionPrompt(
   userText: string,
   toolName: string,
   template?: string,
+  sessionID?: string,
 ): string {
   if (!Array.isArray(images)) {
     throw new TypeError('Vision image resolution must return an array')
   }
   const imageList = images.map((image, index) => `- Image ${index + 1}: ${image.path}`).join('\n')
+  // The MCP runs in a SEPARATE process the host does not hand a session id to,
+  // and the Zen gateway (zen/go, zen/v1) rejects a sessionless request with
+  // HTTP 400 `MissingSessionID`. The plugin relays the live session id through
+  // the tool call so the MCP can send the `x-opencode-session` header. The id
+  // is JSON-quoted so it cannot spoof the surrounding instruction layout.
+  const sessionLine = sessionID
+    ? `When you call the tool, pass session_id=${JSON.stringify(sessionID)} so the Zen gateway accepts the request.`
+    : undefined
   if (template && PROMPT_TEMPLATE_VARIABLES.some((variable) => template.includes(variable))) {
-    return template
+    const rendered = template
       .replaceAll('{imageList}', imageList)
       .replaceAll('{imageCount}', String(images.length))
       .replaceAll('{toolName}', toolName)
       .replaceAll('{userText}', userText)
+    return sessionLine ? `${rendered}\n${sessionLine}` : rendered
   }
   const plural = images.length > 1
   const heading = plural
     ? `The user has shared ${images.length} images. The images are available at:`
     : 'The user has shared an image. The image is available at:'
   const analyze = plural ? 'each image' : 'this image'
-  return [
-    heading,
-    imageList,
-    '',
-    `Use the \`${toolName}\` tool to analyze ${analyze}.`,
-    '',
-    `User's request: ${userText || '(analyze the image)'}`,
-  ].join('\n')
+  const lines = [heading, imageList, '', `Use the \`${toolName}\` tool to analyze ${analyze}.`, '']
+  if (sessionLine) lines.push(sessionLine, '')
+  lines.push(`User's request: ${userText || '(analyze the image)'}`)
+  return lines.join('\n')
 }
 
 /**
@@ -851,6 +1602,32 @@ function unescapeXml(text: string): string {
   return text.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&')
 }
 
+/**
+ * Payload bound for the user's question interpolated into vision prompts:
+ * prompts longer than this are clipped (with an ellipsis marker) so a long
+ * turn never bloats the gateway request. Exported because the V2 path
+ * (v2-vision.ts) applies the same cap to its own describe prompt.
+ */
+export const MAX_PROMPT_USER_TEXT_CHARS = 2000
+
+/**
+ * Trim and cap the user's question at `maxChars` characters TOTAL, appending a
+ * single "…" when clipped (the marker counts against the cap, so the result is
+ * never longer than `maxChars`). The cap applies to the raw text BEFORE XML
+ * escaping (escaping happens at the interpolation site). Empty/whitespace
+ * input yields '' so callers keep their generic-prompt placeholder.
+ * Never logged — the question is prompt content, not telemetry.
+ */
+export function truncateUserText(
+  text: string,
+  maxChars: number = MAX_PROMPT_USER_TEXT_CHARS,
+): string {
+  const trimmed = text.trim()
+  if (trimmed.length <= maxChars) return trimmed
+  const marker = '…'
+  return `${trimmed.slice(0, Math.max(0, maxChars - marker.length))}${marker}`
+}
+
 const INTENT_TASK_INSTRUCTIONS: Record<VisionIntent, string> = {
   describe:
     'Descreva cada imagem fielmente e em detalhes: texto visível verbatim, cores, layout, objetos.',
@@ -871,22 +1648,189 @@ const INTENT_CONTEXT_INSTRUCTIONS: Record<VisionIntent, string> = {
   bugs: '',
 }
 
+// ─── EXIF orientation detection (zero-dep, JPEG only) ──────────────────────
+// DETECTION, not correction: no pixel data is ever rewritten (no sharp/jimp —
+// YAGNI). When a payload's EXIF orientation tag ≠ 1, the native prompt carries
+// a textual hint instructing the vision model to describe the image in its
+// correct viewing orientation. The parser reads only the first kilobytes of
+// the JPEG (APP1 EXIF lives at the very start) and is fail-safe: ANY malformed
+// input yields null, never a throw.
+
+/** EXIF orientation tag id (IFD0). */
+const EXIF_ORIENTATION_TAG = 0x0112
+/**
+ * Base64 chars decoded for the EXIF scan (≈75 KB of binary — far more than
+ * any APP1 segment needs; keeps `payloadOrientation` O(1) even for 25 MB URIs).
+ */
+const EXIF_SCAN_BASE64_CHARS = 100_000
+
+/** How to mentally correct each non-1 EXIF orientation to view the image upright. */
+const ORIENTATION_TRANSFORM_HINTS: Record<number, string> = {
+  2: 'stored mirrored horizontally — apply a horizontal mirror to view it upright',
+  3: 'stored upside down — apply a 180-degree rotation to view it upright',
+  4: 'stored mirrored vertically — apply a vertical mirror to view it upright',
+  5: 'stored mirrored and rotated — apply a horizontal mirror then a 90-degree clockwise rotation to view it upright',
+  6: 'stored rotated — apply a 90-degree clockwise rotation to view it upright',
+  7: 'stored mirrored and rotated — apply a horizontal mirror then a 90-degree counter-clockwise rotation to view it upright',
+  8: 'stored rotated — apply a 90-degree counter-clockwise rotation to view it upright',
+}
+
+/**
+ * Read the EXIF orientation (tag 0x0112) from raw JPEG bytes. Walks the
+ * segment chain (SOI → APP0/APP1/…) for the first APP1 segment starting with
+ * "Exif\0\0", then parses the TIFF byte-order header, the IFD0 entry count and
+ * the 12-byte entries until the orientation tag is found. Supports both TIFF
+ * byte orders ("II" little-endian and "MM" big-endian). Returns 1–8, or null
+ * for anything else — non-JPEG, no EXIF, no orientation tag, or ANY malformed
+ * input. Never throws (fail-safe by construction: every read is bounds-checked).
+ */
+export function readExifOrientation(bytes: Uint8Array): number | null {
+  try {
+    // JPEG must start with the SOI marker; anything else is not ours to parse.
+    if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null
+    let offset = 2
+    while (offset + 4 <= bytes.length) {
+      if (bytes[offset] !== 0xff) return null // marker sync lost → malformed
+      const marker = bytes[offset + 1] ?? 0
+      // Standalone markers carry no length field (SOI repeat, RSTn, TEM).
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+        offset += 2
+        continue
+      }
+      if (marker === 0xda) return null // start of scan — no EXIF ahead
+      const length = ((bytes[offset + 2] ?? 0) << 8) | (bytes[offset + 3] ?? 0)
+      if (length < 2) return null // segment length must cover its own 2 bytes
+      const segmentStart = offset + 4
+      if (marker === 0xe1 && segmentStart + 6 <= bytes.length) {
+        const isExifHeader =
+          bytes[segmentStart] === 0x45 && // "E"
+          bytes[segmentStart + 1] === 0x78 && // "x"
+          bytes[segmentStart + 2] === 0x69 && // "i"
+          bytes[segmentStart + 3] === 0x66 && // "f"
+          bytes[segmentStart + 4] === 0x00 &&
+          bytes[segmentStart + 5] === 0x00
+        if (isExifHeader) {
+          return readTiffOrientation(bytes, segmentStart + 6)
+        }
+        // Non-EXIF APP1 (e.g. XMP) → skip and keep walking.
+      }
+      offset += 2 + length
+    }
+    return null
+  } catch {
+    return null // belt-and-suspenders: never let detection fail a turn
+  }
+}
+
+/** Parse the TIFF block (byte-order header + IFD0) for the orientation tag. */
+function readTiffOrientation(bytes: Uint8Array, tiffStart: number): number | null {
+  if (tiffStart + 8 > bytes.length) return null
+  const bom = bytes[tiffStart]
+  const little = bom === 0x49 // "I" → little-endian; "M" (0x4d) → big-endian
+  if (!little && bom !== 0x4d) return null
+  const u16 = (pos: number): number =>
+    little
+      ? (bytes[pos] ?? 0) | ((bytes[pos + 1] ?? 0) << 8)
+      : ((bytes[pos] ?? 0) << 8) | (bytes[pos + 1] ?? 0)
+  const u32 = (pos: number): number =>
+    little
+      ? ((bytes[pos] ?? 0) |
+          ((bytes[pos + 1] ?? 0) << 8) |
+          ((bytes[pos + 2] ?? 0) << 16) |
+          ((bytes[pos + 3] ?? 0) << 24)) >>>
+        0
+      : (((bytes[pos] ?? 0) << 24) |
+          ((bytes[pos + 1] ?? 0) << 16) |
+          ((bytes[pos + 2] ?? 0) << 8) |
+          (bytes[pos + 3] ?? 0)) >>>
+        0
+  if (u16(tiffStart + 2) !== 42) return null // TIFF magic
+  const ifdStart = tiffStart + u32(tiffStart + 4)
+  if (ifdStart + 2 > bytes.length) return null
+  const entryCount = u16(ifdStart)
+  for (let i = 0; i < entryCount; i++) {
+    const entry = ifdStart + 2 + i * 12
+    if (entry + 12 > bytes.length) return null
+    if (u16(entry) === EXIF_ORIENTATION_TAG) {
+      // Type SHORT (3), count 1 → the value sits inline in the first 2 bytes
+      // of the entry's value/offset field, encoded in the TIFF byte order.
+      const value = u16(entry + 8)
+      return value >= 1 && value <= 8 ? value : null
+    }
+  }
+  return null
+}
+
+/**
+ * Best-effort EXIF orientation for one native payload. Only local JPEG data
+ * URIs are inspected (remote http(s) URLs would need a network round-trip —
+ * out of scope for zero-dep detection; non-JPEG payloads short-circuit before
+ * any parsing). Returns 1–8 or null; never throws.
+ */
+export function payloadOrientation(payload: { url: string }): number | null {
+  if (payload.url.startsWith('http://') || payload.url.startsWith('https://')) return null
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/.exec(payload.url)
+  if (!match || (match[1]?.toLowerCase() ?? '') !== 'image/jpeg') return null
+  try {
+    const prefix = Buffer.from((match[2] ?? '').slice(0, EXIF_SCAN_BASE64_CHARS), 'base64')
+    return readExifOrientation(prefix)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Build the textual orientation hint appended to the native prompt. One line
+ * per image whose detected orientation ≠ 1 (the transform the vision model
+ * must apply mentally to see the image upright); empty string when every
+ * image is upright or unknown — the prompt then stays byte-identical to the
+ * no-EXIF behavior. The hint is pure static text (no user content), so it can
+ * never re-expand template variables nor break the prompt's XML structure.
+ */
+export function buildOrientationHint(orientations: ReadonlyArray<number | null>): string {
+  const notes: string[] = []
+  orientations.forEach((orientation, index) => {
+    const transform = orientation === null ? undefined : ORIENTATION_TRANSFORM_HINTS[orientation]
+    if (transform)
+      notes.push(`- image ${index + 1}: EXIF orientation ${orientation} — ${transform}.`)
+  })
+  return notes.join('\n')
+}
+
 /**
  * Build the calibrated prompt for the native vision gateway call. The model is
  * instructed to reply with N `<item id="N"><description>…</description></item>`
  * blocks (N = imageCount) and, for `compare`, one extra `<context>` block.
- * The user's text is XML-escaped when interpolated so it cannot break the
- * format instructions. `intent` is auto-detected from `userText` +
- * `imageCount` when omitted.
+ * The user's text is trimmed, capped at `MAX_PROMPT_USER_TEXT_CHARS`
+ * (see `truncateUserText`) and XML-escaped when interpolated so it can neither
+ * break the format instructions nor bloat the payload. `intent` is
+ * auto-detected from `userText` + `imageCount` when omitted.
+ *
+ * `orientationHint` (see `buildOrientationHint`) appends an EXIF orientation
+ * block when any image is stored rotated/mirrored — DETECTION, not correction:
+ * the vision model is instructed to describe each image in its corrected
+ * viewing orientation; no pixels are rewritten. An empty hint leaves the
+ * prompt byte-identical to the previous behavior.
+ *
+ * Cache interplay: the returned prompt IS the description-cache key's prompt
+ * component (`buildDescriptionCacheKey`), so the SAME image asked a NEW
+ * question produces a different key and a fresh gateway describe — by design,
+ * aligned with the council's describe-once-per-turn flow; only an identical
+ * re-ask (same question, same images) within the TTL reuses the stored text.
+ * The orientation hint travels INSIDE the returned prompt, so two calls for
+ * the same image whose detected orientations differ necessarily get different
+ * cache keys — a stale hint can never be served (and vice versa).
  */
 export function buildNativeVisionPrompt(
   userText: string,
   imageCount: number,
   intent: VisionIntent = detectVisionIntent(userText, imageCount),
+  orientationHint: string = '',
 ): string {
   const count = Math.max(1, imageCount)
   const request =
-    escapeXml(userText.trim()) || '(sem pedido explícito — descreva as imagens com precisão)'
+    escapeXml(truncateUserText(userText)) ||
+    '(sem pedido explícito — descreva as imagens com precisão)'
   const contextInstruction = INTENT_CONTEXT_INSTRUCTIONS[intent]
   const contextLine = contextInstruction ? ` ${contextInstruction}` : ''
   return [
@@ -920,6 +1864,15 @@ export function buildNativeVisionPrompt(
     '- Nunca invente detalhes que não consegue perceber. Se um texto estiver ilegível,',
     '  escreva "ilegível". Coloque análises cruzadas (comparação, veredito) no <context>,',
     '  nunca dentro de um <description>.',
+    ...(orientationHint.trim()
+      ? [
+          '',
+          'IMAGE ORIENTATION (EXIF) — storage metadata, not content:',
+          ...orientationHint.trim().split('\n'),
+          'Describe each image as it appears AFTER applying the correction above;',
+          'the rotation/mirroring is not a defect and must not be reported as one.',
+        ]
+      : []),
     '',
     `User's request: ${request}`,
   ].join('\n')
@@ -1248,6 +2201,65 @@ export function createVisionHandler(input: PluginInput) {
     return toolNamePromise
   }
 
+  /**
+   * Host provider catalog for native-vision model discovery (TTL-cached per
+   * client inside `fetchProvidersCatalog`): one round-trip per TTL window,
+   * never per request. Null on any failure → legacy behavior.
+   */
+  const getProvidersCatalog = (): Promise<unknown> => fetchProvidersCatalog(client)
+
+  /** Lazily create (and return) the per-session description cache. */
+  const ensureSessionCache = (sessionID: string): Map<string, DescriptionCacheEntry> => {
+    let cache = sessionDescriptionCache.get(sessionID)
+    if (!cache) {
+      cache = new Map()
+      sessionDescriptionCache.set(sessionID, cache)
+    }
+    return cache
+  }
+
+  /**
+   * Last rung of the fallback chain: deterministic local extraction (metadata
+   * + best-effort colors/OCR) for when BOTH the native model and the MCP tool
+   * are unavailable. Reuses `resolveImageSourcePayload` so data URIs and local
+   * paths share the native pipeline's byte/size handling. The block is cached
+   * per session (keyed by content hashes) because it is deterministic for the
+   * same file. Returns null when no image could be read — callers then emit an
+   * explicit unavailable message. Never logs payload content. The user's
+   * question is trimmed, capped at `MAX_PROMPT_USER_TEXT_CHARS` and XML-escaped
+   * (same `truncateUserText` + `escapeXml` as the native prompt) so it can
+   * neither bloat the block nor be interpreted as markup.
+   */
+  const buildLocalInjection = async (
+    sessionID: string,
+    images: ReadonlyArray<{ filePart: FilePart; target: SavedImage }>,
+    userText: string,
+  ): Promise<string | null> => {
+    const urls: string[] = []
+    for (const { filePart, target } of images) {
+      const payload = await resolveImageSourcePayload(target.path, filePart.mime)
+      if (payload) urls.push(payload.url)
+    }
+    if (urls.length === 0) return null
+    const cache = ensureSessionCache(sessionID)
+    const cacheKey = `local:${urls
+      .map((url) => hashContent(url))
+      .sort()
+      .join(':')}`
+    let block = getCachedDescription(cache, cacheKey)
+    if (block === null) {
+      block = await buildLocalVisionBlock(urls)
+      if (block === null) return null
+      setCachedDescription(cache, cacheKey, block)
+    }
+    return [
+      'Visão nativa e tool MCP de visão indisponíveis; foi usada extração local determinística (metadados + best-effort), sem conteúdo inventado:',
+      block,
+      '',
+      `User's request: ${escapeXml(truncateUserText(userText)) || '(analyze the image)'}`,
+    ].join('\n')
+  }
+
   const chatMessage: NonNullable<Hooks['chat.message']> = async (hookInput, output) => {
     try {
       const message: UserMessage | undefined = output?.message
@@ -1328,21 +2340,38 @@ export function createVisionHandler(input: PluginInput) {
       let injection: string | null = null
       if (getVisionMode(process.env, config.mode) !== 'tool') {
         try {
-          const target = await resolveNativeVisionTarget({ config })
+          const target = await resolveNativeVisionTarget({
+            config,
+            catalog: await getProvidersCatalog(),
+          })
           if (target) {
             const payloads = await buildNativeImagePayloads(resolved)
             if (payloads) {
-              let sessionCache = sessionDescriptionCache.get(hookInput.sessionID)
-              if (!sessionCache) {
-                sessionCache = new Map()
-                sessionDescriptionCache.set(hookInput.sessionID, sessionCache)
-              }
+              const sessionCache = ensureSessionCache(hookInput.sessionID)
               const intent = detectVisionIntent(userText, payloads.length)
-              const prompt = buildNativeVisionPrompt(userText, payloads.length, intent)
+              // EXIF orientation detection (zero-dep, JPEG only): a non-1 tag
+              // adds a textual hint to the prompt so the vision model describes
+              // the corrected view. The hint lives INSIDE the prompt, so the
+              // cache key below varies with it — no stale-orientation hits.
+              const orientationHint = buildOrientationHint(
+                payloads.map((payload) => payloadOrientation(payload)),
+              )
+              const prompt = buildNativeVisionPrompt(
+                userText,
+                payloads.length,
+                intent,
+                orientationHint,
+              )
               const cacheKey = buildDescriptionCacheKey(prompt, payloads)
               let rawText = getCachedDescription(sessionCache, cacheKey)
               if (rawText === null) {
-                rawText = await describeImagesNative(payloads, target, prompt)
+                // Attach the live session id so the Zen gateway accepts the
+                // request (Zen-only; see describeImagesNative).
+                const requestTarget: NativeVisionTarget = {
+                  ...target,
+                  ...(hookInput.sessionID ? { sessionID: hookInput.sessionID } : {}),
+                }
+                rawText = await describeImagesNative(payloads, requestTarget, prompt)
                 if (rawText !== null) setCachedDescription(sessionCache, cacheKey, rawText)
               }
               if (rawText !== null) {
@@ -1366,9 +2395,25 @@ export function createVisionHandler(input: PluginInput) {
 
       if (injection === null && saved.length > 0) {
         const toolName = await getToolName()
+        // Chain: native → tool → local. The MCP tool instruction is used when
+        // a tool is configured/detected; otherwise fall to deterministic local
+        // extraction (metadata + best-effort colors/OCR) instead of a bare
+        // unavailable message. A null tool name (env/config absent AND no MCP
+        // evidence) is the only path that reaches local extraction, so the
+        // env > config > preset > discovery > DEFAULT precedence is untouched.
         injection = toolName
-          ? generateInjectionPrompt(saved, userText, toolName, config.promptTemplate)
-          : 'Vision fallback unavailable: pantheon-vision MCP is unavailable. The image was removed safely; please configure the MCP server and retry.'
+          ? generateInjectionPrompt(
+              saved,
+              userText,
+              toolName,
+              config.promptTemplate,
+              hookInput.sessionID,
+            )
+          : await buildLocalInjection(hookInput.sessionID, resolved, userText)
+        if (injection === null) {
+          injection =
+            'Vision fallback unavailable: pantheon-vision MCP is unavailable and local image extraction also failed. The image was removed safely; please configure the MCP server and retry.'
+        }
       }
       if (injection === null) {
         injection = 'A imagem compartilhada foi removida antes do envio ao provedor textual.'

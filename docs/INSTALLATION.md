@@ -313,6 +313,29 @@ npx pantheon-opencode init --headless --no-mcp  # sem Python/MCPs
 
 > Tabelas acima refletem `src/routing.yml` + `PRESET_PRICE` + `CAPABILITY_TABLE`.
 
+### Vision (opcional) — prompt pós-wizard
+
+Após o wizard, uma sessão **TTY interativa** oferece um passo opcional de vision
+(`scripts/install/vision-prompt.mjs`), com três opções:
+
+1. **Descoberta automática** (default, Enter) — não grava nada; o modelo é resolvido no início da sessão (catálogo do host).
+2. **Pinar provider/modelo** — pede `provider/model` (ex. `opencode-go/mimo-v2.5`), valida o formato e grava `visionModel` no config **global** `~/.config/opencode/opencode-vision.json` via **merge** (chaves existentes preservadas; gravação atômica com `.bak`; diretório criado se faltar).
+3. **Pular** — não grava nada.
+
+Fluxos **não-interativos** (`--yes`, `--headless`, pipe/CI, sandbox automatizado)
+**nunca** perguntam e nunca gravam config de vision: a descoberta automática
+continua sendo o default em qualquer fluxo não-interativo. O passo não usa
+tokens/segredos e nunca exibe credenciais. O comando `/pantheon-vision` mostra o
+alvo resolvido + origem (env / config / preset / descoberta / default).
+
+O comando também traz um **picker de modelos**: `node scripts/vision-status.mjs
+--list` enumera os candidatos image-capable (fonte marcada como `host catalog`
+quando o catálogo ao vivo está acessível, ou `heuristic` a partir de
+`opencode models`), com `free`/`paid` e **presença de credencial** por provider
+(sem nunca exibir o token); o usuário escolhe por número e o comando aplica via
+`node scripts/vision-status.mjs --set <provider/model> [--global|--project]`,
+que grava `visionModel` com o mesmo merge atômico do prompt de init.
+
 ## Quick Install
 
 ```bash

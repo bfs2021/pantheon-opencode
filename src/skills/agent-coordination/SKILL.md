@@ -34,8 +34,8 @@ Route tasks to optimized agents based on category instead of specifying agents m
 
 ```
 1. User describes feature
-2. @athena creates PLAN with phases and agents
-3. User approves PLAN (GATE 1)
+2. @athena returns the complete PLAN to Zeus (no approval prompt from the child session)
+3. Zeus displays the full PLAN in the main conversation, then asks the user to approve it (GATE 1)
 4. Zeus dispatches agents to phases (parallel when possible)
 5. Each agent: TDD cycle → writes IMPL artifact
 6. @themis reviews all phases (GATE 2)
@@ -66,6 +66,11 @@ All phase outputs go to `.pantheon/memory-bank/.tmp/`. See `skill: artifact-mana
 ---
 
 ## Safety Gates
+
+For every requested plan, Gate 1 is not satisfied by a child-agent approval
+question or a link to a hidden artifact: the complete plan must be visible in
+the main conversation before Zeus asks for approval. If the user requests
+changes, Zeus presents the complete revised plan and repeats Gate 1.
 
 | Gate | When | Why |
 |------|------|-----|

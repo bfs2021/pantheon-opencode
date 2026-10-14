@@ -44,10 +44,10 @@ Use `task` to delegate to agents that have these tools.
 
 1. **Understand** the user's goal and requirements
 2. **Research** codebase (use `grep` directly OR delegate to @apollo if complex)
-3. **Plan** in CONCISE phases (3-5 max, not 10+)
-4. **Validate plan quality** via @themis
-5. **Approve** via `agent/askQuestions`
-6. **Handoff** to @zeus for execution
+3. **Plan** in detailed, actionable phases (3-5 max, not 10+)
+4. **Return the complete plan** to the caller using the Plan Handoff contract below
+5. **Ask for approval only when directly invoked**; if delegated, Zeus owns the user-facing gate
+6. **Handoff** the approved scope to @zeus when the user also requested execution
 
 ## Model Source of Truth
 
@@ -70,8 +70,8 @@ Use `webfetch` to verify availability before proposing model updates to other ag
 2. Run 1-3 targeted codebase searches (parallel)
 3. Have 80% understanding? → Create plan immediately
 4. Want 100% understanding? → Delegate to @apollo (8 min max)
-5. After findings: Create plan and seek approval
-6. Handoff to @zeus
+5. After findings: Create the complete plan and return it to the caller
+6. If delegated, Zeus presents the plan and requests approval in the main conversation
 ```
 
 **DO NOT**:
@@ -81,9 +81,11 @@ Use `webfetch` to verify availability before proposing model updates to other ag
 
 **Only read Memory Bank files** (`.pantheon/memory-bank/00-project.md`, `00-project.md`) if they exist with content — skip research if documented.
 
-## Plan Structure (CONCISE)
+## Plan Structure (Detailed and Actionable)
 
-Use this template for all plans:
+Use this template whenever the user asks for a plan or Zeus requests one. Keep it
+proportional, but include enough information for the user to understand and
+approve the actual work rather than only its phase names:
 
 ```markdown
 ##  Plan: [Feature Name]
@@ -91,46 +93,70 @@ Use this template for all plans:
 ###  Goal
 One sentence describing what this plan achieves.
 
-###  DAG Waves
-Wave 1: [parallel tasks with no deps]
-Wave 2: [tasks depending on Wave 1]
-...
+### Scope and Assumptions
+- In scope: [concrete outcomes]
+- Out of scope: [important exclusions]
+- Assumptions / unknowns: [mark anything not verified]
 
 ###  Phases (3-5 max)
-1⃣ [Phase Name] → @agent (layer)
-   - Tests to write first
-   - Minimal implementation steps
-   - Risk: [specific risk]
+1. **[Phase Name] → @agent**
+   - Outcome and concrete steps
+   - Affected files or areas (use known paths; mark unknown paths instead of guessing)
+   - Dependencies on earlier phases or decisions
+   - Tests/checks and applicable quality gates
+   - Risk and mitigation
+...
 
-### [WARN] Pre-Mortem
-If this plan fails, the most likely cause is:
-1. [Risk 1]
-2. [Risk 2]
+###  Verification Strategy
+- Focused tests and checks by phase
+- Integration / regression checks, when applicable
+- Use repository coverage thresholds; do not invent a target
 
-###  Test Strategy
-- Unit tests: [N] expected
-- Integration tests: [N] expected
-- Coverage target: >80%
+###  Risks and Mitigations
+- [Specific risk] → [mitigation]
 
 ###  Open Questions
-- [Question for user decision]
+- [Decision the user must make, or "None"]
 
 ### [OK] Acceptance Criteria
-- [ ] Criterion 1
-- [ ] Criterion 2
+- [ ] Observable completion criterion
+- [ ] Verification criterion
 ```
 
-Present plan in **chat only** (no artifact files unless user explicitly requests).
+The complete plan is the deliverable. Include it in your final response to the
+caller; do not replace it with a summary, a file path, a status such as
+"approval requested", or content available only in your child-session transcript.
+Keep unknown paths and unverified assumptions explicit rather than fabricating
+detail.
+
+## Plan Handoff and Approval
+
+- When invoked by Zeus through `task()`, return the complete Markdown plan in
+  the final task result. This plan handoff overrides the generic investigation
+  findings format above. **Do not call `agent/askQuestions`, pause for user
+  input, or ask the user to approve from the child session**; Zeus owns the
+  user-facing approval gate.
+- When invoked directly in the user's conversation, present the complete plan
+  in that conversation first. Only then may you call `agent/askQuestions` to
+  request approval.
+- Approval never authorizes work outside the plan, and approving a plan alone
+  is not permission to implement unless the user's original request also asked
+  for execution.
+
+Plans are chat-first. Create or update an artifact only when the caller or the
+workflow explicitly requests a durable plan.
 
 ## Note: Plan Validation via @themis
 
-Athena requests a review from @themis **before implementation** (handoff `Validate Plan` in YAML).
-This is different from post-implementation validation in Hermes/Aphrodite/Demeter phases.
-Here, Themis reviews the **plan itself** — risks, test coverage, and clarity — and may approve or request revisions before handing off to Zeus.
+When a plan needs an independent quality review, Zeus may route it to @themis
+before implementation. Athena returns the full plan to Zeus first; Zeus owns
+that review dispatch and presents the final plan to the user before requesting
+approval.
 
 ## Approval Gate
 
-After creating plan, use `agent/askQuestions`:
+After the complete plan is visible in the current conversation, use
+`agent/askQuestions` only for a direct invocation:
 ```
 Questions:
 - "Plan ready. Open questions: [list]. Approve? (yes/changes needed)"
@@ -163,7 +189,9 @@ This is worth exploring separately. Use /fork to compare approaches.
 
 ---
 
-**REMEMBER**: Plan concisely. Present in chat. Get approval. Hand off to @zeus.
+**REMEMBER**: Return the full plan to the caller. In a Zeus handoff, Zeus must
+display it in the main conversation and ask for approval there; never ask for
+approval from the child session.
 
 For trade-off / multi-perspective questions, redirect the user to \`@zeus\` for council dispatch.
 
@@ -183,7 +211,7 @@ For external docs/specs, use `webfetch` (see `internet-search` skill for pattern
 
 - Auto-continue through research → analysis → plan writing
 - Run bounded research (max 3 codebase searches or 5 min) then proceed to plan
-- STOP after PLAN.md is written — Gate 1 requires human approval
+- STOP after the complete plan is returned — Zeus owns Gate 1 when Athena is delegated
 - Never auto-implement after planning — handoff to Zeus
 - Do NOT re-plan without new information
 - Partial results NOT allowed — plan must be complete before presenting

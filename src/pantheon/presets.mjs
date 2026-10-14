@@ -61,6 +61,8 @@ export const CAPABILITY_TABLE = [
   // entry above matches 'mimo/v2.5' (full-string) but NOT 'mimo-v2.5'
   // (segment 'mimo-v2.5' has no slash, so 'mimo/' prefix cannot match).
   { prefix: 'mimo-v2.5', maxEffort: 'low', stripEffort: false, vision: true },
+  // Current free OpenCode Zen vision model (renamed to the v2.6 Flash family).
+  { prefix: 'mimo-v2.6-flash', maxEffort: 'low', stripEffort: false, vision: true },
   // mimo-v2.5-pro is text-only per models.dev api.json (2026-08-27).
   { prefix: 'mimo-v2.5-pro', maxEffort: 'low', stripEffort: false, vision: false },
   // Go subscription specific — bare segment prefixes so opencode-go/<model> IDs match

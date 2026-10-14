@@ -12,7 +12,9 @@ description: "Define requirements via spec-first before any code — PRD, edge c
 2. **PRD** — Escreva um documento de requisitos: objetivo, personas, fluxos, regras de negócio, critérios de aceitação
 3. **Edge Cases** — Mapeie entradas inválidas, concorrência, falhas de API, estados vazios
 4. **Technical Spec** — Decisões de arquitetura: componentes, dados, API contracts, deploy
-5. **Approval** — Apresente ao usuário antes de codar. "É isso mesmo?"
+5. **Approval** — Apresente o plano completo ao usuário antes de codar. Se o
+   planejamento veio de um subagente, devolva o plano integral ao orquestrador
+   para que ele o exiba na conversa principal antes de pedir aprovação.
 
 ## Anti-patterns
 - ❌ Pular direto pra implementação
