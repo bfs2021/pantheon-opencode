@@ -1,7 +1,7 @@
 {
   "name": "pantheon-tui",
   "type": "module",
-  "version": "1.6.0-beta.9",
+  "version": "1.6.0-beta.10",
   "description": "Pantheon TUI plugin — V1 rich sidebar and usage gauges; native V2 status, session and delegation sidebar",
   "license": "MIT",
   "engines": {
@@ -21,7 +21,7 @@
   ],
   "scripts": {
     "build": "tsdown",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "1.18.33",
