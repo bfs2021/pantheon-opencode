@@ -14,16 +14,36 @@ release is **v1.6.0-beta.1**, the first beta compatible with OpenCode 2.
 # Interactive (default TTY) — component selection, progress spinners
 npx pantheon-opencode init
 
-# Headless mode — for CI and scripts
-npx pantheon-opencode init --headless
+# Headless mode — for CI and scripts (non-interactive apply requires --yes)
+npx pantheon-opencode init --headless --yes
 ```
 
 Flags:
 - `--interactive` — force interactive TUI even if piped
 - `--headless` — force non-interactive (default for CI)
-- `-y` / `--yes` — skip confirmations, use defaults
+- `-y` / `--yes` — skip confirmations, use defaults; **required for a non-interactive apply**
 - `--project` — install locally in `./.opencode/`
 - `--no-mcp` — skip Python/MCP setup
+
+### Non-interactive apply requires `--yes`
+
+Without a TTY, `init` prints the plan and **changes nothing** unless `--yes`
+(alias `-y`) is passed. It never prompts and never guesses.
+
+```bash
+npx pantheon-opencode init --headless          # prints the plan, applies nothing
+npx pantheon-opencode init --headless --yes    # applies
+```
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | success, or plan-only / declined (nothing applied) |
+| `1` | failure |
+| `2` | apply requested without authorization (non-interactive, no `--yes`) |
+| `3` | drift detected (Phase 4) |
+| `130` | canceled |
 
 For MCP servers (memory, persistence) and TUI plugin:
 
@@ -43,26 +63,32 @@ npm run doctor
 - **Python 3.11+** (optional, for MCP servers)
 
 
-## Background Subagents
+## Delegated Agents and Background Mode
 
-Pantheon dispatches agents in parallel via OpenCode's background subagent system.
-To enable, set before launching OpenCode:
+OpenCode V2 documents the native `subagent` tool. Its availability depends on
+the active host/runtime; check the tools exposed in the current session. A
+foreground call waits for the child result. With `background: true`, the call
+returns immediately, the parent is notified when the child finishes, and the
+response includes a `sessionID` that can be used to continue that child. See
+the [OpenCode V2 tools documentation](https://opencode.ai/v2/docs/tools).
+
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` is not a universal prerequisite.
+It is an experimental gate for some runtimes and is set by Pantheon's
+`npm run start` launcher; use it only when the target runtime documents and
+requires it. The setting does not make a missing tool available.
 
 ```bash
+# Only when the active runtime documents and requires this experimental gate
 export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
 opencode
-```
-
-Or add to your shell profile (`~/.zshrc` or `~/.bashrc`):
-```bash
-echo 'export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true' >> ~/.zshrc
 ```
 
 ## Highlights
 
 - **OpenCode-only** — unified, simplified, no multi-platform fragmentation
 - **Global install** — `npx pantheon-opencode init` works from any directory
-- **Background subagents** — up to 5 agents in parallel
+- **Delegation waves** — Pantheon's workflow may organize up to 5 agents per
+  wave; this is an organizational policy, not an OpenCode API concurrency guarantee
 - **8 slash commands** — Pantheon workflow, model, audit, vision, and goal tools
 - **Themis 3-layer review** — heuristic scanner + deep review + verification planning
 - **Persistent MCP memory** — SQLite FTS5 (BM25) keyword search, no embeddings

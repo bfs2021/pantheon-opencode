@@ -704,6 +704,332 @@ leitor pode planejar contra é enganosa se ele ler "5 event subscriptions" como
 "5 behaviours"; falta ou decidir a paridade ou declarar a cadeia fora de escopo na
 documentação de instalação.
 
+### Beta 11 — Runtime, governança, persistência e release
+
+**Status da Beta 11: IN PROGRESS.** Há 18 commits locais à frente de
+`origin/main` (contagem obtida via `git log --oneline origin/main..HEAD` no
+momento desta atualização — o inventário é datado e deve ser recontado, não
+reaproveitado). Commits de fase: `c2f5698` (contrato de ferramentas e governança
+runtime), `6fedf83` (council e claims + limites de persistência), `1d9b20a`
+(overrides manuais V2 project-scoped de modelo), `2848075` (caminho
+enxuto/proporcional e redação de custo), `c6f5280` (janela e limites de agregação
+do `pantheon_cost`) e os cinco commits da fase **Setup** — `66bf918`, `2f53f01`,
+`2e4066d`, `4ae5283`, `55ecef4`, mais o commit extra de preparação de release
+`8a11282` (`chore(release): v1.6.0-beta.11`) na ponta desta branch. As fases 1 e 2
+passaram (`c2f5698`,
+`6fedf83`); a fase de persistência foi entregue em `6fedf83` com limites
+documentados e testes de fronteira; o subconjunto de overrides manuais da fase de
+modelo ativo está **IMPLEMENTED — COMMITTED — REVIEWED** em `1d9b20a` (Themis
+PASS_WITH_NOTES e verificação de dependência isolada); a documentação do caminho
+enxuto/proporcional foi entregue em `2848075`, com a medição ainda aberta; a
+fatia de relatório de custo em `src/pantheon/cost-command.ts` está **COMMITTED —
+REVIEWED** em `c6f5280` (`docs: describe pantheon_cost window and aggregation
+limits`; Themis PASS_WITH_NOTES e validação isolada: 36/36 testes, typecheck pass,
+Biome direcionado pass); a fase **Setup** está **DELIVERED — COMMITTED —
+REVIEWED** nos cinco commits `66bf918`, `2f53f01`, `2e4066d`, `4ae5283`,
+`55ecef4` (o que foi entregue e a verificação estão na fase 6). Permanecem
+abertos: a medição de orquestração (fase 4, **bloqueada por capacidade**, não
+entregue), o tratamento de `specific_claims` (fase 2) e quais capacidades runtime
+estão realmente disponíveis para todo/background/board. Foram **decididos** nesta
+rodada: V2/empacotamento/catalog (**manter como está**), presets/catálogo V1
+(**congelado**, sem migração) e economia de testes/tiers (fase 10, regra
+normativa entregue via `src/instructions/test-economy.instructions.md`, **split
+não aplicado**); registry/release está **autorizado**: a preparação de release
+está commitada (`8a11282`, `chore(release): v1.6.0-beta.11`) e o PR **#241** está
+aberto para `main`; a publicação fica **pendente** de um dispatch manual do
+workflow `Release` (`release_channel=beta`, dist-tag `beta`) **após o merge e o
+CI verde**. O push de tag não publica — é o workflow que cria a tag. **Nada está
+publicado** enquanto esse workflow não rodar, e a Beta 11 não está "released" até
+a publicação concluir com sucesso. A própria atualização deste
+ROADMAP permanece não commitada nesta árvore; nada nesta atualização declara
+Beta 11 nem qualquer trabalho não commitado como entregue.
+
+**Objetivo.** Reconciliar os contratos documentados com o runtime observado,
+fortalecer a verificação de persistência e setup, e preparar o pacote/catalog para
+V2 sem expandir permissões implicitamente. Medir resultados antes de alterar a
+orquestração ou alegar redução de custo.
+
+**Evidência Beta-10 (resultado, não trabalho Beta-11).** Um projeto externo React
+19 + Vite 8 + TypeScript passou 67/67 testes, buildou em 203 ms e teve zero
+vulnerabilidades em `npm audit`. No browser foram verificados fetch runtime de
+`/offers.json`, atualização de dados sem rebuild, acessibilidade, teclado,
+responsividade e retry. A correção de URL scheme ocorreu naquele projeto externo,
+em `/home/ils15/projetos/site_ofertas`, que não é este repositório e não deve ser
+alterado. O follow-up MED sobre tamanho do link foi aceito após o teste; não abre
+trabalho no Pantheon.
+
+#### Fases e status
+
+1. **Contrato de ferramentas e governança runtime — PASSED (commit local `c2f5698`).** Inventariar e
+   reconciliar catálogo, instruções, documentação e comportamento real de todo,
+   `memory_store`, acompanhamento de background e board. O runtime observado
+   expôs `subagent`, `glob`, `grep`, `read`, `skill`, `question`, `webfetch`,
+   `websearch` e `execute`, mas não `todo_write`, `memory_store`, `task_status` nem
+   `board.registerLaunch`. A allowlist MCP de memória não concede
+   `memory_store`; métodos do board são internos. Validar `task_status` no
+   runtime antes de documentá-lo como disponível; não declarar `todo_write`
+   callable sem prova. Corrigir a nomenclatura `task()` vs `subagent` e avaliar o
+   overhead do caminho indireto `execute` + busca. **Limite:** priorizar contrato
+   e documentação, sem expansão de tools/permissões. Qualquer nova
+   permissão/tool/API requer aprovação explícita do usuário e revisão Themis.
+   **Verificação:** fase aprovada/concluída; resultado registrado no commit
+   local `c2f5698` (`docs: align host tool and background contracts`).
+2. **Council e claims — PASSED (commit local `6fedf83`).** Definir que a primeira rodada paralela pode
+   omitir `agreement_signals` ou retornar `none`; derivar consenso das posições
+   efetivamente coletadas; proibir autorreferência e limitar rebuttal a respostas
+   visíveis. Avaliar `specific_claims` — hoje autorrelato sem validador — como
+   advisory, opcional ou removível, e como validar claims na síntese. O relato de
+   fabricação na Beta-10 é um relato, não prova de defeito no código; três
+   contagens iguais a 7 são sinal, não prova. **Dependência:** fase 1 para alinhar
+   contrato e evidência runtime. **Verificação:** fase aprovada/concluída;
+   resultado registrado no commit local `6fedf83` (`fix: correct council
+   protocol and persistence bounds`).
+3. **Persistence — PASSED (commit local `6fedf83`).** Documentar e testar os limites existentes de
+   `context_save`: 65.536 bytes no total; até 100 itens tail; 4.096 bytes por
+   linha do tail; soma do tail limitada a 65.536 bytes. Os erros passaram a ser
+   específicos e acionáveis (nomeiam o limite e o valor observado) em vez do
+   erro genérico antes emitido, sem truncar ou descartar tail silenciosamente.
+   **Verificação:** entregue em `6fedf83` — `src/mcp/mcp_persistence.py` e
+   `scripts/mcp_persistence.py` rejeitam excesso com a mensagem específica,
+   `docs/persistence-mcp.md` documenta os limites e a rejeição sem truncamento, e
+   `tests/test_mcp_persistence_server.py` adicionou testes de fronteira para cada
+   limite: conteúdo (65.536/65.537 bytes), contagem de itens tail (100/101),
+   bytes por linha do tail (4.096 bytes aceitos / 4.097 rejeitados; no caso
+   multibyte UTF-8, 2.048 caracteres `é` = 4.096 bytes aceitos / 2.049 = 4.098
+   bytes rejeitados) e soma agregada do tail (65.536/65.537 bytes). Os testes
+   verificam a rejeição explícita, com mensagem específica do limite e do valor
+   observado; eles não releem o conteúdo previamente armazenado para comprová-lo.
+   A preservação do que já estava salvo é a semântica documentada de
+   rejeitar-sem-truncar (`docs/persistence-mcp.md`), não uma alegação que estes
+   testes verifiquem diretamente.
+4. **Orquestração proporcional e medição — caminho enxuto DOCUMENTED (`2848075`); medição OPEN — BLOCKED BY CAPABILITY.** Propor um caminho enxuto
+   para tarefa pequena/reversível (um especialista adequado, sem plano/council de
+   rotina) e manter todos os gates para trabalho material/sensível. Medir
+   overhead, resultado e risco antes de reduzir agentes; não usar `general` ou
+   `explore` e não remover agentes com base em uma tarefa. O baseline citado de
+   ~10M tokens / nominal 24h abrangia cerca de 20 dias de sessões, não uma tarefa.
+   `pantheon_cost` agrega tokens por agente/fase (V2 pode reportar `unknown`),
+   não por sessão/modelo/provedor nem USD; `days=1` é janela móvel, não
+   isolamento de tarefa. Registrar timestamps e janelas; não alegar savings ou
+   delta específico sem atribuição. **Entregue em `2848075`:** a orientação do
+   caminho enxuto/proporcional e a redação de custo/modelo
+   (`docs/PERMISSIONS-QUALITY-DELEGATION.md` §3.6, `src/agents/zeus.md`,
+   `src/instructions/zeus-timeout-retry.instructions.md`, `docs/QUICKSTART.md`,
+   `docs/mcp-tools.md` e `README.md`). A alteração de redação/saída do relatório
+   de custo em `src/pantheon/cost-command.ts` está agora **commitada e revisada**
+   em `c6f5280` (`docs: describe pantheon_cost window and aggregation limits`;
+   Themis PASS_WITH_NOTES e validação isolada: 36/36 testes, typecheck pass,
+   Biome direcionado pass) e não é mais trabalho não commitado. **Dependências:**
+   fases 1 e 2 para
+   classificar chamadas/custos e evidência. **Verificação planejada (medição):**
+   comparação com janelas e atribuição explícitas, com risco e resultado
+   registrados; nenhum delta será promovido sem medição atribuível.
+   **Bloqueio de capacidade (registrado):** `pantheon_cost` agrega tokens por
+   agente/fase (V2 pode reportar `unknown`) e não isola tarefa/sessão/modelo/
+   provedor; nenhum delta atribuível foi produzido e nenhuma economia deve ser
+   alegada. A medição permanece **aberta, bloqueada por capacidade** — não
+   entregue.
+5. **Modelo ativo — subconjunto de overrides manuais V2 IMPLEMENTED — COMMITTED — REVIEWED (`1d9b20a`); itens residuais abertos.** **Decisão de política:** V2 não aplica presets
+   estáticos nem `PANTHEON_MODEL_PRESET`; preserva o modelo default do host e só
+   aplica overrides manuais **project-scoped** por agente (`model` e `variant`)
+   no transform de agente; arquivos globais não são lidos nem aplicados. V2
+   `set`/`reset` são project-only e rejeitam `scope=global` e flags de autorização
+   explícitas, sem escrita. Não existe prompt/API V2 de aprovação independente;
+   overrides globais exigem autorização humana explícita futura e não são
+   suportados por esta ferramenta. Marker legado não é apagado nem ativa
+   provider/modelo. Não há wizard de rotas. V1 mantém o comportamento legado, sem
+   alteração. `status` informa a configuração project-scoped, não prova qual modelo
+   executou a completion. **Decisão aprovada
+   explicitamente pelo usuário:** warnings de overrides são acessíveis por
+   `pantheon_model status`. O server plugin V2 não tem API documentada de toast
+   ou notificação visível durante o transform; portanto, não há toast nem aviso
+   proativo prometido. Override inválido/malformado preserva o modelo do host e
+   registra diagnóstico interno; o usuário deve chamar `status` para ver o
+   warning. Continua pendente rastrear o mismatch observado entre preset
+   go-free/config Zeus
+   `opencode/big-pickle` e runtime `opencode-go/deepseek-v4.1-flash`, sem
+   presumir restart lag (item residual aberto: rastrear esse mismatch de runtime).
+   **Dependência:** fase 1 para definir evidência runtime. **Verificação:**
+   subconjunto de overrides manuais V2 entregue, commitado e revisado em
+   `1d9b20a` (`feat: add project-scoped V2 model overrides`) — Themis
+   PASS_WITH_NOTES e verificação de dependência isolada: 5 testes focados,
+   incluindo `plugin-v2-contract` 113/113, typecheck pass e Biome direcionado
+   pass; o lint completo tem apenas um erro pré-existente no inalterado
+   `tests/agents-baseline-contract.test.mjs`. Permanece planejado capturar, para
+   a mesma operação, configuração e observação runtime como campos distintos, ou
+   registrar explicitamente quando o runtime não fornece esta última.
+6. **Setup — DELIVERED — COMMITTED — REVIEWED (`66bf918`, `2f53f01`, `2e4066d`,
+   `4ae5283`, `55ecef4`).** Entrega em cinco fases commitadas: (1) `66bf918` —
+   preview **por arquivo** do change set no dry-run, com **zero escritas**;
+   (2) `2f53f01` — **conjunto de backup exato** (cópia byte-a-byte) gravado
+   **antes da primeira escrita**, em diretório `0700` com arquivos e manifest
+   `0600`, retendo os 5 conjuntos mais recentes, mais o comando `restore`, que
+   **recusa restaurar** um conjunto que falhe na verificação de integridade;
+   (3) `2e4066d` — **gate de autorização explícita `--yes`** antes do apply, com
+   cancelamento e códigos de saída `0` (ok / plan-only, nada aplicado), `1`
+   (falha), `2` (apply sem autorização), `3` (drift) e `130` (cancelado);
+   (4) `4ae5283` — **detecção de drift** entre plano e apply **dentro de uma única
+   execução** (exit `3`) — drift **entre invocações distintas não é detectável**,
+   pois nenhum plano é persistido; (5) `55ecef4` — **relatório de falha** com os
+   caminhos já aplicados e dica de recuperação via `restore` (**sem rollback
+   automático**), mais **auditoria de saída secret-safe** (canário + secret-scanner
+   sobre stdout/stderr). **Verificação:** gates do Themis, validações isoladas em
+   tiers por fase e um gate final de suíte completa (ver "Critérios de verificação"
+   e a lição do gate final em "Riscos"). **Limites:** o `restore` recupera a partir
+   do conjunto de backup e não é rollback automático; o drift cobre apenas a
+   coerência plano↔apply de uma execução; a auditoria de segredos cobre as saídas
+   do installer, não todo o repositório.
+7. **V2, empacotamento e model catalog — PLANNED — DECIDED: keep as-is (no change this beta).** Reconciliar o pacote atual —
+   root pinado em `@opencode-ai/plugin@1.18.33` e `@opencode-ai/sdk@1.18.33`,
+   exports apontando para `.ts` e sem build root — com a recomendação do council
+   de ESM compilado em `dist/`, exports `types`/`default`, `.d.ts`, sem pin exato,
+   peer range + runtime detection e `@opencode/plugin` 2.x. A recomendação fica
+   **registrada, não aplicada**. **Decisão (Beta 11):** manter como está — root
+   pinado em `@opencode-ai/plugin@1.18.33`/`@opencode-ai/sdk@1.18.33`, exports
+   `.ts` e sem build root — para não arriscar consumidores existentes; a migração
+   será revisitada depois. Testar fontes, `dist/` e tarball quando ela for
+   reconsiderada. As observações de hosts `2.0.22` e `2.0.27` não estabelecem uma
+   versão universal. **Dependência (resolvida nesta rodada):** o formato de
+   entrada foi decidido como "manter como está"; qualquer alteração de
+   metadados/build fica adiada. **Verificação planejada:** build reproduzível,
+   exports/types/assets corretos no artefato compilado e inspeção/teste de
+   consumo do tarball.
+8. **Presets e catálogo — V1 CONGELADO (subconjunto de overrides manuais V2 IMPLEMENTED — COMMITTED — REVIEWED `1d9b20a`).** **Decisão V2:** presets estáticos são
+   aposentados como seleção efetiva; não haverá wizard nem ativação implícita.
+   V2 usa apenas overrides manuais project-scoped por agente e deixa o default do host intacto
+   quando não houver override. Arquivos globais não são lidos/aplicados; mutações
+   globais não são suportadas por `pantheon_model`, pois não há API V2 de aprovação
+   humana independente. Suporte futuro exigirá autorização explícita separada.
+   Markers `preset` e `PANTHEON_MODEL_PRESET` são
+   legados/ignorados, sem apagar arquivos. O caminho V1 permanece **congelado**:
+   inalterado, mantendo os IDs estáticos de `routing.yml`, sem migração de
+   presets neste beta. Configuração inválida/malformada mantém o modelo do
+   host, registra diagnóstico interno e expõe warning via `pantheon_model status`;
+   não há toast nem notificação proativa documentada no transform V2. Essa
+   limitação foi explicitamente aprovada pelo usuário. `src/routing.yml` contém
+   IDs estáticos; sua migração V1 está **congelada** (não autorizada neste beta);
+   `.pantheon/tiers.json` é MCP tier. A separação do catálogo legado e a
+   migração V1 dos presets ficam **congeladas** para este beta,
+   sem wizard ou validação de preset V2. **Dependência:** fase 7 para
+   compatibilidade de pacote. **Verificação:** subconjunto de overrides manuais
+   V2 entregue e revisado em `1d9b20a` (default host intacto, marker legado
+   inerte, override/variant manual aplicado ao agente correto e reset sem
+   fallback para preset). A migração V1 dos presets e a separação do catálogo
+   legado ficam **congeladas** (sem migração neste beta).
+9. **Registry e release — AUTORIZADO (preparação commitada; publicação pendente).** Incluir `mcpName` onde o schema exigir e
+   validar conteúdo do tarball, exports/types/assets, frescor do build e consumer
+   smoke. Validar instalação global no sandbox `~/pantheon-sandbox/`, não no
+   ambiente de desenvolvimento. **Dependências:** fases 7 e 8 para artefatos e
+   catálogo finais. **Verificação planejada:** checks do pacote publicado no
+   sandbox, smoke test de consumidor e confirmação do estado do tarball.
+   **Decisão (Beta 11):** **autorizado** pelo usuário — a preparação de
+   release está commitada (`8a11282`, `chore(release): v1.6.0-beta.11`) e o PR
+   **#241** está aberto para `main`; a publicação fica **pendente** de um
+   dispatch manual do workflow `Release` (`release_channel=beta`, dist-tag
+   `beta`) **após o merge e o CI verde**. O push de tag não publica — é o
+   workflow que cria a tag. **Nada está publicado** enquanto esse workflow não
+   rodar, e a Beta 11 **não está "released"** até a publicação concluir com
+   sucesso.
+10. **Test economy e suites em tiers — IN PROGRESS (regra normativa entregue;
+    DECIDED: split não aplicado — manter como está).** Os agentes devem escrever testes menores e
+    focados e parar de produzir suítes exaustivas/repetitivas que tornam cada
+    fase lenta: um comportamento → um teste direcionado, sem duplicar a mesma
+    cobertura entre arquivos; sem E2E/full-install ou testes dependentes de rede
+    a menos que a mudança altere de fato esse caminho ponta a ponta; sem
+    asserções redundantes de cópia/formatação nem asserções que apenas
+    reafirmam a implementação ("testar o teste"). A regra normativa
+    compartilhada é `src/instructions/test-economy.instructions.md`, incluída em
+    `AGENTS.global.md` (sem `agents:` scoping) e portanto entregue a todos os
+    agentes. Suítes pesadas/lentas — hoje `tests/install-opencode.test.mjs`
+    (~12 min) e `tests/install-e2e.test.mjs` (~13 min), por realizarem
+    instalações reais (venv/pip, `npm install` em diretórios temporários) — devem
+    ser **opt-in** por script/tier separado, nunca por edição nem por fase;
+    roda-se apenas o subconjunto afetado. A regra não enfraquece gates
+    existentes: auth, segurança, integridade de dados e thresholds de cobertura
+    exigidos permanecem obrigatórios. **Verificação planejada:** o tier rápido
+    roda por default; as suítes pesadas de instalação/E2E ficam opt-in e
+    reservadas a gates de release/pré-release; a validação por fase permanece sob
+    um orçamento explícito. **Proposta de split NÃO aplicada (preserva CI):**
+    `package.json` e CI não foram alterados porque `test:all` está travado por
+    `tests/ci-workflow-fail-closed.test.mjs` para incluir `npm run test:node` (a
+    suíte completa, incluindo as suítes pesadas) e o job `test-suite` do CI roda
+    `npm run test:node` diretamente; tornar o rápido o default exigiria editar
+    esse gate test e o workflow de CI, o que está fora do escopo desta entrega.
+    Aplicar o split apenas junto da edição revisada daquele contrato e do CI.
+    **Decisão (Beta 11):** manter o **split não aplicado** — `test:node` e o CI
+    permanecem como estão (suítes pesadas incluídas); a validação por fase
+    seleciona o tier manualmente e o `npm run test:node` completo continua sendo o
+    gate de release.
+
+**Critérios de verificação da Beta 11.** Cada fase deve manter evidência
+reproduzível e registrar separadamente resultado, limitações e decisões. Fases
+1/2 passaram e a fase 3 foi entregue em `6fedf83`; a fase 6 (Setup) foi entregue
+nos cinco commits `66bf918`/`2f53f01`/`2e4066d`/`4ae5283`/`55ecef4`; o
+subconjunto de overrides manuais V2 (`1d9b20a`) e a documentação do caminho
+enxuto (`2848075`) estão commitados e revisados, mas mantêm itens
+residuais/medição abertos; os demais critérios continuam pendentes conforme os
+status acima. Validar documentação contra o runtime, testar limites e fluxos de
+falha, e verificar o artefato distribuído — não apenas os fontes. Manter gates de
+Themis para mudanças materiais, de segurança, permissão ou dados. Só marcar uma
+fase entregue após sua própria implementação e verificação. **Gate de release
+(suíte completa):** a validação por fase em tiers não substitui o gate de
+release — `npm run test:node` (a suíte completa, incluindo as suítes pesadas)
+deve rodar antes de release/pré-release, porque regressões em suítes que a fase
+não tocou só aparecem ali (ver a lição do `c2f5698` em "Riscos"); isso é
+consistente com o orçamento de economia de testes da fase 10: o tier rápido
+serve ao ciclo por fase, não ao gate final.
+
+**Riscos.** Contratos do host podem variar entre versões; observações locais podem
+ser confundidas com garantias do pacote; erro pode surgir em camada de renderização
+e não na persistência; métricas agregadas podem induzir falsa atribuição; alterar
+peer range, build ou migração de presets sem decisão pode quebrar consumidores ou
+instalações existentes. Evitar expansão de permissão e mudanças irreversíveis sem
+aprovação/review apropriadas.
+
+**Lição do gate final (regressão entre suítes).** A validação em tiers por fase
+pode não pegar regressões em suítes não relacionadas à fase. Caso real desta
+branch: uma regressão em `tests/memory-delegation-prompt.test.mjs`, introduzida
+por `c2f5698` (que removeu o "both" explícito de
+`src/instructions/zeus-memory-operations.instructions.md`) e corrigida em
+`1b9607c`, só apareceu no gate final de suíte completa. Guardrail: rodar
+`npm run test:node` (suíte completa) nos gates de release; o tier rápido por
+fase não o substitui — consistente com o orçamento de economia de testes da
+fase 10.
+
+**Lição de higiene de hooks (`--no-verify`).** Dois commits foram feitos com
+`--no-verify`; o conteúdo foi verificado limpo, sem segredos. O contrato do Iris
+(`src/agents/iris.md`) agora proíbe explicitamente pular hooks. Guardrail: não
+usar `--no-verify`/`-n` nem qualquer bypass de hook — o hook de segredos é um
+gate.
+
+**Decisões em aberto.** Decididas nesta rodada (registradas, sem alteração de
+implementação): (a) entrada V2-only ou `.ts`/`dist` — **decidida manter como
+está** (root pinado, exports `.ts`, sem build root), para não arriscar
+consumidores existentes; (b) peer range/`*` com compat manifest — **decidida
+manter o pin exato** neste beta; (c) bundler/build — **decidida não introduzir**
+neste beta; (e) migração V1 dos IDs de preset — **congelada**: V1 mantém o
+caminho legado e o `routing.yml` estático, sem migração. Continuam em aberto:
+(d) tratamento de `specific_claims`; (f) quais capacidades runtime estão
+realmente disponíveis para todo/background/board. A medição de orquestração
+(fase 4) permanece **bloqueada por capacidade**: `pantheon_cost` agrega tokens
+por agente/fase (V2 pode reportar `unknown`) e não isola
+tarefa/sessão/modelo/provedor, então nenhum delta atribuível pode ser produzido e
+nenhuma economia deve ser alegada. As diferenças de versão de host observadas
+não resolvem essas decisões.
+
+**Exclusões.** Não puxar automaticamente os 23 itens `OPEN` do roadmap; considerar
+P0-5/P0-6 somente se vínculo direto com Beta 11 for confirmado e manter os demais
+para triagem futura. F5 permanece deferred porque falhou paridade de rota; não
+declarar aceito. F2-V2/F4B/F6 não foram encontrados no repositório e não devem ser
+inventados. Não alterar o projeto React externo nem abrir trabalho Pantheon pelo
+follow-up MED de tamanho do link. Esta seção registra progresso parcial: 18
+commits locais existem à frente de `origin/main` (incluindo `c6f5280`, a fatia de
+relatório de custo em `src/pantheon/cost-command.ts`, agora commitada e revisada,
+e os cinco commits da fase Setup) e a preparação de release está commitada
+(`8a11282`, `chore(release): v1.6.0-beta.11`) com o PR **#241** aberto para
+`main` — porém **nada foi publicado**, Beta 11 não está concluída, e a própria
+atualização deste ROADMAP permanece não commitada e não conta como entregue.
+
 ---
 
 ## Histórico

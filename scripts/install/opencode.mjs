@@ -19,9 +19,10 @@
 import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { listV2UnsupportedFeatures } from '../../src/pantheon/v2-unsupported.mjs'
 import { copyAgentPrompts, writeAgentsMdManaged } from '../build-agents-md.mjs'
+import { backupSetPath, backupWarning, createBackupSet, nextBackupName } from './backup.mjs'
 import {
   bullet,
   colors,
@@ -33,6 +34,7 @@ import {
   spinner,
   step,
   success,
+  tag,
   warning,
 } from './cli-ui.mjs'
 import {
@@ -43,6 +45,17 @@ import {
 import { healthCheck } from './health-check.mjs'
 import { detectVersion, runMigrations } from './migrate.mjs'
 import { resolveOpenCodeVersion } from './opencode-version.mjs'
+import {
+  ACTIONS,
+  createRecorder,
+  displayPath,
+  formatChangePlan,
+  isRecording,
+  planStatsMismatch,
+  recordChange,
+  snapshot,
+  summarizeChanges,
+} from './plan.mjs'
 import { copyPluginFiles, installPlugin, registerPlugin, unregisterPlugin } from './plugin.mjs'
 import {
   checkRuntimePrerequisites,
@@ -70,6 +83,170 @@ const COMPONENT_NAMES = [
   'plugins',
   'runtime',
 ]
+
+/**
+ * MCP server scripts the runtime component installs. Hoisted so the backup-set
+ * enumeration and the runtime writer share one source of truth.
+ */
+const MCP_SCRIPTS = [
+  'mcp_resources.py',
+  'code_mode.py',
+  'memory_mcp.py',
+  'scrub-secrets.py',
+  '_pantheon_paths.py',
+  'mcp_codemap_module.py',
+  'mcp_persistence.py',
+  'pantheon_vision.py',
+  'eval_store.py',
+  'themis_heuristic_scan.py',
+]
+
+/** Recursively list regular files under `root`, relative to `root`. */
+function walkFiles(root, base = root, out = []) {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const full = join(root, entry.name)
+    if (entry.isDirectory()) walkFiles(full, base, out)
+    else if (entry.isFile()) out.push(relative(base, full))
+  }
+  return out
+}
+
+/**
+ * Enumerate what the backup set must preserve, derived from the selected
+ * components. It returns:
+ *   - `entries`: paths (relative to `target`) the run can CREATE/UPDATE/REMOVE.
+ *     For every managed destination tree we take the UNION of the files that
+ *     already exist there (so a `--clean`, a stale removal, or an
+ *     instructions-only refresh is captured) and the source-derived destination
+ *     paths (so a file that will be created is recorded as absent). The union is
+ *     a superset of the plan's changes — unchanged files are backed up too.
+ *   - `notRevertible`: paths the run may delete or write but whose byte-for-byte
+ *     copy is not feasible or is out of the config dir (bulk `.venv` / plugin
+ *     `node_modules`, the global `tui.json` copies and the global vision config).
+ *     These are recorded explicitly in the manifest rather than silently ignored.
+ * It never reads file contents.
+ *
+ * @param {string} target
+ * @param {Set<string>} componentSet
+ * @param {string} version
+ * @param {boolean} isGlobal
+ * @returns {{ entries: string[], notRevertible: string[] }}
+ */
+function collectInstallBackupEntries(target, componentSet, version, isGlobal) {
+  const entries = []
+  const notRevertible = []
+  const rel = (abs) => relative(target, abs)
+  const addFile = (abs) => entries.push(rel(abs))
+  // Existing files under an in-target tree (covers removals / clean / refresh).
+  // `skipDirNames` prunes bulk subdirectories (e.g. plugin `node_modules`) so the
+  // walk stays cheap while everything else — including legacy files a clean pass
+  // deletes — is captured.
+  const addExisting = (dir, skipDirNames = null) => {
+    if (!existsSync(dir)) return
+    const walk = (base) => {
+      for (const entry of readdirSync(base, { withFileTypes: true })) {
+        if (skipDirNames && entry.isDirectory() && skipDirNames.has(entry.name)) continue
+        const full = join(base, entry.name)
+        if (entry.isDirectory()) walk(full)
+        else if (entry.isFile()) addFile(full)
+      }
+    }
+    walk(dir)
+  }
+  // Destination paths derived from a source tree (covers files to be created).
+  const addSource = (srcDir, dstDir, filter = null) => {
+    if (!existsSync(srcDir)) return
+    for (const r of walkFiles(srcDir)) {
+      if (filter && !filter(r)) continue
+      addFile(join(dstDir, r))
+    }
+  }
+
+  const baseDir = isGlobal ? target : join(target, '.opencode')
+  const agentPrefix = isGlobal || version === 'v2' ? 'agents' : '.opencode/agents'
+  const agentDir = join(target, agentPrefix)
+
+  // Always touched.
+  addFile(join(target, 'opencode.json'))
+  addFile(join(target, '.pantheon', 'install-state.json'))
+  addFile(join(baseDir, 'opencode-vision.json'))
+  // The active-preset writer (writeActivePreset(target, …)) lives at
+  // <target>/.pantheon, NOT under <baseDir>, for both project and global scope.
+  addFile(join(target, '.pantheon', 'active-preset.json'))
+  addFile(join(target, '.pantheon', 'active-preset.json.bak'))
+
+  // The agent prompt dir is refreshed (existing-only) by an instructions-only
+  // run too, so enumerate it whenever EITHER component can write it.
+  if (componentSet.has('agents') || componentSet.has('instructions')) {
+    addExisting(agentDir)
+  }
+  if (componentSet.has('agents')) {
+    addFile(join(target, 'routing.yml'))
+    addSource(
+      join(ROOT, 'src', 'agents'),
+      agentDir,
+      (r) => r.endsWith('.md') && r.toLowerCase() !== 'readme.md',
+    )
+  }
+  if (componentSet.has('skills')) {
+    addExisting(join(baseDir, 'skills'))
+    addSource(join(ROOT, 'src', 'skills'), join(baseDir, 'skills'))
+  }
+  if (componentSet.has('instructions')) addFile(join(target, 'AGENTS.md'))
+  if (componentSet.has('prompts')) {
+    addExisting(join(target, 'prompts'))
+    addSource(join(ROOT, 'prompts'), join(target, 'prompts'))
+  }
+  if (componentSet.has('commands')) {
+    const commandDir = isGlobal || version === 'v2' ? 'commands' : '.opencode/commands'
+    addExisting(join(target, commandDir))
+    addSource(join(ROOT, 'commands'), join(target, commandDir), (r) => r.endsWith('.md'))
+  }
+  if (componentSet.has('plugins')) {
+    const dstPluginDir = isGlobal
+      ? join(target, 'plugins', 'pantheon-tui')
+      : join(target, '.opencode', 'plugins', 'pantheon-tui')
+    // Existing files under the installed plugin dir (legacy `index.tsx` /
+    // `dist/tui.tsx` and any extras a `--clean` run deletes) are captured, like
+    // every sibling tree — EXCEPT the bulk `node_modules`, which is regenerated
+    // by `npm ci` and listed as not revertible.
+    addExisting(dstPluginDir, new Set(['node_modules']))
+    addSource(join(ROOT, 'src', 'plugins', 'tui', 'dist'), join(dstPluginDir, 'dist'))
+    addFile(join(dstPluginDir, 'package.json'))
+    addFile(join(dstPluginDir, 'package-lock.json'))
+    addFile(join(dstPluginDir, 'tui.ts'))
+    addFile(join(dstPluginDir, 'index.ts'))
+    notRevertible.push(rel(join(dstPluginDir, 'node_modules')))
+    if (version === 'v1') {
+      const projectTui = join(baseDir, 'tui.json')
+      addFile(projectTui)
+      // Cross-location cleanup touches copies OUTSIDE the config dir.
+      for (const loc of tuiConfigLocations(target)) {
+        if (resolve(loc) !== resolve(projectTui)) notRevertible.push(loc)
+      }
+    }
+  }
+  if (componentSet.has('runtime')) {
+    const runtimeTarget = isGlobal ? target : join(target, '.opencode')
+    addExisting(join(runtimeTarget, 'scripts'))
+    for (const script of MCP_SCRIPTS) addFile(join(runtimeTarget, 'scripts', script))
+    addFile(join(runtimeTarget, 'requirements-vision.txt'))
+    addSource(join(ROOT, '.pantheon', 'code-mode'), join(runtimeTarget, '.pantheon', 'code-mode'))
+    addExisting(join(runtimeTarget, '.pantheon', 'code-mode'))
+    addFile(join(runtimeTarget, '.pantheon', 'tiers.json'))
+    // `--force` recreates the venv from scratch: bulk, not copied.
+    notRevertible.push(rel(join(target, '.venv')))
+  }
+
+  // The vision config is written GLOBALLY (outside the config dir).
+  const xdg = process.env.XDG_CONFIG_HOME || join(homedir(), '.config')
+  const globalVision = join(xdg, 'opencode', 'opencode-vision.json')
+  if (resolve(globalVision) !== resolve(join(baseDir, 'opencode-vision.json'))) {
+    notRevertible.push(globalVision)
+  }
+
+  return { entries, notRevertible }
+}
 
 /**
  * The product defaults an install seeds into the user's `opencode.json`.
@@ -210,30 +387,40 @@ function deepClone(value) {
 
 /**
  * (Re)generate the code-mode manifest with SHA-256 digests for every bundled
- * script. This is the explicit installation opt-in: the MCP server only
- * executes scripts listed here whose on-disk hash matches. Missing or empty
- * directories approve nothing (0) — execution is never implicit.
+ * script, and write it to the destination. This is the explicit installation
+ * opt-in: the MCP server only executes scripts listed here whose on-disk hash
+ * matches. Missing or empty source approves nothing — execution is never
+ * implicit.
+ *
+ * This function is the SINGLE owner of `manifest.json`: `syncDir` deliberately
+ * excludes it (see the runtime block), so exactly one writer and one stats
+ * count exist for that path. The payload is derived from the SOURCE scripts
+ * (what will be installed), then compared against the CURRENT installed
+ * manifest, so the preview action matches what apply writes — including on a
+ * script upgrade, where the installed manifest is stale.
+ *
+ * @returns {{ approved: number, status: 'created'|'skipped'|'conflict'|null }}
  */
-function writeCodeModeManifest(dir, dryRun) {
-  if (!existsSync(dir)) return 0
+function writeCodeModeManifest(srcDir, dstDir, dryRun, recorder = null) {
+  if (!existsSync(srcDir)) return { approved: 0, status: null }
   let names
   try {
-    names = readdirSync(dir)
+    names = readdirSync(srcDir)
       .filter((name) => /\.(sh|py)$/i.test(name) && !name.startsWith('.'))
       .sort()
   } catch {
-    return 0
+    return { approved: 0, status: null }
   }
-  if (names.length === 0) return 0
+  if (names.length === 0) return { approved: 0, status: null }
   const scripts = {}
   for (const name of names) {
     scripts[name] = createHash('sha256')
-      .update(readFileSync(join(dir, name)))
+      .update(readFileSync(join(srcDir, name)))
       .digest('hex')
   }
   const payload = `${JSON.stringify({ version: 1, scripts }, null, 2)}\n`
-  writeIfChanged(join(dir, 'manifest.json'), payload, dryRun)
-  return names.length
+  const status = writeIfChanged(join(dstDir, 'manifest.json'), payload, dryRun, { recorder })
+  return { approved: names.length, status }
 }
 
 function readJsonConfig(filePath) {
@@ -594,11 +781,12 @@ export function tuiConfigLocations(target) {
  * @param {object} [opts]
  * @param {boolean} [opts.isGlobal=false] - flat global layout vs .opencode/
  * @param {boolean} [opts.dryRun=false]
+ * @param {(change: object) => void} [opts.recorder] - optional change recorder for preview
  * @returns {'created'|'skipped'} status for the target registration
  */
 export function syncTuiRegistration(
   target,
-  { isGlobal = false, dryRun = false, version = 'v1' } = {},
+  { isGlobal = false, dryRun = false, version = 'v1', recorder = null } = {},
 ) {
   const configDir = isGlobal ? target : join(target, '.opencode')
   const targetTuiConfigPath = join(configDir, 'tui.json')
@@ -608,7 +796,7 @@ export function syncTuiRegistration(
   const tuiSrcDir = join(ROOT, 'src', 'plugins', 'tui')
   const tuiCopyDir = resolveTuiCopyTarget(configDir)
   if (existsSync(tuiSrcDir)) {
-    copyPluginFiles(tuiSrcDir, tuiCopyDir, { dryRun, version })
+    copyPluginFiles(tuiSrcDir, tuiCopyDir, { dryRun, version, recorder })
   }
 
   // 2. Clean stale Pantheon TUI refs from every location OpenCode reads.
@@ -621,6 +809,7 @@ export function syncTuiRegistration(
     unregisterPlugin(tuiConfigPath, 'plugins/pantheon-tui', {
       dryRun,
       knownPantheonPaths: [ownedCopy, tuiCopyDir],
+      recorder,
     })
   }
 
@@ -630,7 +819,7 @@ export function syncTuiRegistration(
   if (version === 'v2') return 'skipped'
 
   // 3. Register the copied directory in the selected target only.
-  return registerPlugin(targetTuiConfigPath, tuiCopyDir, { dryRun })
+  return registerPlugin(targetTuiConfigPath, tuiCopyDir, { dryRun, recorder })
 }
 
 /**
@@ -639,13 +828,18 @@ export function syncTuiRegistration(
  * MCP entries from the config (entries pointing at a missing venv would
  * make every MCP fail to launch). `deps` is injectable for tests.
  */
-export function setupRuntimePhase(target, { dryRun, clean, isGlobal }, stats, deps = {}) {
+export function setupRuntimePhase(
+  target,
+  { dryRun, clean, isGlobal, recorder = null },
+  stats,
+  deps = {},
+) {
   const S = strings()
   const setup = deps.setupVenv ?? setupVenv
   const check = deps.healthCheck ?? healthCheck
   try {
     const venvSpinner = spinner(S.settingUpRuntime)
-    setup(target, { dryRun, force: clean })
+    setup(target, { dryRun, force: clean, recorder })
     venvSpinner(true)
     const runtimeTarget = isGlobal ? target : join(target, '.opencode')
     const health = check(runtimeTarget, { dryRun, pythonTarget: target })
@@ -758,7 +952,115 @@ export function applyMcpServerEntries(config, { runtimeTarget, venvPython }) {
   return { healed }
 }
 
+/**
+ * Phase 4 drift detection: the planned targets whose on-disk state changed
+ * between the plan pass (snapshots) and the apply pass. A path counts as drifted
+ * when its existence, content hash, size, or mode differs — which includes a
+ * planned-NEW path that now exists. Returns the absolute paths (empty = no
+ * drift); callers print only these paths, never contents or hashes.
+ */
+function detectSnapshotDrift(snapshots) {
+  if (!Array.isArray(snapshots)) return []
+  const changed = []
+  for (const before of snapshots) {
+    const now = snapshot(before.path)
+    if (
+      now.exists !== before.exists ||
+      now.sha256 !== before.sha256 ||
+      now.size !== before.size ||
+      now.mode !== before.mode
+    ) {
+      changed.push(before.path)
+    }
+  }
+  return changed
+}
+
+/**
+ * Remove lingering atomic-write temp siblings (`<file>.tmp-<pid>`) left behind
+ * when a writer aborted mid-write. Best-effort; skips the bulk dirs so a failure
+ * path stays cheap.
+ */
+/**
+ * Remove lingering atomic-write temp siblings (`<file>.tmp-<pid>`) left when a
+ * writer aborted mid-write. Only files matching the installer's own temp
+ * pattern are removed, and the bulk/foreign dirs are skipped so a failure path
+ * stays cheap and never touches unrelated files.
+ */
+function cleanupTempSiblings(root) {
+  if (!root) return
+  const suffix = `.tmp-${process.pid}`
+  const skip = new Set(['.git', '.pantheon', 'node_modules', '.venv'])
+  const walk = (dir) => {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (skip.has(entry.name)) continue
+        walk(join(dir, entry.name))
+      } else if (entry.isFile() && entry.name.endsWith(suffix)) {
+        try {
+          rmSync(join(dir, entry.name), { force: true })
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    }
+  }
+  walk(root)
+}
+
+/**
+ * Phase 5 failure semantics. `installPass` is the whole installer; this thin
+ * wrapper reports a mid-apply failure HONESTLY: it aborts the remaining writes
+ * (the throw), cleans up any lingering atomic-write temp siblings, reports the
+ * PATHS already applied (never contents), prints the recovery path, and
+ * re-throws so the CLI exits non-zero. There is NO automatic rollback — the
+ * exact backup set + `pantheon-opencode restore` is the recovery.
+ *
+ * Progress is tracked in `_lastRun` (set only by a non-dry pass, so the nested
+ * dry plan pass never clobbers it). The RESOLVED target is read back from
+ * `_lastRun.target` so the report and the sweep work when the caller passed
+ * `undefined` (the default global install resolves to `~/.config/opencode`).
+ */
+let _lastRun = null
+
 export async function installOpenCode(
+  target,
+  dryRun = false,
+  clean = false,
+  components = ['agents', 'skills', 'instructions', 'commands', 'plugins', 'runtime'],
+  opts = {},
+) {
+  // Reset per-call so a stale run can never leak into a fresh failure report.
+  if (!dryRun) _lastRun = null
+  try {
+    return await installPass(target, dryRun, clean, components, opts)
+  } catch (err) {
+    const run = dryRun ? null : _lastRun
+    if (run) {
+      const S = strings()
+      const paths = summarizeChanges(run.entries ?? [])
+        .files.filter((f) => f.action !== ACTIONS.UNCHANGED && f.action !== ACTIONS.CONFLICT)
+        .map((f) => displayPath(run.target, f.path))
+      error(S.applyFailed(err instanceof Error ? err.message : String(err)))
+      if (paths.length > 0) {
+        warning(S.alreadyApplied)
+        for (const p of paths) warning(`  ${p}`)
+      }
+      warning(run.backupDir ? S.restoreRecoveryHint(run.backupDir) : S.restoreNoBackup)
+      // Sweep only on the failure path (never a full walk on a clean apply).
+      cleanupTempSiblings(run.target)
+    }
+    throw err
+  }
+}
+
+async function installPass(
   target,
   dryRun = false,
   clean = false,
@@ -772,7 +1074,38 @@ export async function installOpenCode(
 
   const componentSet = new Set(components)
   const stats = summary.opencode
+  // Per-call baseline. `stats` is the module-level cumulative summary, so the
+  // consistency guard must compare against THIS call's delta, not the total.
+  const statsBefore = { created: stats.created, skipped: stats.skipped }
+  // Number of planned changes, filled by a dry plan pass (used by the gate).
+  let plannedChanges = 0
+  // Phase 4: planned-target snapshots from the plan pass, used for drift checks.
+  let plannedSnapshots = null
   const S = strings()
+
+  // Beta 11 (Setup phase 1): a dry pass records every writer's intended change
+  // so we can print the REAL per-file plan without writing anything. A recorder
+  // ALWAYS runs now: a dry pass builds the preview/plan from it, and an apply
+  // pass uses it to report which PATHS were already written if a writer throws
+  // (Phase 5 failure semantics). The default is the module-level no-op recorder,
+  // so an uninstrumented caller stays byte-identical.
+  const ownRecorder = opts.recorder ? null : createRecorder()
+  const preview = dryRun && ownRecorder ? ownRecorder : null
+  let recorder = opts.recorder ?? ownRecorder.recorder
+  // Test-only failure seam: throw after N recorded writes so the failure path is
+  // deterministic. Never reachable from production callers (opts.deps is not a
+  // CLI flag) and never applied to the internal dry plan pass.
+  if (!dryRun && typeof opts.deps?.failAfter === 'number') {
+    const base = recorder
+    const limit = opts.deps.failAfter
+    let applied = 0
+    recorder = (change) => {
+      base(change)
+      if (++applied >= limit) throw new Error('injected failure (test-only failAfter seam)')
+    }
+  }
+  // Track this apply so the wrapper can report the paths written on a failure.
+  if (!dryRun) _lastRun = { target, entries: ownRecorder?.entries ?? [], backupDir: null }
 
   // V1/V2 dual-version awareness (Phase 3): the installer builds a unified
   // config, then applies V2-native migration (migrateV1toV2) when
@@ -822,7 +1155,7 @@ export async function installOpenCode(
 
     if (!result.confirmed && !autoYes) {
       info('Installation canceled.')
-      return stats
+      return { ...stats, applied: false, reason: 'canceled' }
     }
 
     // Map target selection to actual path
@@ -873,7 +1206,108 @@ export async function installOpenCode(
   const _subDir = isGlobal ? '' : '.opencode'
   const agentPrefix = isGlobal || version === 'v2' ? 'agents' : '.opencode/agents'
 
-  configure({ dryRun })
+  configure({ dryRun, quiet: opts.quiet === true })
+
+  // -----------------------------------------------------------------------
+  // Plan pass + apply gate + drift check (Beta 11 Setup phases 3-4).
+  //   * the plan pass (a dry run — writes nothing) prints the plan and
+  //     snapshots every planned target;
+  //   * applying requires explicit authorization (Phase 3): a declined or
+  //     unauthorized run writes NOTHING;
+  //   * drift (Phase 4) aborts BEFORE any write if a planned target changed
+  //     between the plan pass and now.
+  // A result with `applied: false` means the caller must not print success.
+  // -----------------------------------------------------------------------
+  const applyRequested = !dryRun
+  if (applyRequested) {
+    const savedStats = { ...stats }
+    let planned
+    try {
+      // Use the LIVE selection: the wizard above may have changed componentSet.
+      // An AUTHORIZED apply (`--yes`) is not a preview: compute the plan +
+      // snapshots but stay silent. The gate path (no `--yes`) still prints the
+      // plan for the review / decline preview.
+      planned = await installOpenCode(target, true, clean, [...componentSet], {
+        ...opts,
+        planOnly: true,
+        quiet: autoYes,
+        quietPlan: autoYes,
+      })
+    } finally {
+      Object.assign(stats, savedStats)
+      // The plan pass left the UI in dry-run mode; restore this run's mode.
+      configure({ dryRun, quiet: opts.quiet === true })
+    }
+    plannedSnapshots = planned?.snapshots ?? null
+
+    if (!autoYes) {
+      const injected = opts.deps?.promptReview
+      const canPrompt = typeof injected === 'function' || interactive
+      if (canPrompt) {
+        const { promptReview } = await import('./interactive.mjs')
+        const ask = typeof injected === 'function' ? injected : promptReview
+        const accepted = await ask(`Apply these ${planned?.planned ?? 0} changes?`, {
+          default: false,
+        })
+        if (!accepted) {
+          info(S.nothingApplied)
+          return { ...stats, applied: false, reason: 'declined' }
+        }
+      } else {
+        info(S.planOnlyNoYes)
+        return { ...stats, applied: false, reason: 'not-authorized' }
+      }
+    }
+
+    // Test seam: mutate a target between the plan/authorization and the drift
+    // check. Absent in production callers.
+    if (typeof opts.deps?.betweenPlanAndApply === 'function') opts.deps.betweenPlanAndApply()
+
+    const drifted = detectSnapshotDrift(plannedSnapshots)
+    if (drifted.length > 0) {
+      warning(S.driftHeader)
+      for (const p of drifted) warning(`  ${displayPath(target, p)}`)
+      warning(S.driftAbort)
+      return {
+        ...stats,
+        applied: false,
+        reason: 'drift',
+        drift: drifted.map((p) => displayPath(target, p)),
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 0. Exact backup (Beta 11 Setup phase 2): preserve the CURRENT state of
+  //    every regular file this run can modify/remove INSIDE the config dir,
+  //    byte-for-byte, BEFORE the first modifying write. Bulk directories and
+  //    out-of-target global files are recorded in the manifest as
+  //    `notRevertible`. A dry run records the planned backup-manifest path only.
+  // -----------------------------------------------------------------------
+  const backupManifestPath = join(
+    backupSetPath(target, nextBackupName(target, new Date())),
+    'manifest.json',
+  )
+  if (dryRun) {
+    if (isRecording(recorder)) {
+      recordChange(
+        { path: backupManifestPath, action: ACTIONS.CREATE, bytes: 0, scored: false },
+        recorder,
+      )
+    }
+  } else {
+    const backupPlan = collectInstallBackupEntries(target, componentSet, version, isGlobal)
+    const pkgVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
+    const { dir: backupDir } = createBackupSet({
+      configDir: target,
+      entries: backupPlan.entries,
+      notRevertible: backupPlan.notRevertible,
+      packageVersion: pkgVersion,
+    })
+    if (_lastRun && _lastRun.target === target) _lastRun.backupDir = backupDir
+    // Secret-safe: the path only. The exact wording is fixed (once per apply).
+    console.warn(backupWarning(backupDir))
+  }
 
   if (isGlobal) {
     info(S.globalLayout)
@@ -898,7 +1332,7 @@ export async function installOpenCode(
           rmSync(join(dstDir, f), { recursive: true, force: true })
         }
       }
-      const { created, skipped } = copyAgentPrompts(srcDir, dstDir, dryRun)
+      const { created, skipped } = copyAgentPrompts(srcDir, dstDir, dryRun, false, recorder)
       stats.created += created
       stats.skipped += skipped
       agentStep(true)
@@ -912,7 +1346,9 @@ export async function installOpenCode(
     const srcRouting = join(ROOT, 'src', 'routing.yml')
     const dstRouting = join(target, 'routing.yml')
     if (existsSync(srcRouting)) {
-      const routingStatus = writeIfChanged(dstRouting, readFileSync(srcRouting, 'utf8'), dryRun)
+      const routingStatus = writeIfChanged(dstRouting, readFileSync(srcRouting, 'utf8'), dryRun, {
+        recorder,
+      })
       if (routingStatus === 'created') stats.created++
       else stats.skipped++
     }
@@ -939,6 +1375,7 @@ export async function installOpenCode(
         target,
         dryRun,
         installSubDir,
+        recorder,
       )
       stats.created += sCreated
       stats.skipped += sSkipped
@@ -960,7 +1397,7 @@ export async function installOpenCode(
     const dstAgentsMd = join(target, 'AGENTS.md')
     if (existsSync(srcAgentsMd)) {
       const content = readFileSync(srcAgentsMd, 'utf8')
-      const status = writeAgentsMdManaged(dstAgentsMd, content, dryRun)
+      const status = writeAgentsMdManaged(dstAgentsMd, content, dryRun, recorder)
       if (status === 'skipped') stats.skipped++
       else {
         stats.created++
@@ -982,7 +1419,7 @@ export async function installOpenCode(
       const installedAgents = join(target, agentPrefix)
       const sourceAgents = join(ROOT, 'src', 'agents')
       if (existsSync(installedAgents) && existsSync(sourceAgents)) {
-        const refreshed = copyAgentPrompts(sourceAgents, installedAgents, dryRun, true)
+        const refreshed = copyAgentPrompts(sourceAgents, installedAgents, dryRun, true, recorder)
         stats.created += refreshed.created
         stats.skipped += refreshed.skipped
       }
@@ -997,7 +1434,7 @@ export async function installOpenCode(
     const srcPrompts = join(ROOT, 'prompts')
     const dstPrompts = join(target, 'prompts')
     if (existsSync(srcPrompts)) {
-      const promptsResult = syncDir(srcPrompts, dstPrompts, dryRun, clean)
+      const promptsResult = syncDir(srcPrompts, dstPrompts, dryRun, clean, null, recorder)
       stats.created += promptsResult.created
       stats.skipped += promptsResult.skipped
     }
@@ -1015,7 +1452,7 @@ export async function installOpenCode(
     const commandDir = isGlobal || version === 'v2' ? 'commands' : '.opencode/commands'
     const dstCmds = join(target, commandDir)
     if (existsSync(srcCmds)) {
-      const cmdResult = syncDir(srcCmds, dstCmds, dryRun, clean, (f) => f.endsWith('.md'))
+      const cmdResult = syncDir(srcCmds, dstCmds, dryRun, clean, (f) => f.endsWith('.md'), recorder)
       stats.created += cmdResult.created
       stats.skipped += cmdResult.skipped
     }
@@ -1038,7 +1475,12 @@ export async function installOpenCode(
     const dstPluginDir = isGlobal
       ? join(target, 'plugins', 'pantheon-tui')
       : join(target, '.opencode', 'plugins', 'pantheon-tui')
-    const pluginStats = installPlugin(srcPluginDir, dstPluginDir, { dryRun, clean, version })
+    const pluginStats = installPlugin(srcPluginDir, dstPluginDir, {
+      dryRun,
+      clean,
+      version,
+      recorder,
+    })
     stats.created += pluginStats.created
     stats.skipped += pluginStats.skipped
     stats.errors += pluginStats.errors
@@ -1050,7 +1492,7 @@ export async function installOpenCode(
   if (componentSet.has('plugins')) {
     let tuiStatus
     try {
-      tuiStatus = syncTuiRegistration(target, { isGlobal, dryRun, version })
+      tuiStatus = syncTuiRegistration(target, { isGlobal, dryRun, version, recorder })
     } catch (cause) {
       error(`TUI plugin setup failed: ${cause.message}`)
       stats.errors++
@@ -1069,18 +1511,7 @@ export async function installOpenCode(
     const runtimeTarget = isGlobal ? target : join(target, '.opencode')
 
     // ── MCP server scripts ──
-    const mcpScripts = [
-      'mcp_resources.py',
-      'code_mode.py',
-      'memory_mcp.py',
-      'scrub-secrets.py',
-      '_pantheon_paths.py',
-      'mcp_codemap_module.py',
-      'mcp_persistence.py',
-      'pantheon_vision.py',
-      'eval_store.py',
-      'themis_heuristic_scan.py',
-    ]
+    const mcpScripts = MCP_SCRIPTS
     const srcScriptsDir = join(ROOT, 'scripts')
     // Canonical MCP server sources live in src/mcp/. Map them explicitly so the
     // sync always copies from the canonical source, never from the stale root
@@ -1108,7 +1539,7 @@ export async function installOpenCode(
       }
       const content = readFileSync(src, 'utf8')
       const dst = join(dstScriptsDir, script)
-      const status = writeIfChanged(dst, content, dryRun)
+      const status = writeIfChanged(dst, content, dryRun, { recorder })
       if (status === 'created') {
         stats.created++
         // Make executable
@@ -1126,7 +1557,9 @@ export async function installOpenCode(
     const visionRequirements = join(ROOT, 'src', 'mcp', 'requirements-vision.txt')
     if (existsSync(visionRequirements)) {
       const destination = join(runtimeTarget, 'requirements-vision.txt')
-      const status = writeIfChanged(destination, readFileSync(visionRequirements, 'utf8'), dryRun)
+      const status = writeIfChanged(destination, readFileSync(visionRequirements, 'utf8'), dryRun, {
+        recorder,
+      })
       if (status === 'created') stats.created++
       else stats.skipped++
     } else {
@@ -1138,7 +1571,17 @@ export async function installOpenCode(
     const srcCodeModeDir = join(ROOT, '.pantheon', 'code-mode')
     const dstCodeModeDir = join(runtimeTarget, '.pantheon', 'code-mode')
     if (existsSync(srcCodeModeDir)) {
-      const cmResult = syncDir(srcCodeModeDir, dstCodeModeDir, dryRun, clean)
+      // manifest.json is owned by writeCodeModeManifest (below), not by the dir
+      // sync. Excluding it here keeps exactly ONE writer/count for that path,
+      // so the preview action and the install summary can never diverge.
+      const cmResult = syncDir(
+        srcCodeModeDir,
+        dstCodeModeDir,
+        dryRun,
+        clean,
+        (f) => f !== 'manifest.json',
+        recorder,
+      )
       stats.created += cmResult.created
       stats.skipped += cmResult.skipped
     } else {
@@ -1149,13 +1592,18 @@ export async function installOpenCode(
       warning(`Code-mode source not found: ${srcCodeModeDir} — creating empty ${dstCodeModeDir}`)
       if (!dryRun) mkdirSync(dstCodeModeDir, { recursive: true })
       stats.created++
+      // The empty runtime dir is a real create counted by `stats.created`, so
+      // record it too (or the preview under-reports on this fallback path).
+      recordChange({ path: dstCodeModeDir, action: ACTIONS.CREATE, bytes: 0 }, recorder)
     }
 
     // B3-08: explicit installation mode — seed the manifest with SHA-256
     // digests so the server never executes a script implicitly.
-    const approvedScripts = writeCodeModeManifest(dstCodeModeDir, dryRun)
-    if (approvedScripts > 0) {
-      info(`Code-mode manifest: ${approvedScripts} script(s) approved`)
+    const manifest = writeCodeModeManifest(srcCodeModeDir, dstCodeModeDir, dryRun, recorder)
+    if (manifest.status === 'created') stats.created++
+    else if (manifest.status === 'skipped') stats.skipped++
+    if (manifest.approved > 0) {
+      info(`Code-mode manifest: ${manifest.approved} script(s) approved`)
     }
 
     // ── tiers.json ──
@@ -1163,7 +1611,7 @@ export async function installOpenCode(
     const dstTiers = join(runtimeTarget, '.pantheon', 'tiers.json')
     if (existsSync(srcTiers)) {
       const content = readFileSync(srcTiers, 'utf8')
-      const status = writeIfChanged(dstTiers, content, dryRun)
+      const status = writeIfChanged(dstTiers, content, dryRun, { recorder })
       if (status === 'created') stats.created++
       else stats.skipped++
     }
@@ -1177,7 +1625,7 @@ export async function installOpenCode(
   // -----------------------------------------------------------------------
   let runtimeHealthy = !componentSet.has('runtime')
   if (componentSet.has('runtime')) {
-    runtimeHealthy = setupRuntimePhase(target, { dryRun, clean, isGlobal }, stats)
+    runtimeHealthy = setupRuntimePhase(target, { dryRun, clean, isGlobal, recorder }, stats)
   }
 
   // -----------------------------------------------------------------------
@@ -1625,12 +2073,13 @@ export async function installOpenCode(
     // Test seam: lets a test simulate a concurrent writer landing between the
     // initial config read and the pre-swap recheck. Absent in production.
     beforeRecheck: opts.deps?.beforeRecheck,
+    recorder,
   })
   if (status === 'conflict') {
     // The user's config changed under the installer between the read and the
     // swap. Treating this as an ordinary skipped write would report a
     // successful install over a file we never actually updated — fail loudly
-    // and leave the target and its `.bak` byte-identical instead.
+    // and leave the target byte-identical instead.
     throw new Error(
       `Installation aborted: ${targetConfigPath} changed on disk during install ` +
         '(it no longer matches the content that was read); refusing to overwrite it. ' +
@@ -1646,13 +2095,63 @@ export async function installOpenCode(
   if (componentSet.has('runtime')) {
     const currentVersion = detectVersion(target)
     if (currentVersion) {
-      const migration = runMigrations(target, currentVersion, { dryRun })
+      const migration = runMigrations(target, currentVersion, { dryRun, recorder })
       if (migration.applied > 0) {
         success(`Applied ${migration.applied} migration(s)`)
         for (const msg of migration.messages) {
           bullet(msg, 1)
         }
       }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 3.75 Preview summary (Beta 11 Setup phase 1): print the REAL per-file
+  //      change set this same pass would apply. Paths + action + byte size
+  //      ONLY — never file contents or hashes. Nothing was written.
+  // -----------------------------------------------------------------------
+  if (preview) {
+    // Apply always writes the install-state file (terminal step); record the
+    // planned state-only write here so the printed plan is complete. Unscored:
+    // it is bookkeeping, not part of the install summary.
+    recordChange(
+      {
+        path: join(target, '.pantheon', 'install-state.json'),
+        action: hasState(target) ? ACTIONS.UPDATE : ACTIONS.CREATE,
+        bytes: 0,
+        scored: false,
+      },
+      recorder,
+    )
+    const plan = summarizeChanges(preview.entries)
+    plannedChanges = plan.totals.create + plan.totals.update + plan.totals.remove
+    // Phase 4: snapshot each planned target now, so the apply pass can detect
+    // any change between plan and apply (drift) before the first write.
+    plannedSnapshots = plan.files.map((f) => ({ path: f.path, ...snapshot(f.path) }))
+    const statsDelta = {
+      created: stats.created - statsBefore.created,
+      skipped: stats.skipped - statsBefore.skipped,
+    }
+    const mismatch = planStatsMismatch(plan, statsDelta)
+    if (mismatch) {
+      // Development safety net: a writer that incremented THIS call's install
+      // stats but never recorded a change would otherwise make the preview
+      // silently incomplete. Surface it loudly instead of hiding it.
+      warning(
+        `Change-plan consistency mismatch: plan reports ${mismatch.changed} changed / ` +
+          `${mismatch.unchanged} unchanged vs stats ${mismatch.recordedChanged}/${mismatch.recordedUnchanged}`,
+      )
+    }
+    // Tag the plan like every other dry-run line so the output reads uniformly.
+    // An internal snapshot pass on the apply path (`quietPlan`, e.g. an
+    // authorized `--yes` run) computes the plan and snapshots but must NOT echo
+    // it — a real apply is not a dry run.
+    if (!opts.quietPlan) {
+      console.log('')
+      for (const line of formatChangePlan(target, plan).split('\n')) {
+        console.log(tag(line))
+      }
+      console.log('')
     }
   }
 
@@ -1695,7 +2194,7 @@ export async function installOpenCode(
       `  ${colors.dim('\u2022')} Run 'opencode' to start using Pantheon agents\n`,
     )
     process.stdout.write('\n')
-  } else {
+  } else if (!opts.planOnly) {
     printSummary(target, ['opencode'], stats)
   }
 
@@ -1757,4 +2256,17 @@ export async function installOpenCode(
     }
     writeState(target, state)
   }
+
+  // Beta 11 Setup phase 3: report whether this call APPLIED, so the caller can
+  // avoid a success banner for a plan-only / unauthorized run. The dry pass also
+  // returns the planned-target snapshots for the apply pass's drift check.
+  return dryRun
+    ? {
+        ...stats,
+        applied: false,
+        reason: 'plan',
+        planned: plannedChanges,
+        snapshots: plannedSnapshots,
+      }
+    : { ...stats, applied: true, reason: 'applied' }
 }

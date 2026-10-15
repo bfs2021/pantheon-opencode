@@ -44,7 +44,7 @@ Lexical memory with SQLite FTS5 (BM25). **9 tools**: 6 `memory_*` for storing, s
 
 | Tool | Signature | Description | Who uses it |
 |------|-----------|-------------|-------------|
-| `memory_store` | `(value, namespace?: "default", key?, metadata?: "{}")` | Store a reusable memory entry (FTS5 index updated by trigger); metadata is a JSON string | Zeus, Mnemosyne when durable context is warranted |
+| `memory_store` | `(value, namespace?: "default", key?, metadata?: "{}")` | Store a reusable memory entry (FTS5 index updated by trigger); metadata is a JSON string | Mnemosyne when durable context is warranted and write access is granted |
 | `memory_search` | `(query, namespace?, top_k?: 5, decay_days?)` | FTS5 BM25 keyword search (stopwords dropped, 4+ char terms prefix-matched); optional freshness decay via `decay_days` (default off) | Coordinator or specialist only when prior project context is relevant |
 | `memory_recall` | `(key, namespace?: "default")` | Exact recall of an entry by key within a namespace | Exact-key lookup when needed |
 | `memory_forget` | `(id?, key?, namespace?: "default")` | Delete an entry by ID or key (FTS index cleaned via trigger) | mnemosyne only |
@@ -62,6 +62,12 @@ memory_search(query="existing auth patterns", top_k=2)
 # Store once at the top level only if the result is reusable in a later session.
 memory_store(value="Refresh tokens rotate on every use", key="decision-42")
 ```
+
+The table describes server capabilities, not per-agent grants. Zeus's canonical
+frontmatter grants `memory_search`, not `memory_store`; the Beta 10 root tool
+catalog likewise did not expose a memory-write tool. Zeus may search when
+available, but must not claim a memory decision was persisted unless a permitted
+write tool is actually exposed and confirms success.
 
 Do not search at every agent start, repeat a task-level search in each child, or
 store routine phase/test summaries. Use `memory_recall` only when an exact key
@@ -141,6 +147,23 @@ explicit `PANTHEON_VISION_TOOL` or `imageAnalysisTool` setting.
 the configured gateway. The server reads `PANTHEON_OPENCODE_API_KEY` or
 `OPENCODE_API_KEY`, then the OpenCode auth store; no API key is stored in the
 repository configuration.
+
+---
+
+## OpenCode plugin tools
+
+These tools are provided by the OpenCode plugin, not by one of the five native
+MCP servers listed above.
+
+| Tool | Arguments | What it reports |
+|------|-----------|-----------------|
+| `pantheon_model` | `action?: status\|show\|set\|reset`, plus action-specific agent/model/effort and optional `scope: project` | V2 manual overrides are **project-only**: status reads project configuration, and the agent transform applies only explicit project per-agent model/variant overrides; global files are neither read nor applied. `set`/`reset` reject `scope: global` and any `confirm`/`authorize_global` fields before writing. Global overrides require separate explicit human authorization in a future surface and are not supported by this tool; flags in the same tool call are not approval. V2 ignores static preset markers and `PANTHEON_MODEL_PRESET`, leaving host defaults intact otherwise. Invalid or malformed project overrides preserve the host model and expose warnings via status. The V2 server plugin has no documented toast or other proactive user-visible notification API during transform, so no toast/proactive warning is promised. V1 behavior remains legacy. |
+| `pantheon_cost` | `days?: 1..365` (default `7`) | Read-only token totals by agent and phase in a rolling `days × 24-hour` window from query time. It is not a calendar-day or session window. |
+
+`pantheon_cost` is not grouped by session, task, model, or provider; on V2 the
+phase can be `unknown`. It reports token counts, not dollars, so it cannot prove
+monetary savings or a model-specific usage delta. Its aggregate is not a
+per-session or per-task ledger.
 
 ---
 

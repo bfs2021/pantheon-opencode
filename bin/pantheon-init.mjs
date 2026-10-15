@@ -21,6 +21,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { resolveInstallExitCode } from '../scripts/install/exit-codes.mjs'
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 
@@ -69,10 +71,24 @@ function printUsage() {
   console.log('  npx pantheon-opencode prune               # List legacy artifacts (dry-run)')
   console.log('  npx pantheon-opencode prune --apply       # Remove stale backups')
   console.log('  npx pantheon-opencode doctor [--profile]  # Run health check')
+  console.log(
+    '  npx pantheon-opencode restore [--project] [--yes]  # Restore an exact installer backup',
+  )
   console.log('  npx pantheon-opencode uninstall --project   # Remove project artifacts safely')
   console.log('  npx pantheon-opencode uninstall --global    # Remove global artifacts safely')
   console.log('  npx pantheon-opencode --version, -v       # Print version and exit')
   console.log('  npx pantheon-opencode --help              # Show this help')
+  console.log('')
+  console.log('Apply authorization:')
+  console.log('  A non-interactive run without --yes prints the plan and applies NOTHING.')
+  console.log('  Re-run with --yes to apply; an interactive TTY run prompts (default: no).')
+  console.log('')
+  console.log('Exit codes:')
+  console.log('  0   success, or plan/no-apply (declined)')
+  console.log('  1   failure')
+  console.log('  2   apply was requested without authorization (non-interactive, no --yes)')
+  console.log('  3   drift detected (a planned file changed after the plan)')
+  console.log('  130 canceled')
 }
 
 async function main() {
@@ -103,6 +119,17 @@ async function main() {
     const { spawnSync } = await import('node:child_process')
     const uninstallScript = path.join(ROOT, 'scripts', 'uninstall.mjs')
     const result = spawnSync(process.execPath, [uninstallScript, ...args.slice(1)], {
+      stdio: 'inherit',
+      cwd: process.cwd(),
+    })
+    process.exit(result.status ?? 1)
+  }
+
+  // restore delegates to scripts/restore.mjs (same spawnSync pattern as prune).
+  if (command === 'restore') {
+    const { spawnSync } = await import('node:child_process')
+    const restoreScript = path.join(ROOT, 'scripts', 'restore.mjs')
+    const result = spawnSync(process.execPath, [restoreScript, ...args.slice(1)], {
       stdio: 'inherit',
       cwd: process.cwd(),
     })
@@ -414,10 +441,11 @@ async function main() {
       console.log('')
     }
 
+    let result
     try {
       const { installOpenCode } = await import('../scripts/install/opencode.mjs')
       const target = isProject ? process.cwd() : undefined
-      await installOpenCode(target, isDryRun, forceReinstall, components, {
+      result = await installOpenCode(target, isDryRun, forceReinstall, components, {
         interactive: forceInteractive,
         headless: forceHeadless,
         yes: autoYes,
@@ -434,6 +462,21 @@ async function main() {
       }
       console.error(`${S.installFailed(err.message)}\n${S.failHintNoMcp}\n${S.failHintForce}`)
       process.exit(1)
+    }
+
+    // Beta 11 Setup phases 3-4: a run that did NOT apply (declined /
+    // unauthorized / drift) must never print a success banner. Exit codes:
+    //   0 ok / no-apply · 2 apply-requested-without-authorization · 3 drift
+    //   130 canceled · 1 failure (thrown above).
+    if (result?.applied === false) {
+      if (!isDryRun) {
+        if (result.reason === 'canceled') console.error(S.canceled)
+        process.exit(resolveInstallExitCode(result, isDryRun))
+      }
+      // Dry-run preview: report honestly instead of the "installed!" banner.
+      console.log('')
+      console.log(`  ${S.dryRunNothingWritten}`)
+      return
     }
 
     if (runDoctor && !isDryRun) {

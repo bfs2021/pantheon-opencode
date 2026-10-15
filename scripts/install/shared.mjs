@@ -4,8 +4,6 @@
 
 import { spawnSync } from 'node:child_process'
 import {
-  copyFileSync,
-  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,7 +14,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const REQUIRED_NODE_MAJOR = 18
@@ -26,6 +24,8 @@ if (parseInt(process.versions.node.split('.')[0], 10) < REQUIRED_NODE_MAJOR) {
 }
 
 import { dump, load } from 'js-yaml'
+
+import { ACTIONS, isRecording, recordChange } from './plan.mjs'
 
 export const __dirname = dirname(fileURLToPath(import.meta.url))
 export const ROOT = join(__dirname, '..', '..')
@@ -139,33 +139,6 @@ export function resolveTarget(target) {
   if (target.startsWith('/')) return target
   // If it's relative, resolve from cwd
   return join(process.cwd(), target)
-}
-
-export function createBackup(target) {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-  const backupDir = join(target, '..', `.pantheon-bak-${basename(target)}-${timestamp}`)
-
-  console.log(`\n  💾 Creating backup: ${backupDir}`)
-  mkdirSync(backupDir, { recursive: true })
-
-  // Copy only relevant Pantheon directories/files
-  const items = ['agents', 'skills', 'commands', 'instructions', 'opencode.json', 'tui.json']
-  let count = 0
-  for (const item of items) {
-    const src = join(target, item)
-    try {
-      cpSync(src, join(backupDir, item), {
-        recursive: true,
-        errorOnExist: false,
-      })
-      count++
-    } catch {
-      // File or directory doesn't exist in target — skip silently
-    }
-  }
-
-  console.log(`  ✅ Backed up ${count} items to: ${backupDir}`)
-  return backupDir
 }
 
 export function detectAndReport(target) {
@@ -302,19 +275,27 @@ function readFileOrNull(filePath) {
  *   filesystem CAS: the final re-read and the rename are still two syscalls, so
  *   a writer that lands between them is not prevented. What it does close is
  *   the window the installer actually races with — a config the caller parsed
- *   going stale during the same run — and it keeps the target and the `.bak`
- *   consistent with the bytes that were checked.
+ *   going stale during the same run — and it keeps the target consistent with
+ *   the bytes that were checked.
  * @param {(existing: string|null) => void} [options.beforeRecheck] - runs after
  *   the initial content check and before the last-moment re-read. Injection
  *   point so tests can simulate a concurrent writer landing in the window;
  *   production callers omit it (undefined is a no-op).
  * @param {(existing: string|null) => void} [options.beforeSwap] - runs after the
- *   expected-content checks pass and immediately before the rename, so side
- *   effects that must not fire on a conflict (e.g. the `.bak` copy) live here.
+ *   expected-content checks pass and immediately before the rename, for side
+ *   effects that must not fire on a conflict.
+ * @param {(change: object) => void} [options.recorder] - optional change
+ *   recorder. When supplied, the outcome is recorded (path + action + byte
+ *   size only) so `--dry-run` can print the real per-file plan. Defaults to
+ *   the module-level no-op singleton, so an uninstrumented caller is
+ *   byte-identical to before.
+ * @param {boolean} [options.scored] - set `false` when this write is not part
+ *   of the install summary (e.g. stale-ref cleanup), so it is shown in the plan
+ *   but excluded from the consistency guard.
  * @returns {'created'|'skipped'|'conflict'}
  */
 export function writeIfChanged(filePath, content, dryRun, options = {}) {
-  const { expectedContent, beforeSwap, beforeRecheck } = options
+  const { expectedContent, beforeSwap, beforeRecheck, recorder, scored } = options
 
   // Refuse to write through/over a symlink. A dangling symlink is invisible to
   // existsSync, and rename-over-link would replace the link rather than its
@@ -325,12 +306,29 @@ export function writeIfChanged(filePath, content, dryRun, options = {}) {
   }
 
   const existing = stat === null ? null : readFileOrNull(filePath)
+  const record = (outcome) => {
+    if (!isRecording(recorder)) return
+    const action =
+      outcome === 'conflict'
+        ? ACTIONS.CONFLICT
+        : outcome === 'skipped'
+          ? ACTIONS.UNCHANGED
+          : existing === null
+            ? ACTIONS.CREATE
+            : ACTIONS.UPDATE
+    recordChange(
+      { path: filePath, action, bytes: Buffer.byteLength(content, 'utf8'), scored },
+      recorder,
+    )
+  }
   if (existing === content) {
+    record('skipped')
     return 'skipped'
   }
   if (expectedContent !== undefined && existing !== expectedContent) {
     // The file changed since the caller read it (or appeared/disappeared).
     // Do not clobber the newer content; the caller decides how to react.
+    record('conflict')
     return 'conflict'
   }
   if (!dryRun) {
@@ -347,11 +345,12 @@ export function writeIfChanged(filePath, content, dryRun, options = {}) {
     // Last-moment re-read. The initial compare and this rename are separate
     // syscalls, so a concurrent writer can land in between; re-check the
     // expected bytes immediately before the swap. On a mismatch, drop the temp
-    // and leave the target AND any existing `.bak` byte-identical.
+    // and leave the target byte-identical.
     if (expectedContent !== undefined) {
       const current = readFileOrNull(filePath)
       if (current !== expectedContent) {
         rmSync(tmpPath, { force: true })
+        record('conflict')
         return 'conflict'
       }
     }
@@ -359,19 +358,20 @@ export function writeIfChanged(filePath, content, dryRun, options = {}) {
     if (typeof beforeSwap === 'function') beforeSwap(existing)
     renameSync(tmpPath, filePath)
   }
+  record('created')
   return 'created'
 }
 
 /**
- * beta.5: write the user's opencode.json with a same-directory backup of the
- * previous content. The installer rewrites the whole config; a `.bak` gives
- * the user a one-step recovery if a merge ever goes wrong.
+ * Write a config file atomically, honoring the compare-before-write guard.
+ * This used to always keep a `<config>.bak` sidecar; the main `opencode.json`
+ * no longer does — the target-scoped exact backup set
+ * (scripts/install/backup.mjs) preserves it byte-for-byte and
+ * `pantheon-opencode restore` reverts it.
  *
- * The backup is created INSIDE the `beforeSwap` hook, so it fires only after
- * both expected-content checks pass (the initial compare and the last-moment
- * re-read before the rename). A conflict observed at either point leaves the
- * target AND any pre-existing `.bak` untouched, rather than overwriting the
- * user's last known-good backup with a stale copy on a no-op write.
+ * A caller may still supply `beforeSwap` for a file the exact set does NOT
+ * cover: the GLOBAL `opencode-vision.json` lives outside the config dir, so
+ * vision-prompt passes a `beforeSwap` that keeps its `<file>.bak` recovery.
  *
  * @param {string} filePath
  * @param {string} content
@@ -382,14 +382,9 @@ export function writeConfigWithBackup(filePath, content, dryRun, options = {}) {
   return writeIfChanged(filePath, content, dryRun, {
     expectedContent: options.expectedContent,
     beforeRecheck: options.beforeRecheck,
-    beforeSwap: (existing) => {
-      if (existing === null) return
-      try {
-        copyFileSync(filePath, `${filePath}.bak`)
-      } catch {
-        // Best-effort: a backup failure must not block the install.
-      }
-    },
+    beforeSwap: options.beforeSwap,
+    recorder: options.recorder,
+    scored: options.scored,
   })
 }
 
@@ -455,7 +450,7 @@ export function serializeFm(fm) {
   })
 }
 
-export function installSkills(skills, target, dryRun, subDir = '.opencode') {
+export function installSkills(skills, target, dryRun, subDir = '.opencode', recorder = null) {
   const srcSkillsDir = join(ROOT, 'src', 'skills')
   const dstSkillsDir = join(target, subDir, 'skills')
 
@@ -481,9 +476,29 @@ export function installSkills(skills, target, dryRun, subDir = '.opencode') {
           const existing = existsSync(dstPath) ? readFileSync(dstPath, 'utf8') : null
           if (existing === content) {
             skipped++
+            if (isRecording(recorder)) {
+              recordChange(
+                {
+                  path: dstPath,
+                  action: ACTIONS.UNCHANGED,
+                  bytes: Buffer.byteLength(content, 'utf8'),
+                },
+                recorder,
+              )
+            }
           } else {
             if (!dryRun) writeFileSync(dstPath, content, 'utf8')
             created++
+            if (isRecording(recorder)) {
+              recordChange(
+                {
+                  path: dstPath,
+                  action: existing === null ? ACTIONS.CREATE : ACTIONS.UPDATE,
+                  bytes: Buffer.byteLength(content, 'utf8'),
+                },
+                recorder,
+              )
+            }
           }
         }
       }
@@ -504,6 +519,9 @@ export function installSkills(skills, target, dryRun, subDir = '.opencode') {
           console.log(`    🗑️  Removed stale skill: ${entry}`)
         }
         created++
+        // A stale removal increments `created` (a change), so it must also be
+        // recorded or the preview would under-report on a non-fresh target.
+        recordChange({ path: dstPath, action: ACTIONS.REMOVE, bytes: 0 }, recorder)
       }
     }
   }
@@ -511,7 +529,7 @@ export function installSkills(skills, target, dryRun, subDir = '.opencode') {
   return { created, skipped }
 }
 
-export function syncDir(src, dst, dryRun, clean = false, filter = null) {
+export function syncDir(src, dst, dryRun, clean = false, filter = null, recorder = null) {
   if (!existsSync(src)) return { created: 0, skipped: 0 }
   let created = 0
   let skipped = 0
@@ -530,7 +548,7 @@ export function syncDir(src, dst, dryRun, clean = false, filter = null) {
     const srcPath = join(src, entry)
     const dstPath = join(dst, entry)
     if (statSync(srcPath).isDirectory()) {
-      const sub = syncDir(srcPath, dstPath, dryRun, false, filter)
+      const sub = syncDir(srcPath, dstPath, dryRun, false, filter, recorder)
       created += sub.created
       skipped += sub.skipped
     } else {
@@ -538,9 +556,25 @@ export function syncDir(src, dst, dryRun, clean = false, filter = null) {
       const existing = existsSync(dstPath) ? readFileSync(dstPath, 'utf8') : null
       if (existing === content) {
         skipped++
+        if (isRecording(recorder)) {
+          recordChange(
+            { path: dstPath, action: ACTIONS.UNCHANGED, bytes: Buffer.byteLength(content, 'utf8') },
+            recorder,
+          )
+        }
       } else {
         if (!dryRun) writeFileSync(dstPath, content, 'utf8')
         created++
+        if (isRecording(recorder)) {
+          recordChange(
+            {
+              path: dstPath,
+              action: existing === null ? ACTIONS.CREATE : ACTIONS.UPDATE,
+              bytes: Buffer.byteLength(content, 'utf8'),
+            },
+            recorder,
+          )
+        }
       }
     }
   }

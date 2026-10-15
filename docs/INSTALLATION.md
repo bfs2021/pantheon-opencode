@@ -1,15 +1,15 @@
 # Pantheon Installation Guide — v1.6.0-beta.1 (OpenCode 2)
 
-Pantheon v1.6.0-beta.1 is **OpenCode 2-compatible**. Instalação global via `npx pantheon-opencode init` com **wizard 3 perguntas** (default = herdar do chat, sem `active-preset.json`). Herança nativa para delegates: sem preset, os filhos herdam o modelo do chat pai. 4 presets: `go-free`, `go-fast`, `go-premium` (Go gateway) + `openai` puro. As tabelas de preset são derivadas de `src/routing.yml` (sem hardcodar segredos: só `PANTHEON_OPENCODE_API_KEY` / `OPENAI_API_KEY` names + `baseURL`s).
+Pantheon v1.6.0-beta.1 is **OpenCode 2-compatible**. `npx pantheon-opencode init` instala a geração selecionada. A seleção interativa de perfil/preset (3 perguntas; default = herdar do chat) é o caminho legado V1, não uma rota de modelo V2. No V2, `pantheon_model` oferece somente `status`, `show`, `set` e `reset` manuais, sem wizard de presets: o default do host fica intacto sem override explícito por agente; markers `preset` e `PANTHEON_MODEL_PRESET` são ignorados e preservados. Herança nativa para delegates: sem preset, os filhos herdam o modelo do chat pai no caminho V1. As tabelas dos presets abaixo são referência V1 legada e derivadas de `src/routing.yml` (sem hardcodar segredos: só nomes de variáveis e `baseURL`s).
 
 ## TL;DR (Quick Start)
 
 ```bash
-# Instalar agentes Pantheon globalmente (wizard interativo)
+# Instalar agentes Pantheon globalmente (a seleção de presets é V1 legacy)
 npx pantheon-opencode init
 
-# Headless (CI/scripts, usa defaults)
-npx pantheon-opencode init --headless
+# Headless (CI/scripts, usa defaults) — apply não-interativo exige --yes
+npx pantheon-opencode init --headless --yes
 
 # (Opcional) Servidores MCP + skills + plugin TUI
 npm run setup
@@ -19,8 +19,7 @@ npm run doctor
 ```
 
 - Requisitos: **Node.js 22.22.2+** (ou 24.15.0+ / 26+), **OpenCode v1.18.4+**, **Python 3.11+** (opcional, MCP servers).
-- Habilite subagentes paralelos antes de abrir o OpenCode:
-  `export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true`.
+- Delegação e modo background dependem das ferramentas expostas pela versão/runtime do host. Na sessão Beta 10 reportada, Zeus tinha a ferramenta `subagent`, sem `task_status`/`cancel_task` ou garantia de acompanhamento/recuperação. Verifique o schema e a documentação do runtime; não presuma que `task()` ou background estejam disponíveis. A variável experimental abaixo só se aplica a hosts/versões que a documentem.
 - Passo a passo de 5 minutos: [QUICKSTART.md](QUICKSTART.md).
 
 ## Prerequisites
@@ -193,9 +192,10 @@ hook that enforces read-only sessions (`apollo`/`gaia` are denied `edit`,
 tools are
 not registered on V2 because the goal loop requires V1 infrastructure the V2
 context does not expose; `getUnsupportedFeatures()` reports this as
-`goal-tools`. Native OpenCode `task()` is an OpenCode capability, not a V2
-Pantheon delegate API. Do not add the V1 plugin beside `plugin-v2` to try to
-restore V1-specific features: that is an unsupported mixed registration.
+`goal-tools`. The host-native child-session API (called `task()` in hosts that
+expose that API) is not a V2 Pantheon delegate API. Do not add the V1 plugin
+beside `plugin-v2` to try to restore V1-specific features: that is an
+unsupported mixed registration.
 
 Choose the target explicitly when needed:
 
@@ -266,9 +266,15 @@ The TUI plugin is a separate component. Its host-specific entry is installed
 only when the installer component set includes `plugins`; the presence of the
 V2 TUI entry does not imply the V1 runtime was loaded.
 
-## Instalação Interativa — Wizard 3 Perguntas (default = herdar do chat)
+## Instalação Interativa — Wizard 3 Perguntas (V1 legacy; default = herdar do chat)
 
-> **Default = herdar do chat (sem `active-preset.json`)** — sem preset ativo, delegates herdam nativamente o modelo do chat pai. O wizard (`scripts/install/model-picker.mjs`) implementa exatamente 3 perguntas via `askQuestions` (ou `readline` fallback), com tabelas geradas de `src/routing.yml`:
+> **Este wizard de seleção de perfil é exclusivo do caminho legado V1.** No
+> V2, presets estáticos e `PANTHEON_MODEL_PRESET` não selecionam modelos e não
+> existe wizard de rotas; use a ferramenta `pantheon_model` com ações manuais
+> `status`/`show`/`set`/`reset`. No V1, o default é herdar do chat (sem
+> `active-preset.json`) e delegates herdam nativamente o modelo do pai. O wizard
+> (`scripts/install/model-picker.mjs`) implementa três perguntas via
+> `askQuestions` (ou fallback `readline`), com tabelas geradas de `src/routing.yml`:
 
 **Q1 — Perfil (0=herdar do chat [default])** — tabela exibida: perfil | `provider`/`baseURL`/key env | preço 2026 | modelos por papel
 
@@ -296,7 +302,7 @@ V2 TUI entry does not imply the V1 runtime was loaded.
 - `inherit` (Q1) **não grava** arquivo — retorna `{preset:'inherit', scope:'project'}` e loga `Herança nativa: delegates herdam o modelo do chat pai`.
 
 ```bash
-# Interativo padrão (TTY → wizard; pipe → headless)
+# Interativo padrão (TTY → wizard; pipe → plano, exige --yes para aplicar)
 npx pantheon-opencode init
 
 # Forçar wizard mesmo em CI-like terminals
@@ -306,9 +312,9 @@ npx pantheon-opencode init --interactive
 npx pantheon-opencode init --preset go-fast
 npx pantheon-opencode init --preset openai --project
 
-# Headless (sem perguntas, usa defaults)
-npx pantheon-opencode init --headless
-npx pantheon-opencode init --headless --no-mcp  # sem Python/MCPs
+# Headless (sem perguntas, usa defaults; exige --yes para aplicar)
+npx pantheon-opencode init --headless --yes
+npx pantheon-opencode init --headless --yes --no-mcp  # sem Python/MCPs
 ```
 
 > Tabelas acima refletem `src/routing.yml` + `PRESET_PRICE` + `CAPABILITY_TABLE`.
@@ -340,34 +346,42 @@ que grava `visionModel` com o mesmo merge atômico do prompt de init.
 
 ```bash
 # 1. Install Pantheon agents globally
-npx pantheon-opencode init --headless
+npx pantheon-opencode init --headless --yes
 
 # 2. (Optional) Install MCP servers + skills + TUI plugin
 npm run setup
 
-# 3. Enable background subagents
-# Add to ~/.zshrc or ~/.bashrc:
-export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
-
-# 4. Launch OpenCode with background subagents
+# 3. Launch OpenCode
 opencode
 ```
+
+Only if the active OpenCode version/runtime documents support for and requires
+the experimental background setting, set it before launch (for example, in
+`~/.zshrc` or `~/.bashrc`):
+
+```bash
+export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+opencode
+```
+
+This variable is not a general prerequisite and does not guarantee a background
+dispatch tool, status/cancel tools, completion tracking, or recovery.
 
 ## Install Modes
 
 | Mode | Command | Installs | Time | Dependencies |
 |------|---------|----------|------|-------------|
 | **Interactive** 🎯 | `npx pantheon-opencode init` (default TTY) | seletor visual de componentes | ~variavel | Node.js 22.22.2+ |
-| **Minimal** 🟢 | `npx pantheon-opencode init --headless --no-mcp` | agents + commands | ~2s | None |
-| **Full** 🔵 | `npx pantheon-opencode init --headless` | agents + MCPs + skills + TUI | ~60s | Python 3.11+ |
+| **Minimal** 🟢 | `npx pantheon-opencode init --headless --yes --no-mcp` | agents + commands | ~2s | None |
+| **Full** 🔵 | `npx pantheon-opencode init --headless --yes` | agents + MCPs + skills + TUI | ~60s | Python 3.11+ |
 | **Runtime** 🟡 | `npm run setup` | MCP servers + venv | ~30s | Python 3.11+ |
 
 ```bash
-# Minimal — just the agent rules, no Python dependencies
-npx pantheon-opencode init --no-mcp
+# Minimal — just the agent rules, no Python dependencies (non-interactive)
+npx pantheon-opencode init --headless --yes --no-mcp
 
 # Full setup — agents + MCP servers (memory, persistence, resources, vision)
-npx pantheon-opencode init
+npx pantheon-opencode init --headless --yes
 
 # Add MCP servers to an existing minimal install
 npm run setup
@@ -387,9 +401,9 @@ This installs to `.opencode/agents/` in the current project directory.
 
 ## Herança Nativa — sem `active-preset.json` (default)
 
-Desde **v1.5.0** o instalador **não cria** `model`/`small_model` top-level em `opencode.json` e o plugin/wizard **não grava** `active-preset.json` quando o usuário escolhe `0`/`inherit` (default da Q1). Comportamento:
+No caminho de instalação V1 desde **v1.5.0**, o instalador **não cria** `model`/`small_model` top-level em `opencode.json` e o plugin/wizard **não grava** `active-preset.json` quando o usuário escolhe `0`/`inherit` (default da Q1). O fluxo V2 não ativa presets. Comportamento V1:
 
-- **Sem preset = herança nativa**: `resolveActivePreset()` retorna `null`; `loadRoutingAgentModels()` retorna `{}`; nenhum modelo é imposto aos filhos — o `task()` nativo herda o modelo do chat pai. `small_model` nunca é usado.
+- **Sem preset = herança nativa**: `resolveActivePreset()` retorna `null`; `loadRoutingAgentModels()` retorna `{}`; nenhum modelo é imposto aos filhos — o dispatch nativo do host (por exemplo, `task()` onde exposto) herda o modelo do chat pai conforme a semântica desse host. `small_model` nunca é usado.
 - **Ordem de resolução do modelo filho** (fontes sem hardcode de segredos, só nomes):
   1. `overrides.agents[agent].model` em `.pantheon/active-preset.json` (via `/pantheon-model set --agent`)
   2. `presets.<active>.agents[agent].model` (via `loadRoutingAgentModels`)
@@ -413,17 +427,30 @@ npx pantheon-opencode init --preset go-fast
 
 > **Nota:** A validação de `provider/model-id` usa `MODEL_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:+-]*$/` (em `src/pantheon/model-command.ts`, hint sem expor segredos). Model inválido → erro `model must use provider/model-id format`.
 
-## `/pantheon-model` — Per-agent Overrides em `active-preset.json`
+## `/pantheon-model` — Per-agent Overrides em `active-preset.json` (V1 legacy)
 
-> **Em v1.5.0** — opera **exclusivamente** em `active-preset.json` `overrides.agents[agent]` (project ou global). **Nunca** escreve `.env` e **nunca** injeta `model`/`small_model` top-level em `opencode.json`. No caminho V1, a delegação usa herança nativa (sem modelo → herda chat/preset); o caminho V2 não registra a API de delegação V1.
+> Os comandos `/pantheon-model` e o wizard abaixo são o caminho legado V1. V2
+> expõe a ferramenta `pantheon_model` com ações explícitas `status`, `show`,
+> `set` e `reset`, sem wizard de rotas ou presets. No V2, só overrides manuais
+> project-scoped por agente são aplicados; arquivos globais não são lidos nem
+> aplicados. `set`/`reset` rejeitam `scope=global` e flags `confirm`/
+> `authorize_global`; a mesma chamada não é aprovação humana independente. O
+> suporte global futuro exigirá autorização explícita separada e não é suportado
+> nesta ferramenta. Markers `preset` e `PANTHEON_MODEL_PRESET` são ignorados,
+> não removidos, e o default do host fica intacto sem override.
+> Ambos os caminhos gravam overrides em `active-preset.json` e nunca escrevem
+> `.env` nem injetam `model`/`small_model` top-level em `opencode.json`.
 
-O comando é determinístico (`src/pantheon/model-command.ts`) — leitura/escrita local sem resolver providers externos, backup `.bak` + rename atômico + `O_NOFOLLOW` + lock por path. Escopo default `project`; `global` exige `confirm` + `authorize_global` separados (`-y` não basta).
+No V1, a delegação usa herança nativa (sem modelo → herda chat/preset); o
+caminho V2 não registra a API de delegação V1.
+
+O comando V1 é determinístico (`src/pantheon/model-command.ts`) — leitura/escrita local sem resolver providers externos, backup `.bak` + rename atômico + `O_NOFOLLOW` + lock por path. No V1, escopo default `project`; `global` exige `confirm` + `authorize_global` separados (`-y` não basta). A ferramenta V2 aceita apenas `project` e rejeita flags de autorização.
 
 ```text
 # status — lista 14 agentes canônicos com modelo/effort/origem (preset|override|env|none), sem segredos
 /pantheon-model status          # alias: show
 
-# wizard interativo (sem args) — via askQuestions:
+# V1 legacy only: wizard interativo (sem args) — via askQuestions:
 /pantheon-model                 # agente → modelo (provider/model-id) → effort (low/medium/high) → scope (project|global)
 /pantheon-model                 # valida agente ∈ {zeus, athena, apollo, hermes, aphrodite, demeter, themis, prometheus, hephaestus, nyx, gaia, iris, mnemosyne, talos}
                                # valida modelo via CAPABILITY_TABLE capabilityEntry() + clamp via normalizeCapability()
@@ -446,59 +473,84 @@ O comando é determinístico (`src/pantheon/model-command.ts`) — leitura/escri
 - Modelo sem entrada em `CAPABILITY_TABLE` → erro de `capabilityEntry(model)` (ex.: modelo inexistente)
 - `effort` inválido → `effort must be one of low, medium, high`; se válido mas acima do teto (`maxEffort`), é **clamped** (`normalizeCapability` retorna `{variant, clamped:true}`) e loga aviso
 - `hasVision(model)` = false mas usado como visão → warning `hasVision` via logger (não bloqueia, mas avisa)
-- `--scope global` sem `--confirm --authorize-global` → `global set/reset requires explicit confirmation and separate global authorization; -y is not sufficient`
+- No V1, `--scope global` sem `--confirm --authorize-global` → `global set/reset requires explicit confirmation and separate global authorization; -y is not sufficient`
+- No V2, `scope=global`, `confirm` ou `authorize_global` → erro project-only; nenhuma escrita é feita
 - Modelo é apenas referência `provider/model-id` — provider/model disponibilidade depende de `opencode` config + credenciais (`PANTHEON_OPENCODE_API_KEY` ou `OPENAI_API_KEY`) + conta/assinatura/endpoint
 
 **Persistência:**
 
-- Lê `active-preset.json` candidatos (`project` → `global` → legacy) via `readRegularFile` + `O_NOFOLLOW` + validação JSON; inválido → equivale a ausência (log warn, sem segredos)
+- No V1, lê candidatos `active-preset.json` (`project` → `global` → legacy) via `readRegularFile` + `O_NOFOLLOW` + validação JSON; inválido → equivale a ausência (log warn, sem segredos). No V2, somente o arquivo do projeto é lido; arquivo global não contribui overrides nem warnings.
 - Escreve via `writeActivePresetAtomically(path, data, current)` — `mkdir -p`, backup `.bak` (se existia), `atomicReplace(path, JSON.stringify(data,null,2))` (`tmp`+`rename` + `fsync` dir), lock `pathLocks` por `path`, preserva `mode` (default `600`)
-- Reinicie OpenCode após sucesso (sem hot-swap). `status` nunca exibe valores de chaves.
+- No V1, reinicie OpenCode após sucesso (sem hot-swap); V2 lê overrides em um próximo configuration load. `status` nunca exibe valores de chaves.
 
 **Histórico superseded (≤1.4.1):** antes manipulava `model`/`small_model` top-level em `opencode.json`; em 1.5.0 manipula apenas `overrides.agents`. Instrução em `commands/pantheon-model.md` usa `agent: zeus` + per-agent semantics.
 
-## Background Delegation (native `task()`)
+## OpenCode V2 `subagent` Tool and Runtime Delegation
 
-Pantheon delegates through OpenCode's native `task()` child-session engine —
-there is no Pantheon-specific delegation tool surface. In background mode the
-call returns immediately and the child keeps running; the TUI Delegations panel
-follows it through `api.client.session.children` and OpenCode session events. No
-completion text is injected into the chat transcript.
+OpenCode V2 documents `subagent` as the child-session tool. It is a host tool,
+not a Pantheon-specific delegation API; verify that it is exposed in the active
+session. The following shows its V2 tool arguments, not a promise that other
+hosts or versions expose the same schema:
 
-**Requirement:** Set the environment variable before launching OpenCode:
+```json
+{
+  "agent": "apollo",
+  "description": "Find X",
+  "prompt": "Search the codebase for X."
+}
+```
+
+A foreground call waits for the child to finish and returns its result. To
+request background execution where the active tool schema supports it, add
+`"background": true`:
+
+```json
+{
+  "agent": "apollo",
+  "description": "Find X",
+  "prompt": "Search the codebase for X.",
+  "background": true
+}
+```
+
+In OpenCode V2, a background call returns immediately; its response includes a
+`sessionID` for continuing that child, and the parent is notified when the child
+finishes. The exact tool availability and behavior remain runtime-dependent.
+Some older or host-specific documentation uses `task()` to refer to native
+child-session dispatch; that name does not guarantee a root tool named `task`.
+Do not assume `task_status`, `cancel_task`, a Pantheon BackgroundJobBoard, or
+other status/recovery facilities are available in V2.
+
+The experimental environment variable below is a gate used by some supported
+runtime versions; it is not a universal prerequisite and does not install or
+guarantee a background tool. Pantheon's `npm run start` launcher sets it, but
+that launcher does not detect runtime support. Set it only when the active
+runtime documents and requires it:
 
 ```bash
 export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
 opencode
 ```
 
-Or use the provided npm script:
+The Pantheon launcher can be used for that same runtime-specific case:
 
 ```bash
 npm run start
 ```
 
-**How it works:**
+The reported Beta 10 Zeus-root toolset also exposed `subagent`; other runtimes
+may expose different tools or options. Follow the active schema and use
+background only when supported by that schema.
 
-```javascript
-// Dispatch a background child — returns immediately in background mode
-task({ subagent_type: "apollo", description: "Find X", prompt: "search the codebase" })
-// → child session ses_xxx; visible in the TUI Delegations panel
+**Suggested dispatch style (only when the active root schema supports it):**
 
-// Foreground dispatch blocks until the child finishes and returns its report
-task({ subagent_type: "hermes", description: "Implement Y", prompt: "..." })
-```
+| Agent/task kind | Preference | Why |
+|-----------------|------------|-----|
+| Independent, long-running work (e.g. discovery or implementation) | Background only if explicitly supported and completion is observable | May benefit from concurrency |
+| Short, dependent, or context-sensitive work (e.g. plan or review handoff) | Synchronous | Keeps result and dependency visible |
 
-**Which agents run in background:**
-
-| Agent | Background? | Why |
-|-------|------------|-----|
-| Apollo, Hermes, Aphrodite, Demeter, Hephaestus, Prometheus | ✅ Yes | Independent, long-running work |
-| Athena, Themis | ❌ No | Need full session context |
-| Talos, Iris, Nyx, Mnemosyne, Gaia | ❌ No | Quick operations |
-
-See the **Delegation (native `task()`)** section in the [README](../README.md)
-for the engine contract and historical notes.
+See the **Delegation (root `subagent`; host/API `task()`)** section in the
+[README](../README.md) for the runtime distinction and historical notes.
 
 V1 compaction carry-forward is implemented by
 `experimental.session.compacting`. It is not available through `plugin-v2`.
@@ -589,11 +641,18 @@ Type these in the OpenCode chat:
 | `/pantheon` | Multi-perspective council synthesis via inline agents |
 | `/pantheon-audit` | 3-layer code audit: heuristic scan → Themis deep review → OWASP Top 10 |
 | `/pantheon-deepwork` | Heavy multi-phase task with persisted checkpoints and Themis review gates |
-| `/pantheon-model` (wizard) / `status\|show\|set --agent\|reset --agent` | Per-agent overrides em `active-preset.json` (`overrides.agents[agent]`); `status` lista 14 agentes (model/effort/origem `preset\|override\|env\|none`); `set --agent X --model provider/model-id [--effort low\|medium\|high] [--scope project\|global]` validado via `CAPABILITY_TABLE`+`hasVision`+clamp; `reset --agent X`; default `project`; `global` exige `confirm`+`authorize_global`; atômico `.bak`+lock; nunca escreve `.env` nem top-level `model` |
+| V1 `/pantheon-model` (wizard) e ações; V2 ferramenta `pantheon_model` (`status\|show\|set\|reset`) | Overrides manuais per-agent em `active-preset.json` (`overrides.agents[agent]`). V2: ações explícitas sem wizard de presets, project-only; `status` mostra overrides e warnings do projeto; `set` recebe `agent`, `model`, `effort` opcional e opcionalmente `scope: project`; `reset` recebe `agent` e opcionalmente `scope: project`. Arquivos globais não são lidos nem aplicados. Mutação global exige autorização humana explícita futura, indisponível nesta ferramenta; `scope=global` e flags de autorização são rejeitados. Escrita atômica `.bak`+lock; nunca escreve `.env` nem top-level `model`. O wizard sem argumentos é legado V1 apenas. |
 | `/pantheon-optimize` | Project optimization: bloat scan, deepwork archive, cache migration, token report |
 | `/pantheon-consolidate` | Merge and deduplicate memory entries through the persistence MCP server |
 
 ## Troubleshooting — Chaves e Presets
+
+> Esta seção descreve o caminho legado V1 de instalação e presets. No OpenCode
+> V2, `PANTHEON_MODEL_PRESET` e markers `preset` não ativam modelos; somente
+> overrides per-agent explícitos do projeto são aplicados, arquivos globais são
+> ignorados e sem override o modelo do host permanece intacto. Mutação global
+> requer autorização humana explícita futura e não é suportada pela ferramenta.
+> V1 continua inalterado até a decisão de compatibilidade.
 
 **Sem segredos hardcoded — só nomes de env vars + `baseURL`s abaixo.**
 
@@ -638,7 +697,7 @@ node -e "import('./src/pantheon/presets.mjs').then(m=>console.log(m.validatePres
 | `OPENAI_API_KEY não configurada` | `openai` selecionado mas env vazia | `export OPENAI_API_KEY=...` |
 | `unknown agent "foo"` em `/pantheon-model set` | agente não canônico | Use um dos 14: `zeus`, `athena`, `apollo`, `hermes`, `aphrodite`, `demeter`, `themis`, `prometheus`, `hephaestus`, `nyx`, `gaia`, `iris`, `mnemosyne`, `talos` |
 | `model must use provider/model-id format` | modelo sem barra ou com espaço/`..` | Use `provider/model-id` ex.: `openai/gpt-5.6-sol`, `opencode-go/kimi-k2.7-code` (valida `MODEL_REF_PATTERN`) |
-| `global set/reset requires explicit confirmation...` | `--scope global` sem confirmação | Adicione `--confirm --authorize-global` (ou use `--scope project`, default seguro) |
+| No V1, `global set/reset requires explicit confirmation...` | `--scope global` sem confirmação | No V1, adicione `--confirm --authorize-global` (ou use `--scope project`, default seguro). Na ferramenta V2, global não é suportado. |
 | `.pantheon/active-preset.json has invalid JSON` | arquivo corrompido | Apague ou corrija JSON; `readActivePresetRaw` trata como ausência + log `warn` sem segredos; `write` preserva anterior se falhar |
 | `health-check: active-preset.json verification failed` | `writeActivePreset` gravou mas `preset` mismatch | Verifique permissões (`mode` default `600`, `O_NOFOLLOW`, `fsync` dir); wizard loga warning, não expõe chave |
 | `[pantheon-delegate] no model resolved for agent "X" — omitting model...` | sem preset e sem override, herança nativa | Normal em default (herança nativa); para pinar, `npx pantheon-opencode set-tier <preset>` ou `/pantheon-model set --agent X ...` |
@@ -647,10 +706,37 @@ node -e "import('./src/pantheon/presets.mjs').then(m=>console.log(m.validatePres
 
 ### Headless / CI (sem TTY)
 
+> **Apply não-interativo exige `--yes`.** Sem TTY, `init` imprime o plano e
+> **não altera nada** sem `--yes` (alias `-y`). Exit codes: `0` ok/plan-only
+> (nada aplicado) · `2` apply pedido sem autorização · `3` drift (um alvo
+> planejado mudou entre o plano e o apply) · `130` cancelado · `1` falha.
+> O drift é verificado **dentro de uma única execução** (plano → apply); não é
+> detectável entre duas invocações separadas do CLI (nenhum plano é persistido).
+
+#### Backup, restore e fluxo de aprovação
+
+- **Preview**: `init --dry-run` imprime o plano e **não escreve nada**.
+- **Backup exato**: antes da primeira escrita, `init` salva um conjunto exato em
+  `.pantheon/backups/<timestamp>/` (diretório `0700`, arquivos e manifest `0600`;
+  mantém os **5** mais recentes). É uma cópia byte-a-byte e, portanto, **também
+  contém quaisquer API keys/tokens já presentes nos seus arquivos** — por isso
+  nunca é impresso (nem seus hashes).
+- **Restore**: `pantheon-opencode restore [--project] [--from <dir>] [--dry-run] [--yes]`.
+  Verifica a integridade do manifest e se recusa a restaurar um conjunto
+  adulterado; faz um backup do estado atual antes de reverter. Exige `--yes` num
+  TTY não-interativo; num TTY pergunta (default **não**).
+- **Falha no meio do apply**: aborta as escritas restantes, limpa arquivos
+  temporários (`<arquivo>.tmp-<pid>`), lista os caminhos já aplicados (sem
+  conteúdo) e imprime a instrução de recuperação. **Não há rollback automático** —
+  o backup exato + `restore` é o caminho de recuperação (um apply interrompido é
+  recuperável do mesmo modo).
+- **Fora do fluxo de aprovação**: `postinstall`/`sync-tui` apenas ressincroniza
+  artefatos da TUI; não faz prompt nem passa pelo gate de `--yes`.
+
 ```bash
 # Preset explícito pula wizard (Q1/Q2/Q3)
-PANTHEON_OPENCODE_API_KEY=... npx pantheon-opencode init --headless --preset go-fast
-OPENAI_API_KEY=... npx pantheon-opencode init --headless --preset openai --project
+PANTHEON_OPENCODE_API_KEY=... npx pantheon-opencode init --headless --yes --preset go-fast
+OPENAI_API_KEY=... npx pantheon-opencode init --headless --yes --preset openai --project
 
 # Env override (vence arquivo) — útil em CI
 PANTHEON_MODEL_PRESET=go-premium opencode run "hello"
@@ -679,16 +765,22 @@ ls ~/.config/opencode/agents/
 # 2. Check MCP servers
 ls ~/.config/opencode/scripts/
 
-# 3. Launch OpenCode with background subagents
-export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+# 3. Launch normally; use the conditional setting below only when supported.
 opencode
 
-# 4. Test background delegation
-# Type: @zeus, task(background=true, subagent_type="apollo", prompt="test")
+# 4. Test delegation with the actual tool schema shown to Zeus
+# In the reported Beta 10 runtime, dispatch through `subagent`; request
+# background only if the active schema offers it.
 
 # 5. Run health check
 npm run doctor
 ```
+
+If (and only if) the active host version/runtime documents and requires the
+experimental background setting, export
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` before launching OpenCode.
+Verify delegation against the tools actually exposed to Zeus; do not infer
+completion tracking or recovery from a successful dispatch.
 
 **Instalação global isolada:** para testar o pacote instalado em um sandbox
 isolado (sem contaminar o ambiente de dev, que mistura várias instalações), use
@@ -728,7 +820,7 @@ removed from all `tui.json` locations OpenCode reads: `~/.opencode/tui.json`,
 |---------|----------|
 | Agents not found | Run `npx pantheon-opencode init` again |
 | MCP servers not starting | Check Python 3.11+, run `npm run setup` |
-| Background delegation not available | Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` before launching OpenCode |
+| Background delegation not available | Check the active host version/runtime's tool schema and documentation. Set `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` only if that version documents support and requires it; the setting does not guarantee status, completion tracking, or recovery tools. |
 | TUI sidebar not showing | Check the installed config's `tui.json` has exactly one `plugins/pantheon-tui` entry (absolute path) |
 | Plugin not loading | Ensure `<config>/plugins/pantheon-tui/dist/tui.js` exists (copied at install time) |
 | Health check fails | Run `npm run doctor` for detailed diagnostics |
@@ -811,27 +903,37 @@ flowchart LR
     C --> E["npm run setup"]
     D --> E
     E --> F["MCP servers + skills + TUI"]
-    F --> G["export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"]
+    F --> G["Check background support; configure only if documented"]
     G --> H["opencode"]
     H --> I["🚀 Pantheon v1.5.0 ready"]
 ```
 
-## Native `task()` Delegation Flow
+## Host/API `task()` Delegation Concept
+
+This is an API-level illustration for hosts that expose the documented native
+`task()` shape and completion semantics. It is not a guarantee that Zeus has a
+root `task()` tool, that this signature is available, or that dispatch returns
+a trackable result. In the reported Beta 10 Zeus-root runtime, dispatch was via
+`subagent`; `task_status` and `cancel_task` were not exposed, and no status,
+completion-tracking, or recovery guarantee follows from this diagram. Check the
+active runtime's tool schema and documentation. Background support, the
+experimental environment variable, and completion notifications are
+version/runtime-dependent.
 
 ```mermaid
 sequenceDiagram
     participant Z as Zeus
     participant A as Apollo (child)
-    participant D as Demeter (child)
     participant H as OpenCode host
 
-    Z->>+A: task({ subagent_type: "apollo", ... })
-    Z->>+D: task({ subagent_type: "demeter", ... })
-    A-->>H: child session terminal state
-    D-->>H: child session terminal state
-    H-->>Z: task() result returned to the caller
+    Z->>H: host API dispatch (e.g. task(), if exposed)
+    H-->>A: child session starts (host-dependent)
+    A-->>H: child completion (if emitted by host)
+    opt Host exposes a result or completion notification
+        H-->>Z: host-defined result/notification
+    end
 
-    Note over Z: Native OpenCode task(); no Pantheon delegate API
+    Note over Z,H: Illustrative host API only; no Pantheon-specific delegate API
 ```
 
 ## TUI Sidebar Layout

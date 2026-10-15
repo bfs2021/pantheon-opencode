@@ -52,6 +52,23 @@ opencode
 The installer guides you through the available setup. For optional MCP servers,
 project-local installation, or non-interactive setup, see the
 [installation guide](docs/INSTALLATION.md).
+
+A non-interactive apply requires `--yes` (alias `-y`): without a TTY and
+without `--yes`, `init` prints the change plan and applies nothing. Exit codes:
+`0` success or plan/no-apply, `1` failure, `2` apply requested without
+authorization, `3` drift (a planned target changed between plan and apply),
+`130` canceled. Drift is checked within a single run (plan → apply); it cannot
+be detected across two separate CLI invocations (no plan is persisted).
+
+Preview without writing anything with `init --dry-run`. Before the first write,
+`init` saves an exact backup set under `.pantheon/backups/<timestamp>/`
+(directory `0700`, files `0600`, the 5 most recent kept); it is a byte-for-byte
+copy and therefore also contains any API keys or tokens already present in your
+files — it is never printed. Recover with
+`pantheon-opencode restore [--project] [--yes]` (there is no automatic
+rollback; an interrupted apply is recoverable the same way). The
+`postinstall`/`sync-tui` step only refreshes TUI artifacts and is deliberately
+outside this approval flow — no prompt is possible there.
 The bundled Python MCP servers use the pinned MCP SDK 2.2.0 and standalone
 FastMCP 4.0.10 runtime; see the [MCP guide](docs/MCP.md).
 The installer also turns each agent's `mcp_tools` allowlist into native
@@ -182,12 +199,17 @@ session/compaction hooks, so the 1.6 line is not full V2 feature parity.
 | V2 native subagent admission | OpenCode v2.0.29 | `tests/canary/run-v2-permission-proof.sh`; identity, root/child checks and permission-before-child ordering are recorded in [`bench/results/f4a-v229-admission-identity-2026-10-14.md`](bench/results/f4a-v229-admission-identity-2026-10-14.md) |
 | Exact 1.X host version the 1.6 line is exercised against end-to-end | **Unverified.** No V1 host leg exists: the sandbox runner is V2-only and `--run v1` is rejected | — |
 
-## Delegation (native `task()`)
+## Delegation (root `subagent`; host/API `task()`)
 
-Pantheon delegates exclusively through OpenCode's native `task()` child-session
-engine. The former custom `pantheon_delegate` tool and the V1 delegation engine
-(`delegation.ts`, `delegate-manager.ts` and supporting modules) were removed;
-there is no Pantheon-specific delegation tool surface to configure. See
+The host's child-session engine is referred to as native `task()` in API and
+implementation documentation. In the user-reported Beta 10 Zeus-root runtime,
+the callable dispatch tool was `subagent`; `task()` was not exposed as a root
+tool. Treat the API name and examples below as host/API terminology, not a
+guaranteed root-tool name or signature. The active runtime determines the
+`subagent` schema, background options, and completion observability. The former
+custom `pantheon_delegate` tool and the V1 delegation engine (`delegation.ts`,
+`delegate-manager.ts` and supporting modules) were removed; there is no
+Pantheon-specific delegation tool surface to configure. See
 [ADR-0011](.pantheon/memory-bank/adr/0011-delegation-engine-contract.md) for the
 historical engine contract.
 
@@ -210,8 +232,12 @@ global database. Both OpenCode services were running, so the 404 in the global
 log may come from the other instance; this remains an end-to-end verification
 item.
 
-Delegated tasks get at most one retry after an initial timeout or failure. If
-that retry fails, the configured fallback or escalation chain applies.
+Delegated work gets at most one retry after an initial transient failure. If no
+completion/status tool is exposed, prefer synchronous `subagent` dispatch or
+wait for a host-provided completion notification; do not assume polling,
+cancellation, job tracking, or board-based recovery. If the runtime does not
+make completion observable, report that limitation. The configured fallback or
+escalation chain still applies.
 
 ## Cost tool backend
 
@@ -229,6 +255,8 @@ available.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PANTHEON_NODE` | `node` from `PATH` | Path to a Node.js >= 22.5 binary used by the CLI fallback; an explicit path must exist and be executable, otherwise the tool fails fast instead of ignoring the override |
+
+Tool interpretation matters: `pantheon_model status` reports configuration, not the model serving a completion. V2 manual model overrides are project-only; global override files are neither read nor applied, and global mutation is unsupported until a future surface can obtain separate explicit human authorization. V2 ignores static presets and applies only explicit per-agent project model/variant overrides, leaving the host default unchanged otherwise; V1 preset behavior remains legacy pending compatibility decisions. `pantheon_cost` is a rolling token aggregate, not a session-level or monetary cost report. See the [OpenCode plugin tool notes](docs/mcp-tools.md#opencode-plugin-tools) for details and measurement limits.
 
 
 ## Code-mode execution (explicit opt-in)
@@ -550,23 +578,35 @@ Two freshness guarantees back it up:
   current package.
 
 `init` also gained `--components agents,skills,...` (narrow install),
-`--clean` (alias of `--force`), `--opencode-version auto`, atomic config
-writes with an `opencode.json.bak` backup, preflight checks for python3/npm
-before any file is written, and a non-fatal Python runtime: if the venv fails,
-the install completes but MCP entries are omitted (with a warning) instead of
-pointing at a broken interpreter. Installer messages auto-detect pt-BR via
-`LANG`/`LC_ALL`.
+`--clean` (alias of `--force`), `--opencode-version auto`, preflight checks for
+python3/npm before any file is written, and a non-fatal Python runtime: if the
+venv fails, the install completes but MCP entries are omitted (with a warning)
+instead of pointing at a broken interpreter. Before the first modifying write,
+`init` preserves, byte-for-byte, every regular file it can modify or remove
+inside the config dir (including files a `--clean` run deletes) under
+`.pantheon/backups/<timestamp>/` (directory `0700`, files `0600`, kept 5 deep);
+bulk directories
+(`.venv`, the plugin's `node_modules`) and out-of-target global files
+(`tui.json` copies elsewhere, the global `opencode-vision.json`) are listed in
+the manifest as `notRevertible` rather than silently omitted. The exact-set
+warning is printed once and never echoes file contents. Restore with
+`pantheon-opencode restore [--project] [--yes]` (the old `opencode.json.bak`
+sidecar is gone; the global vision config keeps its own `.bak`). Installer
+messages auto-detect pt-BR via `LANG`/`LC_ALL`.
 
 ## Migrating to 1.5.x (from 1.4.x)
 
 1.5.0 removed the custom `pantheon_delegate` tool (and the V1 delegation
-engine) in favor of OpenCode's native `task()`; see
-[Delegation (native `task()`)](#delegation-native-task). Two things change on
+engine) in favor of the host child-session engine; see
+[Delegation (`subagent` / host API `task()`)](#delegation-root-subagent-hostapi-task). In the
+reported Beta 10 runtime Zeus dispatches through `subagent`; `task()` remains
+host/API terminology, not a guaranteed root tool. Two things change on
 an existing install:
 
 1. **The tool disappears from the plugin surface.** `pantheon_delegate` is no
    longer registered by `src/plugin.ts` or `src/plugin-v2.ts`. Agents now
-   delegate through `task()` only — no configuration is needed.
+   delegate through the dispatch tool actually exposed by the active runtime —
+   no Pantheon-specific delegation tool configuration is needed.
 2. **A lockfile-pinned copy can keep the old tool alive.** `npm install` is
    lockfile-authoritative: a `package-lock.json` pinned to `1.4.1` (which
    satisfies `^1.4.1`) is never re-resolved, so a project's
@@ -839,13 +879,18 @@ with the other.
 
 ### Task-result guard
 
-A `task-result-guard` intercepts calls to the native `task()` tool where the
-child session returns an empty or missing result. Instead of surfacing a silent
+A `task-result-guard` intercepts host/API child-session dispatch calls where the
+child session returns an empty or missing result. In the reported Beta 10 Zeus
+root, dispatch is exposed as `subagent`; host/API `task()` terminology does not
+guarantee a root tool by that name. Instead of surfacing a silent
 `completed` with no payload (which confuses the orchestrator), the guard now
 raises an explicit error. This catches the common free-tier failure mode where a
 child session exceeds the uncached-prefill token budget (`BackendAdmissionRejected`)
-and returns nothing. Prefer `background=true` dispatches with an explicit
-`task_status(wait=true)` fan-in so large payloads are collected deterministically.
+and returns nothing. Background dispatch and status/fan-in facilities are
+runtime-dependent. The reported Beta 10 Zeus root did not expose `task_status`;
+use synchronous `subagent` dispatch or wait for a host-provided completion
+notification when no status tool is visible. Do not claim deterministic fan-in
+or job recovery without an exposed, verified mechanism.
 
 
 ## Configuration (environment variables)
