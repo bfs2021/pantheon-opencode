@@ -19,10 +19,14 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  isSupportedNodeVersion,
+  MIN_SUPPORTED_NODE_VERSION,
+  unsupportedNodeVersionMessage,
+} from '../node-engine-policy.mjs'
 
-const REQUIRED_NODE_MAJOR = 18
-if (parseInt(process.versions.node.split('.')[0], 10) < REQUIRED_NODE_MAJOR) {
-  console.error(`❌ Node.js >= ${REQUIRED_NODE_MAJOR} required (current: ${process.versions.node})`)
+if (!isSupportedNodeVersion(process.versions.node)) {
+  console.error(unsupportedNodeVersionMessage(process.versions.node))
   process.exit(1)
 }
 
@@ -136,7 +140,7 @@ export function parseArgs(argv) {
         args.help = true
         break
       default:
-        console.warn(`⚠️  Unknown option: ${argv[i]}`)
+        console.warn(`[WARN] Unknown option: ${argv[i]}`)
         break
     }
   }
@@ -161,12 +165,12 @@ export function resolveTarget(target) {
 export function detectAndReport(target) {
   const found = detectPlatforms(target).length > 0
 
-  console.log(`\n  🔍 Pantheon Platform Detection`)
+  console.log(`\n  Pantheon Platform Detection`)
   console.log(`     Target: ${target}\n`)
 
   console.log(`  ${'Platform'.padEnd(12)} ${'Detected?'.padEnd(12)} Config file`)
   console.log(`  ${'─'.repeat(55)}`)
-  const status = (found ? '✅ YES' : '❌ no').padEnd(12)
+  const status = (found ? '[OK] yes' : '[MISSING]').padEnd(12)
   console.log(`  ${'OpenCode'.padEnd(12)} ${status} ${found ? 'opencode.json' : '(not found)'}`)
   console.log(`\n  📊 ${found ? 1 : 0} of 1 platforms detected.`)
   if (found) {
@@ -463,7 +467,10 @@ export function checkRuntimePrerequisites(env = process.env) {
   const problems = []
   const checks = [
     { cmd: 'python3', hint: 'install Python 3.10+ (https://www.python.org/downloads/)' },
-    { cmd: 'npm', hint: 'install Node.js 22+ (https://nodejs.org) — npm ships with it' },
+    {
+      cmd: 'npm',
+      hint: `install Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (https://nodejs.org) — npm ships with it`,
+    },
   ]
   for (const { cmd, hint } of checks) {
     const probe = spawnSync(cmd, ['--version'], { encoding: 'utf8', timeout: 10_000, env })
@@ -806,7 +813,7 @@ export function printSummary(target, platforms) {
     totalSkipped += stats.skipped
     totalErrors += stats.errors
 
-    const status = stats.errors > 0 ? '⚠️' : '✅'
+    const status = stats.errors > 0 ? '[WARN]' : '[OK]'
     console.log(
       ` ${status} ${label}: ${stats.created} created, ${stats.skipped} skipped${stats.errors > 0 ? `, ${stats.errors} errors` : ''}`,
     )
@@ -818,7 +825,7 @@ export function printSummary(target, platforms) {
   )
 
   if (totalErrors > 0) {
-    console.log('   ⚠️  Some platforms had errors — review warnings above.')
+    console.log('   [WARN] Some platforms had errors — review warnings above.')
   }
 
   console.log('')

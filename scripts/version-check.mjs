@@ -19,11 +19,24 @@ export const MANIFESTS = Object.freeze(
   }),
 )
 
+const RELEASE_METADATA = Object.freeze(
+  VERSION_MANIFEST_INVENTORY.filter((item) => item.role === 'metadata').map((item) => ({
+    name: item.file,
+    file: item.file,
+    kind: item.kind,
+  })),
+)
+
 function readLegacyVersion(root, manifest) {
   const path = join(root, manifest.file)
   const text = readFileSync(path, 'utf8')
   if (manifest.kind === 'toml') {
     const match = text.match(/^version\s*=\s*"([^"]+)"/m)
+    if (!match) throw new Error(`${manifest.file} is missing version`)
+    return match[1]
+  }
+  if (manifest.kind === 'cff') {
+    const match = text.match(/^version:\s*([^\s#]+)\s*(?:#.*)?$/m)
     if (!match) throw new Error(`${manifest.file} is missing version`)
     return match[1]
   }
@@ -64,6 +77,15 @@ export function compareVersions(root) {
     }
     return { name: manifest.name, version, ok: version !== null && version === source }
   })
+  const releaseMetadata = RELEASE_METADATA.map((manifest) => {
+    let version = null
+    try {
+      version = readLegacyVersion(root, manifest)
+    } catch (error) {
+      errors.push(`${manifest.file}: ${error.message}`)
+    }
+    return { name: manifest.name, version, ok: version !== null && version === source }
+  })
   const locks = LOCK_INVENTORY.map((entry) => {
     let version = null
     try {
@@ -81,11 +103,13 @@ export function compareVersions(root) {
   return {
     source,
     manifests,
+    releaseMetadata,
     locks,
     errors: [...new Set(errors)],
     ok:
       source !== null &&
       manifests.every((item) => item.ok) &&
+      releaseMetadata.every((item) => item.ok) &&
       locks.every((item) => item.ok) &&
       errors.length === 0,
   }
@@ -100,7 +124,11 @@ export function syncToSource(root) {
   const source = inventory.sourceVersion
   const changed = inventory.versions.filter(({ version }) => version !== source).length
   const lockChanged = inventory.documents.filter(
-    ({ entry, data }) => entry.role === 'lock' && data.version !== source,
+    ({ entry, data }) =>
+      entry.role === 'lock' &&
+      (data.version !== source ||
+        (entry.file === 'package-lock.json' &&
+          data.packages?.['src/plugins/tui']?.version !== source)),
   ).length
   if (changed || lockChanged) writeInventoryVersion(inventory, source)
   return changed + lockChanged
@@ -110,6 +138,11 @@ function printDivergenceTable(result) {
   const rows = [
     ['manifest', 'version', 'status'],
     ...result.manifests.map((item) => [
+      item.name,
+      item.version ?? 'MISSING',
+      item.ok ? 'ok' : 'DIVERGENT',
+    ]),
+    ...result.releaseMetadata.map((item) => [
       item.name,
       item.version ?? 'MISSING',
       item.ok ? 'ok' : 'DIVERGENT',

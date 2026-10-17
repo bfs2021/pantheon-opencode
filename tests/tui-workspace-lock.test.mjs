@@ -106,6 +106,13 @@ export function findUnresolvedDeps(manifestDeps, lockPackages, block) {
 test('nested TUI lock stays in sync with the shipped TUI manifest', () => {
   const lockRoot = tuiLock.packages?.['']
   assert.ok(lockRoot, 'src/plugins/tui/package-lock.json must carry a packages[""] entry')
+  const rootWorkspace = rootLock.packages?.['src/plugins/tui']
+  assert.ok(rootWorkspace, 'package-lock.json must carry the TUI workspace package metadata')
+  assert.equal(
+    rootWorkspace.version,
+    tuiPkg.version,
+    'root lock TUI workspace version must match src/plugins/tui/package.json',
+  )
 
   for (const block of ['dependencies', 'devDependencies', 'peerDependencies']) {
     const divergence = compareDepBlock(tuiPkg[block], lockRoot[block], block)

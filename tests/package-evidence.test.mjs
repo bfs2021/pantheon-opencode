@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 const SCRIPT = fileURLToPath(new URL('../scripts/package-evidence.mjs', import.meta.url))
 const VERSION = '1.2.3'
 const TARGET_SHA = 'a'.repeat(40)
+const ENGINE_RANGE = '>=26.4.0'
 
 function writeFixtureFile(root, relativePath, content) {
   const path = join(root, relativePath)
@@ -26,15 +27,30 @@ function writeFixtureFile(root, relativePath, content) {
 }
 
 function fixtureDocuments() {
-  const packageJson = JSON.stringify({ name: 'pantheon-opencode', version: VERSION }, null, 2)
+  const packageJson = JSON.stringify(
+    { name: 'pantheon-opencode', version: VERSION, engines: { node: ENGINE_RANGE } },
+    null,
+    2,
+  )
   const pluginJson = JSON.stringify({ name: 'pantheon', version: VERSION }, null, 2)
-  const tuiJson = JSON.stringify({ name: 'pantheon-tui', version: VERSION }, null, 2)
+  const tuiJson = JSON.stringify(
+    { name: 'pantheon-tui', version: VERSION, engines: { node: ENGINE_RANGE } },
+    null,
+    2,
+  )
   const rootLock = JSON.stringify(
     {
       name: 'pantheon-opencode',
       version: VERSION,
       lockfileVersion: 3,
-      packages: { '': { name: 'pantheon-opencode', version: VERSION } },
+      packages: {
+        '': { name: 'pantheon-opencode', version: VERSION, engines: { node: ENGINE_RANGE } },
+        'src/plugins/tui': {
+          name: 'pantheon-tui',
+          version: VERSION,
+          engines: { node: ENGINE_RANGE },
+        },
+      },
     },
     null,
     2,
@@ -44,7 +60,9 @@ function fixtureDocuments() {
       name: 'pantheon-tui',
       version: VERSION,
       lockfileVersion: 3,
-      packages: { '': { name: 'pantheon-tui', version: VERSION } },
+      packages: {
+        '': { name: 'pantheon-tui', version: VERSION, engines: { node: ENGINE_RANGE } },
+      },
     },
     null,
     2,
@@ -52,6 +70,8 @@ function fixtureDocuments() {
   return {
     'package.json': `${packageJson}\n`,
     'plugin.json': `${pluginJson}\n`,
+    '.zenodo.json': `${JSON.stringify({ version: VERSION }, null, 2)}\n`,
+    'CITATION.cff': `cff-version: 1.2.0\nversion: ${VERSION}\n`,
     'pyproject.toml': `[project]\nname = "pantheon"\nversion = "${VERSION}"\n`,
     'package-lock.json': `${rootLock}\n`,
     'src/plugins/tui/package.json': `${tuiJson}\n`,
@@ -63,7 +83,9 @@ function makeFixture() {
   const root = mkdtempSync(join(tmpdir(), 'package-evidence-'))
   for (const [path, content] of Object.entries(fixtureDocuments())) {
     writeFixtureFile(root, path, content)
-    writeFixtureFile(root, join('package', path), content)
+    if (!['.zenodo.json', 'CITATION.cff'].includes(path)) {
+      writeFixtureFile(root, join('package', path), content)
+    }
   }
   for (const path of [
     'src/plugin.ts',
@@ -73,6 +95,8 @@ function makeFixture() {
     'src/plugins/tui/dist/server.js',
     'bin/pantheon-init.mjs',
     'scripts/doctor.mjs',
+    'scripts/node-engine-policy.mjs',
+    'scripts/validate-node-engine-policy.mjs',
     '.pantheon/code-mode/compress-inline.py',
   ]) {
     writeFixtureFile(root, join('package', path), 'fixture\n')

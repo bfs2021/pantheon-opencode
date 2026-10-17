@@ -59,6 +59,22 @@ function makeFixture({
   )
   writeFileSync(join(root, 'pyproject.toml'), TOML_FIXTURE.replace('1.1.0', pyproject))
   writeFileSync(join(root, 'plugin.json'), PLUGIN_FIXTURE.replace('1.1.0', plugin))
+  writeFileSync(
+    join(root, '.zenodo.json'),
+    `${JSON.stringify(
+      {
+        version: SOURCE_PKG,
+        description: `Release ${SOURCE_PKG}`,
+        url: `https://example.test/${SOURCE_PKG}`,
+      },
+      null,
+      2,
+    )}\n`,
+  )
+  writeFileSync(
+    join(root, 'CITATION.cff'),
+    `cff-version: 1.2.0\nversion: ${SOURCE_PKG}\nurl: https://example.test/${SOURCE_PKG}\nabstract: Pantheon ${SOURCE_PKG}\n`,
+  )
   const tuiDir = join(root, 'src', 'plugins', 'tui')
   mkdirSyncRecursive(tuiDir)
   writeFileSync(join(tuiDir, 'package.json'), TUI_PKG_FIXTURE.replace('1.2.0', tui))
@@ -71,6 +87,7 @@ function makeFixture({
         lockfileVersion: 3,
         packages: {
           '': { name: 'pantheon-opencode', version: rootLock, dependencies: { fixture: '^1.0.0' } },
+          'src/plugins/tui': { name: 'pantheon-tui', version: tui },
         },
         dependencies: { fixture: { version: '1.0.0', integrity: 'sha512-fixture-root' } },
       },
@@ -127,6 +144,53 @@ test('all manifests in sync → ok=true', () => {
   }
 })
 
+test('root workspace lock version must match the TUI package manifest', () => {
+  const root = makeFixture({ pyproject: SOURCE_PKG, plugin: SOURCE_PKG, tui: SOURCE_PKG })
+  try {
+    const lockPath = join(root, 'package-lock.json')
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'))
+    lock.packages['src/plugins/tui'].version = '1.2.0'
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`)
+    assert.equal(compareVersions(root).ok, false)
+    syncToSource(root)
+    assert.equal(compareVersions(root).ok, true)
+    assert.equal(
+      JSON.parse(readFileSync(lockPath, 'utf8')).packages['src/plugins/tui'].version,
+      SOURCE_PKG,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('release metadata versions and embedded release references sync with the package', () => {
+  const root = makeFixture()
+  try {
+    const zenodoPath = join(root, '.zenodo.json')
+    const zenodo = JSON.parse(readFileSync(zenodoPath, 'utf8'))
+    zenodo.version = '1.0.0'
+    zenodo.description = 'Release 1.0.0'
+    zenodo.url = 'https://example.test/1.0.0'
+    writeFileSync(zenodoPath, `${JSON.stringify(zenodo, null, 2)}\n`)
+    const citationPath = join(root, 'CITATION.cff')
+    writeFileSync(citationPath, readFileSync(citationPath, 'utf8').replaceAll(SOURCE_PKG, '1.0.0'))
+
+    assert.equal(compareVersions(root).ok, false)
+    syncToSource(root)
+    assert.equal(compareVersions(root).ok, true)
+    const syncedZenodo = JSON.parse(readFileSync(zenodoPath, 'utf8'))
+    assert.equal(syncedZenodo.version, SOURCE_PKG)
+    assert.equal(syncedZenodo.url, `https://example.test/${SOURCE_PKG}`)
+    assert.match(readFileSync(citationPath, 'utf8'), new RegExp(`version: ${SOURCE_PKG}`))
+    assert.match(
+      readFileSync(citationPath, 'utf8'),
+      new RegExp(`url: https://example.test/${SOURCE_PKG}`),
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('divergent manifests → ok=false with per-manifest flags', () => {
   const root = makeFixture() // pyproject 1.1.0, plugin 1.1.0, tui 1.2.0 vs source 1.2.1
   try {
@@ -160,7 +224,7 @@ test('syncToSource rewrites every divergent manifest to the source version', () 
   const root = makeFixture()
   try {
     const changed = syncToSource(root)
-    assert.equal(changed, 4, 'three manifests and the TUI lock must be rewritten')
+    assert.equal(changed, 5, 'three manifests and both locks must be rewritten')
     const result = compareVersions(root)
     assert.equal(result.ok, true)
     for (const m of result.manifests) assert.equal(m.version, SOURCE_PKG)
@@ -309,7 +373,7 @@ test('CLI --fix syncs all manifests to the source version and exits 0', () => {
   try {
     const { status, stdout } = runCli(['--fix'], root)
     assert.equal(status, 0)
-    assert.match(stdout, /Synced 4 metadata entries to v1\.2\.1/)
+    assert.match(stdout, /Synced 5 metadata entries to v1\.2\.1/)
     assert.equal(compareVersions(root).ok, true)
   } finally {
     rmSync(root, { recursive: true, force: true })

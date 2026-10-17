@@ -58,6 +58,18 @@ export const MANIFEST_INVENTORY = Object.freeze([
     valuePath: ['name'],
   }),
   Object.freeze({
+    id: 'zenodo-release-metadata',
+    role: 'metadata',
+    file: '.zenodo.json',
+    kind: 'json',
+  }),
+  Object.freeze({
+    id: 'citation-release-metadata',
+    role: 'metadata',
+    file: 'CITATION.cff',
+    kind: 'cff',
+  }),
+  Object.freeze({
     id: 'root-lock',
     role: 'lock',
     file: 'package-lock.json',
@@ -76,7 +88,7 @@ export const MANIFEST_INVENTORY = Object.freeze([
 ])
 
 export const VERSION_MANIFEST_INVENTORY = Object.freeze(
-  MANIFEST_INVENTORY.filter(({ role }) => role === 'manifest'),
+  MANIFEST_INVENTORY.filter(({ role }) => role !== 'lock'),
 )
 
 export const LOCK_INVENTORY = Object.freeze(
@@ -99,11 +111,18 @@ function readToml(file, text) {
   return parsed
 }
 
+function readCff(file, text) {
+  const match = /^version:\s*([^\s#]+)\s*(?:#.*)?$/m.exec(text)
+  if (!match) throw new Error(`${file} is missing top-level version metadata`)
+  return { version: match[1] }
+}
+
 function readDocument(root, entry) {
   const path = join(root, entry.file)
   if (!existsSync(path)) throw new Error(`manifest inventory file is missing: ${entry.file}`)
   const text = readFileSync(path, 'utf8')
   if (entry.kind === 'toml') return { entry, path, text, data: readToml(entry.file, text) }
+  if (entry.kind === 'cff') return { entry, path, text, data: readCff(entry.file, text) }
   let data
   try {
     data = JSON.parse(text)
@@ -175,6 +194,24 @@ function validateLock(document, manifestsByFile, allowVersionDivergence) {
   if (!allowVersionDivergence && rootPackage.version !== manifestVersionValue) {
     throw new Error(`${entry.file} packages[""] version diverges from ${entry.packageFile}`)
   }
+
+  if (entry.file === 'package-lock.json') {
+    const tuiManifest = manifestsByFile.get('src/plugins/tui/package.json')
+    const tuiWorkspace = data.packages?.['src/plugins/tui']
+    if (!tuiManifest) throw new Error('package-lock.json has no TUI workspace manifest partner')
+    if (!tuiWorkspace || typeof tuiWorkspace !== 'object' || Array.isArray(tuiWorkspace)) {
+      throw new Error('package-lock.json is missing packages["src/plugins/tui"]')
+    }
+    if (tuiWorkspace.name !== 'pantheon-tui') {
+      throw new Error('package-lock.json TUI workspace name must be pantheon-tui')
+    }
+    assertSemver(tuiWorkspace.version, 'package-lock.json TUI workspace version')
+    if (!allowVersionDivergence && tuiWorkspace.version !== manifestVersion(tuiManifest)) {
+      throw new Error(
+        'package-lock.json TUI workspace version diverges from src/plugins/tui/package.json',
+      )
+    }
+  }
 }
 
 /** Read and validate every entry before a caller is allowed to write anything. */
@@ -186,7 +223,7 @@ export function validateInventory(root, { allowVersionDivergence = false } = {})
       .map((document) => [document.entry.file, document]),
   )
   const versions = documents
-    .filter(({ entry }) => entry.role === 'manifest')
+    .filter(({ entry }) => entry.role === 'manifest' || entry.role === 'metadata')
     .map((document) => ({ file: document.entry.file, version: manifestVersion(document) }))
   documents.filter(({ entry }) => entry.role === 'manifest').forEach(manifestName)
   const sourceVersion = versions[0].version
@@ -309,8 +346,17 @@ function replaceTomlProjectVersion(text, version, file) {
 
 function prepareDocumentVersion(document, version) {
   const { entry, text } = document
+  if (entry.role === 'metadata') {
+    const current = manifestVersion(document)
+    return text.split(current).join(version)
+  }
   if (entry.kind === 'toml') return replaceTomlProjectVersion(text, version, entry.file)
-  const paths = entry.role === 'lock' ? [['version'], ['packages', '', 'version']] : [['version']]
+  const paths =
+    entry.role === 'lock'
+      ? entry.file === 'package-lock.json'
+        ? [['version'], ['packages', '', 'version'], ['packages', 'src/plugins/tui', 'version']]
+        : [['version'], ['packages', '', 'version']]
+      : [['version']]
   return replaceJsonStringValues(text, paths, version, entry.file)
 }
 

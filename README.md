@@ -27,20 +27,37 @@ way to plan work, make progress, check results, and keep useful project context.
   collaborators.
 - **You stay in charge:** Pantheon supports your decisions; it does not replace
   your judgment or your review of generated code.
+- **Right-sized coordination:** bounded work goes to the correct specialist;
+  planning, discovery, parallel work, and review are added when scope and risk
+  call for them. `/pantheon-deepwork` remains the checkpointed workflow for
+  heavy multi-phase work.
 
 ## Start in 2 minutes
 
 Requirements: [OpenCode 1.18.4+](https://opencode.ai/docs/) and Node.js
-22.22.2+ (or 24.15.0+ / 26+). For which OpenCode generation each Pantheon
-release line supports, see
+26.4.0+ for the Pantheon CLI, installer, and Node-based tooling. For which
+OpenCode generation each Pantheon release line supports, see
 [Compatibility and support policy](#compatibility-and-support-policy).
 
-Pantheon declares `engines.node` as `^22.22.2 || ^24.15.0 || >=26.0.0`. The
-floor reflects what the dependency tree actually needs — the transitive
-`ini@7` rejects earlier 22.x/24.x builds with `EBADENGINE` — and odd-numbered
-Node releases (23, 25) are out of range. The `pantheon_cost` tool also needs
-`node:sqlite`, which requires Node >= 22.5; `doctor` warns when the running
-runtime cannot load it.
+Pantheon declares `engines.node` as `>=26.4.0`; Node 22, Node 24, and Node
+26.0–26.3 are not supported by this release. This package floor does not imply
+that every OpenCode host runs on Node: official OpenCode V2.0.31 has a Bun
+runtime path and a separate Node build pinned to Node 26.4.0. No Bun minimum is
+asserted here. The optional `pantheon_cost` SQLite backend has its own capability
+threshold, `node:sqlite` on Node >= 22.5; that feature threshold does not lower
+Pantheon's package or CLI support floor.
+
+With npm's default configuration, an unsupported Node version may produce an
+`EBADENGINE` warning during install. Pantheon's postinstall then skips Node-based
+sync without changing OpenCode configuration, and the CLI itself exits with a
+clear error before setup. If needed, switch using a user-managed version
+manager—no system-wide install is required:
+
+```bash
+nvm install 26.4.0 && nvm use 26.4.0
+# or: fnm install 26.4.0 && fnm use 26.4.0
+# or: volta install node@26.4.0
+```
 
 From the project where you want to use Pantheon:
 
@@ -49,9 +66,31 @@ npx pantheon-opencode init
 opencode
 ```
 
-The installer guides you through the available setup. For optional MCP servers,
+In a TTY, the interactive setup uses Clack prompts to choose components and a
+global or project location before reviewing the apply. Canceling writes nothing.
+`--yes`, `--headless`, `--dry-run`, and non-TTY workflows retain their existing
+behavior. The installer guides you through the available setup. For optional MCP servers,
 project-local installation, or non-interactive setup, see the
 [installation guide](docs/INSTALLATION.md).
+
+In the interactive **V1 model setup**, the profile choices are **Inherit**,
+**OpenCode Go**, **OpenAI**, and **Anthropic**. OpenCode Go saves the internal
+`go-hybrid` profile (premium routes for Zeus, Athena, Themis, and Hephaestus;
+the existing fast Go routes for the other agents). Anthropic uses
+`anthropic/claude-sonnet-5-5`; configure `ANTHROPIC_API_KEY` in your environment
+yourself. The installer does not read or validate API keys or contact provider
+catalogs. Legacy `go-free`, `go-fast`, and `go-premium` presets remain available
+for existing saved settings and explicit `--preset` use. V2 continues to ignore
+static presets and uses explicit per-agent model overrides instead.
+
+In an interactive TTY setup summary, Pantheon recommends the persistent
+external worktree location
+`<project-parent>/.pantheon-worktrees/<exact-repository-directory-basename>/<task>`
+(for example, `/home/user/.pantheon-worktrees/My Project/feature-name`). Use the
+project directory's exact basename, including spaces; do not normalize it into
+a slug. This is guidance for future agent work only; Pantheon does not create
+Git worktrees or directories automatically. See the shipped
+[worktrees skill](src/skills/worktrees/SKILL.md) for the agent workflow.
 
 A non-interactive apply requires `--yes` (alias `-y`): without a TTY and
 without `--yes`, `init` prints the change plan and applies nothing. Exit codes:
@@ -286,7 +325,7 @@ available.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PANTHEON_NODE` | `node` from `PATH` | Path to a Node.js >= 22.5 binary used by the CLI fallback; an explicit path must exist and be executable, otherwise the tool fails fast instead of ignoring the override |
+| `PANTHEON_NODE` | `node` from `PATH` | Path to a Node.js >= 22.5 binary used only for the `node:sqlite` capability in the CLI fallback; this is not the Pantheon package support floor. An explicit path must exist and be executable, otherwise the tool fails fast instead of ignoring the override |
 
 Tool interpretation matters: `pantheon_model status` reports configuration, not the model serving a completion. V2 manual model overrides are project-only; global override files are neither read nor applied, and global mutation is unsupported until a future surface can obtain separate explicit human authorization. V2 ignores static presets and applies only explicit per-agent project model/variant overrides, leaving the host default unchanged otherwise; V1 preset behavior remains legacy pending compatibility decisions. `pantheon_cost` is a rolling token aggregate, not a session-level or monetary cost report. See the [OpenCode plugin tool notes](docs/mcp-tools.md#opencode-plugin-tools) for details and measurement limits.
 
@@ -880,7 +919,7 @@ or whole-file binary classification. The host-backed evidence is in
 
 `npm run coverage:plugin-v2` runs the `tests/pantheon/*.test.ts` suite with
 Node's source-mapped native coverage and enforces an 80% line-coverage minimum
-for `src/plugin-v2.ts` only. It requires Node `v24.15.0`; branch and function
+for `src/plugin-v2.ts` only. It requires Node `>=26.4.0`; branch and function
 coverage are reported but are not gates. This is not a repository-wide coverage
 claim.
 

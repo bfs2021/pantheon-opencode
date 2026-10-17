@@ -15,6 +15,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveOpenCodeVersion } from './install/opencode-version.mjs'
+import { isSupportedNodeVersion } from './node-engine-policy.mjs'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const ROOT = join(__dirname, '..')
@@ -257,7 +258,10 @@ async function main() {
 const isDirectRun =
   Boolean(process.argv[1]) && pathToFileURL(process.argv[1]).href === import.meta.url
 
-if (isDirectRun) {
+if (isDirectRun && !isSupportedNodeVersion(process.versions.node)) {
+  // postinstall.mjs already reports the engine mismatch. Do not call npm ci or
+  // touch the user's config with an incompatible lifecycle runtime.
+} else if (isDirectRun) {
   main().catch((err) => {
     console.error(`❌ TUI sync failed: ${err.message}`)
     process.exitCode = 1

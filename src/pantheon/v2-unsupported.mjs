@@ -21,9 +21,8 @@
  * So a `.mjs` import is the only form all three consumers can share, and it
  * matches the existing `src/pantheon/presets.mjs` + `.d.mts` precedent.
  *
- * NOT the reason: type-stripping. `package.json#engines` admits
- * `^22.22.2 || ^24.15.0 || >=26.0.0`, every admitted version already defaults to
- * unflagged type-stripping (it landed in 22.18.0), so that argument would not
+ * NOT the reason: type-stripping. `package.json#engines` admits Node >=26.4.0,
+ * which defaults to unflagged type-stripping (it landed in 22.18.0), so that argument would not
  * have held on any admitted version. The live hazard is that `engines` is not
  * ENFORCED: a Node 20 user can run `doctor` and would get no type-stripping,
  * which is an argument for a runtime version check, not for this file's shape.

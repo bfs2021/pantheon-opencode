@@ -1,6 +1,6 @@
 {
   "name": "pantheon-opencode",
-  "version": "1.6.0-beta.11",
+  "version": "1.6.0-beta.14",
   "description": "Multi-agent orchestration for OpenCode — 14 specialized agents, TDD, Themis review gates.",
   "type": "module",
   "workspaces": [
@@ -33,7 +33,8 @@
     "version:check": "node scripts/version-check.mjs",
     "release:dry-run": "node scripts/versioning.mjs status && node scripts/release-notes.mjs && node scripts/package-evidence.mjs",
     "package:evidence": "node scripts/package-evidence.mjs",
-    "package:validate": "node scripts/validate-package.mjs",
+    "engine:check": "node scripts/validate-node-engine-policy.mjs",
+    "package:validate": "node scripts/validate-package.mjs && npm run engine:check",
     "lint": "biome ci .",
     "typecheck": "tsc --noEmit",
     "audit": "npm audit --audit-level=high",
@@ -98,6 +99,7 @@
     "!**/*.pyc"
   ],
   "dependencies": {
+    "@clack/prompts": "1.8.1",
     "@opencode-ai/plugin": "1.18.33",
     "js-yaml": "^5.4.2",
     "zod": "4.1.8",
@@ -138,7 +140,7 @@
   "author": "ils15",
   "license": "MIT",
   "engines": {
-    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+    "node": ">=26.4.0"
   },
   "preferGlobal": true
 }

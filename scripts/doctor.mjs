@@ -32,6 +32,7 @@ import { fileURLToPath } from 'node:url'
 import { listV2UnsupportedFeatures } from '../src/pantheon/v2-unsupported.mjs'
 import { classifyFileInventory } from './install/file-inventory.mjs'
 import { readState } from './install/state.mjs'
+import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_VERSION } from './node-engine-policy.mjs'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -140,14 +141,14 @@ function emit(category, message, metadata = {}) {
   console.log(`  ${prefix} ${message}`)
 }
 
-function pass(msg) {
-  emit('pass', msg)
+function pass(msg, metadata = {}) {
+  emit('pass', msg, metadata)
 }
 function warn(msg, metadata = {}) {
   emit('warn', msg, metadata)
 }
-function error(msg) {
-  emit('error', msg)
+function error(msg, metadata = {}) {
+  emit('error', msg, metadata)
   exitCode = 2
 }
 function info(msg) {
@@ -1853,13 +1854,47 @@ export function classifyNodeSqliteProbe(probe) {
   }
 }
 
+/** Classify the Node package-support policy independently of feature probes. */
+export function classifyNodePackageRuntime(version) {
+  if (isSupportedNodeVersion(version)) {
+    return {
+      status: 'supported',
+      code: 'node_version_supported',
+      message: `Node.js v${String(version).replace(/^v/, '')} meets Pantheon's package requirement (>= ${MIN_SUPPORTED_NODE_VERSION})`,
+    }
+  }
+  return {
+    status: 'unsupported',
+    code: 'node_version_unsupported',
+    message: `Pantheon requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION}; current runtime is v${String(version).replace(/^v/, '')}`,
+  }
+}
+
 function checkNodeRuntime() {
   section('K. Node Runtime')
+  const packageRuntime = classifyNodePackageRuntime(process.versions.node)
+  if (packageRuntime.status === 'supported') {
+    pass(packageRuntime.message, {
+      code: packageRuntime.code,
+      classification: 'runtime',
+    })
+  } else {
+    error(packageRuntime.message, { code: packageRuntime.code, classification: 'runtime' })
+  }
+
+  // This capability check is independent of the package support floor: it
+  // describes pantheon_cost's optional backend, not Pantheon's Node support.
   const outcome = classifyNodeSqliteProbe(probeNodeSqlite())
   if (outcome.status === 'ok') {
-    pass(outcome.message)
+    pass(outcome.message, {
+      code: 'node_sqlite_supported',
+      classification: 'capability',
+    })
   } else {
-    warn(outcome.message)
+    warn(outcome.message, {
+      code: 'node_sqlite_unsupported',
+      classification: 'capability',
+    })
     info(
       `Upgrade to Node >= ${NODE_SQLITE_MIN} (or a runtime with node:sqlite) to enable pantheon_cost`,
     )

@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { validateInventory } from './manifest-inventory.mjs'
+import { validateNodeEnginePolicy } from './node-engine-policy.mjs'
 
 const CI_ARGS = ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund']
 const REQUIRED_PAYLOAD = [
@@ -32,6 +33,8 @@ const REQUIRED_PAYLOAD = [
   'package/src/plugins/tui/dist/server.js',
   'package/bin/pantheon-init.mjs',
   'package/scripts/doctor.mjs',
+  'package/scripts/node-engine-policy.mjs',
+  'package/scripts/validate-node-engine-policy.mjs',
   'package/.pantheon/code-mode/compress-inline.py',
 ]
 
@@ -132,6 +135,7 @@ function validatePayload(packageRoot, inventory) {
   }
   for (const document of inventory.documents) {
     const { entry, path: sourcePath } = document
+    if (entry.role === 'metadata') continue
     const packagedPath = join(packageRoot, entry.file)
     if (entry.role === 'lock' && entry.file === 'package-lock.json' && !existsSync(packagedPath)) {
       // npm-packlist excludes the package root lockfile by policy. It remains
@@ -181,6 +185,8 @@ function sha256(path) {
 
 export function createPackageEvidence(root, { outputDir, targetSha } = {}) {
   const inventory = validateInventory(root)
+  const engineErrors = validateNodeEnginePolicy(root)
+  if (engineErrors.length) fail(engineErrors.join('; '))
   const sha = resolveTargetSha(root, targetSha)
   const output = createOutputDirectory(outputDir)
   let workDir

@@ -5,18 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
-## [Unreleased]
+## [v1.6.0-beta.14] - Unreleased
 
-<!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. -->
+_Pre-release candidate; not yet published._
 
 ## 🆕 What's New
 
+- **Installer model profiles:** choose Inherit, OpenCode Go (hybrid), OpenAI, or
+  Anthropic. Inherit leaves the active preset unset; OpenCode Go combines the
+  premium lineup for Zeus, Athena, Themis, and Hephaestus with the Go lineup for
+  other agents. Existing `go-free`, `go-fast`, and `go-premium` preset IDs remain
+  available for compatibility.
+- **Anthropic key guidance:** the profile identifies `ANTHROPIC_API_KEY` as the
+  required environment variable. The installer does not collect or inspect API
+  keys; configure the key in your environment.
+- **Modernized installer progress and terminal safety:** Clack spinners are used
+  in interactive TTYs, with readable output in headless/non-TTY runs. Canceling
+  or selecting no components stops safely without writes; `--no-mcp` continues
+  to exclude runtime, and `--yes` does not override an explicit decline.
+- **Proportional delegation guidance:** prompts now route bounded work directly
+  to the relevant specialist and call for planning, broad discovery, review, or
+  parallel work only when the request, uncertainty, dependencies, or risk
+  warrant it.
+
 ## 🐞 Fixed
 
-## ⚠️ Known Issues
+- **Reduce duplicated CI work:** plugin V2 coverage now measures one focused
+  TypeScript contract test while retaining its required 80% line-coverage
+  threshold. The hook canary has one CI owner (`test:node`); its duplicate
+  standalone CI invocation was removed. This records the CI configuration
+  change, not a claim that the current CI run passed.
 
-## ✅ Closed Issues
+## [v1.6.0-beta.13] - 2026-10-17
+
+## 🆕 What's New
+
+- **Modernize interactive TTY setup** with `@clack/prompts` while keeping the
+  existing component, install-location, authorization, and worktree guidance
+  choices. Canceling the setup wizard leaves configuration unchanged; headless,
+  `--yes`, dry-run, and non-TTY behavior remain available.
+
+## 🐞 Fixed
+
+- **Let npm finish on an unsupported Node runtime:** postinstall now warns and
+  skips Node-dependent TUI/config sync, leaving the CLI to show its explicit
+  Node >=26.4.0 hard gate and user-managed upgrade instructions.
+- **Synchronize Beta 13 package and release metadata** across manifests and
+  lockfiles without changing the Node >=26.4.0 engine floor.
+
+## [v1.6.0-beta.12] - 2026-10-17
+
+## 🆕 What's New
+
+- **Raise the Node.js support floor to 26.4.0** for the package, CLI, installer,
+  and Node-based tooling. This release drops Node 22, Node 24, and Node
+  26.0–26.3; the npm `beta` dist-tag remains the intended publication channel.
+- **Clarify runtime boundaries:** this package requirement is not a universal
+  OpenCode host-runtime claim. Official OpenCode V2.0.31 has a Bun runtime path
+  and a separate Node build pinned to 26.4.0; no Bun minimum is asserted.
+- **Keep `node:sqlite` as a separate capability threshold:** Node >=22.5 may
+  provide the optional `pantheon_cost` backend, but does not imply package
+  support on that Node version.
+- **Recommend a persistent external Git worktree location** in interactive TTY
+  setup summaries and the shipped worktrees skill. This is guidance only;
+  Pantheon does not create worktrees or directories automatically.
+
+## 🐞 Fixed
+
+- **Synchronize Beta 12 version metadata and Node engine policy** across package
+  manifests, locks, citation/release metadata, CLI guards, doctor, and CI.
 
 ## [v1.6.0-beta.11] - 2026-10-15
 
