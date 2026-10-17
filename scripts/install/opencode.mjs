@@ -63,6 +63,7 @@ import {
 } from './plan.mjs'
 import { findPlanDrift } from './plan-artifact.mjs'
 import { copyPluginFiles, installPlugin, registerPlugin, unregisterPlugin } from './plugin.mjs'
+import { PROMPT_CANCELED } from './prompt-result.mjs'
 import {
   checkRuntimePrerequisites,
   collectSkillNames,
@@ -1152,7 +1153,14 @@ async function installPass(
     const result = await runInteractiveInstall({
       components,
       defaultComponents: COMPONENT_NAMES,
+      prompts: opts.deps?.prompts,
+      isTTY: opts.deps?.isTTY,
     })
+
+    if (result.canceled) {
+      info('Installation canceled.')
+      return { ...stats, applied: false, reason: 'canceled' }
+    }
 
     if (!result.confirmed && !autoYes) {
       info('Installation canceled.')
@@ -1266,7 +1274,13 @@ async function installPass(
         const ask = typeof injected === 'function' ? injected : promptReview
         const accepted = await ask(`Apply these ${planned?.planned ?? 0} changes?`, {
           default: false,
+          prompts: opts.deps?.prompts,
+          isTTY: opts.deps?.isTTY,
         })
+        if (accepted === PROMPT_CANCELED) {
+          info(S.nothingApplied)
+          return { ...stats, applied: false, reason: 'canceled' }
+        }
         if (!accepted) {
           info(S.nothingApplied)
           return { ...stats, applied: false, reason: 'declined' }

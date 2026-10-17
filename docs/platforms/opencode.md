@@ -1,6 +1,6 @@
 # Pantheon for OpenCode
 
-Complete setup and usage guide for running Pantheon **v1.6.0-beta.12** in [OpenCode](https://opencode.ai) — the open-source AI coding agent for the terminal, desktop, and IDE.
+Complete setup and usage guide for running Pantheon **v1.6.0-beta.13** in [OpenCode](https://opencode.ai) — the open-source AI coding agent for the terminal, desktop, and IDE.
 
 ---
 
@@ -17,6 +17,12 @@ OpenCode V2.0.31 has a Bun runtime path and a separate Node build pinned to
 26.4.0; no Bun minimum is stated. The optional `pantheon_cost` backend's
 `node:sqlite` threshold (Node >=22.5) is a separate capability, not package
 support.
+
+With npm's default configuration, an incompatible Node version may produce an
+`EBADENGINE` warning; Pantheon's postinstall skips Node/config sync, and its CLI
+then hard-stops with an explicit version message before setup writes. Use a
+user-managed version manager to switch to Node 26.4.0; see the
+[installation guide](../INSTALLATION.md) for nvm, fnm, and Volta commands.
 
 ---
 

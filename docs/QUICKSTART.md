@@ -4,14 +4,14 @@
 
 A multi-agent framework for **OpenCode**. It provides 14 specialized agents,
 TDD enforcement, Themis quality gates, and persistent memory MCP. The current
-release candidate is **v1.6.0-beta.12**, compatible with OpenCode 2.
+release candidate is **v1.6.0-beta.13**, compatible with OpenCode 2.
 
 ## Installation
 
 ### Quick install (recommended)
 
 ```bash
-# Interactive (default TTY) — component selection, progress spinners
+# Interactive TTY setup (Clack component/location prompts, then progress display)
 npx pantheon-opencode init
 
 # Headless mode — for CI and scripts (non-interactive apply requires --yes)

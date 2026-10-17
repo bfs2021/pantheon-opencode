@@ -26,9 +26,10 @@ import {
   loadPlanArtifact,
   savePlanArtifact,
 } from '../scripts/install/plan-artifact.mjs'
+import { PROMPT_CANCELED } from '../scripts/install/prompt-result.mjs'
 import {
   isSupportedNodeVersion,
-  MIN_SUPPORTED_NODE_VERSION,
+  unsupportedNodeVersionMessage,
 } from '../scripts/node-engine-policy.mjs'
 import { runUpdate } from '../scripts/update.mjs'
 
@@ -36,10 +37,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 
 if (!isSupportedNodeVersion(process.versions.node)) {
-  console.error(
-    `❌ Pantheon requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (current: ${process.versions.node})`,
-  )
-  console.error('   Install a newer Node via nvm: https://github.com/nvm-sh/nvm')
+  console.error(unsupportedNodeVersionMessage(process.versions.node))
   process.exit(1)
 }
 
@@ -111,14 +109,8 @@ async function authorizeReviewedPlan(plan) {
   for (const operation of operations) {
     console.log(`  ${operation.action.padEnd(9)} ${operation.path}`)
   }
-  const readline = await import('node:readline/promises')
-  const prompt = readline.createInterface({ input: process.stdin, output: process.stdout })
-  try {
-    const answer = await prompt.question('Apply this reviewed plan? [y/N] ')
-    return ['y', 'yes'].includes(answer.trim().toLowerCase())
-  } finally {
-    prompt.close()
-  }
+  const { promptReview } = await import('../scripts/install/interactive.mjs')
+  return promptReview('Apply this reviewed plan?', { default: false })
 }
 
 async function main() {
@@ -490,8 +482,14 @@ async function main() {
 
     if (reviewedPlan && !autoYes) {
       if (!forceHeadless && process.stdin.isTTY && process.stdout.isTTY) {
-        if (!(await authorizeReviewedPlan(reviewedPlan))) {
+        const authorization = await authorizeReviewedPlan(reviewedPlan)
+        if (authorization === PROMPT_CANCELED) {
           console.log('❌ Install canceled; no files were written.')
+          process.exitCode = 130
+          return
+        }
+        if (!authorization) {
+          console.log('❌ Install declined; no files were written.')
           return
         }
       } else {

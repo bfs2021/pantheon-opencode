@@ -43,6 +43,18 @@ asserted here. The optional `pantheon_cost` SQLite backend has its own capabilit
 threshold, `node:sqlite` on Node >= 22.5; that feature threshold does not lower
 Pantheon's package or CLI support floor.
 
+With npm's default configuration, an unsupported Node version may produce an
+`EBADENGINE` warning during install. Pantheon's postinstall then skips Node-based
+sync without changing OpenCode configuration, and the CLI itself exits with a
+clear error before setup. If needed, switch using a user-managed version
+manager—no system-wide install is required:
+
+```bash
+nvm install 26.4.0 && nvm use 26.4.0
+# or: fnm install 26.4.0 && fnm use 26.4.0
+# or: volta install node@26.4.0
+```
+
 From the project where you want to use Pantheon:
 
 ```bash
@@ -50,7 +62,10 @@ npx pantheon-opencode init
 opencode
 ```
 
-The installer guides you through the available setup. For optional MCP servers,
+In a TTY, the interactive setup uses Clack prompts to choose components and a
+global or project location before reviewing the apply. Canceling writes nothing.
+`--yes`, `--headless`, `--dry-run`, and non-TTY workflows retain their existing
+behavior. The installer guides you through the available setup. For optional MCP servers,
 project-local installation, or non-interactive setup, see the
 [installation guide](docs/INSTALLATION.md).
 

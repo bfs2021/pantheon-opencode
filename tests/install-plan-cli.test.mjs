@@ -16,6 +16,7 @@ import { dirname, join, relative } from 'node:path'
 import { test } from 'node:test'
 
 const CLI = join(process.cwd(), 'bin', 'pantheon-init.mjs')
+const HAS_SCRIPT = spawnSync('script', ['--version'], { encoding: 'utf8' }).status === 0
 
 function run(cwd, ...args) {
   return spawnSync(process.execPath, [CLI, 'init', ...args], {
@@ -45,6 +46,43 @@ function runAsync(cwd, ...args) {
     child.stderr.setEncoding('utf8').on('data', (chunk) => (stderr += chunk))
     child.once('error', reject)
     child.once('close', (status) => resolve({ status, stdout, stderr }))
+  })
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`
+}
+
+function runInteractiveInput(cwd, input, ...args) {
+  return new Promise((resolve, reject) => {
+    const command = [process.execPath, CLI, 'init', ...args].map(shellQuote).join(' ')
+    const child = spawn('script', ['-q', '-e', '-c', `exec ${command}`, '/dev/null'], {
+      cwd,
+      env: { ...process.env, HOME: cwd, XDG_CONFIG_HOME: join(cwd, '.config') },
+    })
+    let stdout = ''
+    let stderr = ''
+    let sentInput = false
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error(`Timed out waiting for apply authorization prompt. Output: ${stdout}`))
+    }, 15_000)
+    child.stdout.setEncoding('utf8').on('data', (chunk) => {
+      stdout += chunk
+      if (!sentInput && stdout.includes('Reviewed plan:')) {
+        sentInput = true
+        setTimeout(() => child.stdin.write(input), 300)
+      }
+    })
+    child.stderr.setEncoding('utf8').on('data', (chunk) => (stderr += chunk))
+    child.once('error', (error) => {
+      clearTimeout(timeout)
+      reject(error)
+    })
+    child.once('close', (status) => {
+      clearTimeout(timeout)
+      resolve({ status, stdout, stderr, sentInput })
+    })
   })
 }
 
@@ -108,6 +146,54 @@ test('saved plan has mode 0600 and unauthorized apply writes nothing', () => {
     assert.equal(result.status, 2)
     assert.equal(existsSync(join(target, 'agents')), false)
     assert.equal(existsSync(join(target, '.pantheon', 'backups')), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('canceling interactive --apply-plan exits 130 and leaves the target unchanged', {
+  skip: !HAS_SCRIPT,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pantheon-install-plan-cancel-'))
+  try {
+    const { target, plan } = savePlan(root)
+    const sentinel = join(target, 'user-sentinel.txt')
+    writeFileSync(sentinel, 'keep this file\n')
+    const before = readdirSync(target).sort()
+
+    const result = await runInteractiveInput(target, '\x03', '--apply-plan', plan)
+
+    assert.equal(result.sentInput, true, result.stdout)
+    assert.equal(result.status, 130, result.stderr || result.stdout)
+    assert.match(result.stdout, /Installation canceled\./)
+    assert.equal(readFileSync(sentinel, 'utf8'), 'keep this file\n')
+    assert.deepEqual(readdirSync(target).sort(), before)
+    assert.equal(existsSync(join(target, '.opencode')), false)
+    assert.equal(existsSync(join(target, 'opencode.json')), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('declining interactive --apply-plan exits successfully and leaves the target unchanged', {
+  skip: !HAS_SCRIPT,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pantheon-install-plan-decline-'))
+  try {
+    const { target, plan } = savePlan(root)
+    const sentinel = join(target, 'user-sentinel.txt')
+    writeFileSync(sentinel, 'keep this file\n')
+    const before = readdirSync(target).sort()
+
+    const result = await runInteractiveInput(target, '\r', '--apply-plan', plan)
+
+    assert.equal(result.sentInput, true, result.stdout)
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    assert.match(result.stdout, /Install declined; no files were written\./)
+    assert.equal(readFileSync(sentinel, 'utf8'), 'keep this file\n')
+    assert.deepEqual(readdirSync(target).sort(), before)
+    assert.equal(existsSync(join(target, '.opencode')), false)
+    assert.equal(existsSync(join(target, 'opencode.json')), false)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

@@ -1,6 +1,6 @@
-# Pantheon Installation Guide — v1.6.0-beta.12 (OpenCode 2)
+# Pantheon Installation Guide — v1.6.0-beta.13 (OpenCode 2)
 
-Pantheon v1.6.0-beta.12 is **OpenCode 2-compatible**. `npx pantheon-opencode init` instala a geração selecionada. A seleção interativa de perfil/preset (3 perguntas; default = herdar do chat) é o caminho legado V1, não uma rota de modelo V2. No V2, `pantheon_model` oferece somente `status`, `show`, `set` e `reset` manuais, sem wizard de presets: o default do host fica intacto sem override explícito por agente; markers `preset` e `PANTHEON_MODEL_PRESET` são ignorados e preservados. Herança nativa para delegates: sem preset, os filhos herdam o modelo do chat pai no caminho V1. As tabelas dos presets abaixo são referência V1 legada e derivadas de `src/routing.yml` (sem hardcodar segredos: só nomes de variáveis e `baseURL`s).
+Pantheon v1.6.0-beta.13 é **compatível com OpenCode 2**. `npx pantheon-opencode init` instala a geração selecionada. A seleção interativa de perfil/preset (3 perguntas; default = herdar do chat) é o caminho legado V1, não uma rota de modelo V2. No V2, `pantheon_model` oferece somente `status`, `show`, `set` e `reset` manuais, sem wizard de presets: o default do host fica intacto sem override explícito por agente; markers `preset` e `PANTHEON_MODEL_PRESET` são ignorados e preservados. Herança nativa para delegates: sem preset, os filhos herdam o modelo do chat pai no caminho V1. As tabelas dos presets abaixo são referência V1 legada e derivadas de `src/routing.yml` (sem hardcodar segredos: só nomes de variáveis e `baseURL`s).
 
 ## TL;DR (Quick Start)
 
@@ -18,9 +18,17 @@ npm run setup
 npm run doctor
 ```
 
-- Requisitos: **Node.js >=26.4.0** para a CLI/instalador/ferramentas Node do Pantheon, **OpenCode v1.18.4+**, **Python 3.11+** (opcional, MCP servers). Node 22, Node 24 e Node 26.0–26.3 não são compatíveis com Beta 12.
+- Requisitos: **Node.js >=26.4.0** para a CLI/instalador/ferramentas Node do Pantheon, **OpenCode v1.18.4+**, **Python 3.11+** (opcional, MCP servers). Node 22, Node 24 e Node 26.0–26.3 não são compatíveis com Beta 13.
+- Com a configuração padrão do npm, versões incompatíveis podem gerar `EBADENGINE` como aviso durante a instalação. O postinstall do Pantheon então pula a sincronização Node/config e permite que o pacote termine de instalar; a CLI bloqueia a configuração com uma mensagem explícita antes de gravar arquivos. `engine-strict=true` pode fazer o próprio npm interromper a instalação. Para atualizar sem instalação global/system-wide, use um gerenciador de Node do usuário:
+
+  ```bash
+  nvm install 26.4.0 && nvm use 26.4.0
+  # ou: fnm install 26.4.0 && fnm use 26.4.0
+  # ou: volta install node@26.4.0
+  ```
 - Isso não pressupõe um runtime Node universal para o host OpenCode: o OpenCode V2.0.31 oficial tem um caminho de runtime Bun e um build Node separado fixado em Node 26.4.0; nenhum mínimo de Bun é declarado. `node:sqlite` >=22.5 é apenas um limite de capacidade do backend opcional `pantheon_cost`, não o requisito de suporte do pacote.
 - No resumo de uma configuração interativa em TTY, o instalador recomenda um local persistente externo para futuros worktrees: `<project-parent>/.pantheon-worktrees/<exact-repository-directory-basename>/<task>` (por exemplo, `/home/user/.pantheon-worktrees/My Project/feature-name`). Use o nome exato do diretório do projeto, incluindo espaços; não o normalize como slug. A recomendação é apenas orientação para agentes; o Pantheon não cria worktrees Git nem diretórios automaticamente.
+- A configuração interativa em TTY usa prompts Clack para selecionar componentes, escolher instalação global/projeto e confirmar a revisão antes de aplicar. Cancelar não altera a configuração. `--yes`, `--headless`, `--dry-run` e os caminhos sem TTY mantêm seus comportamentos.
 - Delegação e modo background dependem das ferramentas expostas pela versão/runtime do host. Na sessão Beta 10 reportada, Zeus tinha a ferramenta `subagent`, sem `task_status`/`cancel_task` ou garantia de acompanhamento/recuperação. Verifique o schema e a documentação do runtime; não presuma que `task()` ou background estejam disponíveis. A variável experimental abaixo só se aplica a hosts/versões que a documentem.
 - Passo a passo de 5 minutos: [QUICKSTART.md](QUICKSTART.md).
 

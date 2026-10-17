@@ -19,12 +19,14 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_VERSION } from '../node-engine-policy.mjs'
+import {
+  isSupportedNodeVersion,
+  MIN_SUPPORTED_NODE_VERSION,
+  unsupportedNodeVersionMessage,
+} from '../node-engine-policy.mjs'
 
 if (!isSupportedNodeVersion(process.versions.node)) {
-  console.error(
-    `❌ Pantheon requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (current: ${process.versions.node})`,
-  )
+  console.error(unsupportedNodeVersionMessage(process.versions.node))
   process.exit(1)
 }
 

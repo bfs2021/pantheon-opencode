@@ -18,6 +18,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## ✅ Closed Issues
 
+## [v1.6.0-beta.13] - 2026-10-17
+
+## 🆕 What's New
+
+- **Modernize interactive TTY setup** with `@clack/prompts` while keeping the
+  existing component, install-location, authorization, and worktree guidance
+  choices. Canceling the setup wizard leaves configuration unchanged; headless,
+  `--yes`, dry-run, and non-TTY behavior remain available.
+
+## 🐞 Fixed
+
+- **Let npm finish on an unsupported Node runtime:** postinstall now warns and
+  skips Node-dependent TUI/config sync, leaving the CLI to show its explicit
+  Node >=26.4.0 hard gate and user-managed upgrade instructions.
+- **Synchronize Beta 13 package and release metadata** across manifests and
+  lockfiles without changing the Node >=26.4.0 engine floor.
+
 ## [v1.6.0-beta.12] - 2026-10-17
 
 ## 🆕 What's New
