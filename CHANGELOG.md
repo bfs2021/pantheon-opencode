@@ -18,6 +18,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## ✅ Closed Issues
 
+## [v1.6.0-beta.12] - 2026-10-17
+
+## 🆕 What's New
+
+- **Raise the Node.js support floor to 26.4.0** for the package, CLI, installer,
+  and Node-based tooling. This release drops Node 22, Node 24, and Node
+  26.0–26.3; the npm `beta` dist-tag remains the intended publication channel.
+- **Clarify runtime boundaries:** this package requirement is not a universal
+  OpenCode host-runtime claim. Official OpenCode V2.0.31 has a Bun runtime path
+  and a separate Node build pinned to 26.4.0; no Bun minimum is asserted.
+- **Keep `node:sqlite` as a separate capability threshold:** Node >=22.5 may
+  provide the optional `pantheon_cost` backend, but does not imply package
+  support on that Node version.
+- **Recommend a persistent external Git worktree location** in interactive TTY
+  setup summaries and the shipped worktrees skill. This is guidance only;
+  Pantheon does not create worktrees or directories automatically.
+
+## 🐞 Fixed
+
+- **Synchronize Beta 12 version metadata and Node engine policy** across package
+  manifests, locks, citation/release metadata, CLI guards, doctor, and CI.
+
 ## [v1.6.0-beta.11] - 2026-10-15
 
 ## 🆕 What's New

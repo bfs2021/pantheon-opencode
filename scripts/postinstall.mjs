@@ -5,14 +5,13 @@
  * Runs after `npm install` completes. Validates environment and prints
  * setup instructions. Does NOT install Pantheon platform components.
  */
-const REQUIRED_NODE_MAJOR = 18
-const nodeMajor = parseInt(process.versions.node.split('.')[0], 10)
+import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_VERSION } from './node-engine-policy.mjs'
 
 try {
   // Validate Node.js version
-  if (nodeMajor < REQUIRED_NODE_MAJOR) {
+  if (!isSupportedNodeVersion(process.versions.node)) {
     console.error(
-      `❌ Node.js >= ${REQUIRED_NODE_MAJOR} required (current: ${process.versions.node})`,
+      `❌ Pantheon requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (current: ${process.versions.node})`,
     )
     process.exit(1)
   }

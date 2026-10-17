@@ -111,7 +111,15 @@ function analyzeConventionalCommits(since) {
 function prepareManifests(newVersion) {
   if (!SEMVER_PATTERN.test(newVersion)) throw new Error(`invalid version: ${newVersion}`)
   const inventory = validateInventory(ROOT, { allowVersionDivergence: true })
-  return { inventory, updates: prepareInventoryVersion(inventory, newVersion) }
+  const releaseMetadataFiles = new Set(
+    inventory.documents
+      .filter(({ entry }) => entry.role === 'metadata')
+      .map(({ entry }) => entry.file),
+  )
+  const updates = prepareInventoryVersion(inventory, newVersion).filter(
+    ({ path }) => !releaseMetadataFiles.has(path.slice(ROOT.length + 1)),
+  )
+  return { inventory, updates }
 }
 
 /**

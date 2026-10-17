@@ -1,6 +1,6 @@
 # Pantheon for OpenCode
 
-Complete setup and usage guide for running Pantheon **v1.5.0** in [OpenCode](https://opencode.ai) — 4 presets (`go-free`/`go-fast`/`go-premium`/`openai` puro), wizard 3 perguntas, herança nativa default — the open-source AI coding agent for the terminal, desktop, and IDE.
+Complete setup and usage guide for running Pantheon **v1.6.0-beta.12** in [OpenCode](https://opencode.ai) — the open-source AI coding agent for the terminal, desktop, and IDE.
 
 ---
 
@@ -9,8 +9,14 @@ Complete setup and usage guide for running Pantheon **v1.5.0** in [OpenCode](htt
 | Requirement | Notes |
 |---|---|
 | **OpenCode** installed | Follow the [OpenCode installation guide](https://opencode.ai/docs/) or use `npm install -g opencode-ai` |
-| **Node.js 22+** | Required by the installer and Node-based tooling |
+| **Node.js >=26.4.0** | Required by Pantheon's CLI, installer, and Node-based tooling |
 | **Git** | Any recent version |
+
+This package floor does not assert that every OpenCode host uses Node. Official
+OpenCode V2.0.31 has a Bun runtime path and a separate Node build pinned to
+26.4.0; no Bun minimum is stated. The optional `pantheon_cost` backend's
+`node:sqlite` threshold (Node >=22.5) is a separate capability, not package
+support.
 
 ---
 

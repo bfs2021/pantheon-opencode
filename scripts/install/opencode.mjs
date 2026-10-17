@@ -30,6 +30,7 @@ import {
   error,
   info,
   printSummary,
+  printWorktreeGuidance,
   section,
   spinner,
   step,
@@ -2353,6 +2354,7 @@ async function installPass(
       `  ${colors.dim('\u2022')} Run 'opencode' to start using Pantheon agents\n`,
     )
     process.stdout.write('\n')
+    printWorktreeGuidance({ projectRoot: process.cwd(), interactive: true })
   } else if (!opts.planOnly) {
     printSummary(target, ['opencode'], stats)
   }

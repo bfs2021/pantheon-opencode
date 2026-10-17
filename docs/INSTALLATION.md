@@ -1,6 +1,6 @@
-# Pantheon Installation Guide — v1.6.0-beta.1 (OpenCode 2)
+# Pantheon Installation Guide — v1.6.0-beta.12 (OpenCode 2)
 
-Pantheon v1.6.0-beta.1 is **OpenCode 2-compatible**. `npx pantheon-opencode init` instala a geração selecionada. A seleção interativa de perfil/preset (3 perguntas; default = herdar do chat) é o caminho legado V1, não uma rota de modelo V2. No V2, `pantheon_model` oferece somente `status`, `show`, `set` e `reset` manuais, sem wizard de presets: o default do host fica intacto sem override explícito por agente; markers `preset` e `PANTHEON_MODEL_PRESET` são ignorados e preservados. Herança nativa para delegates: sem preset, os filhos herdam o modelo do chat pai no caminho V1. As tabelas dos presets abaixo são referência V1 legada e derivadas de `src/routing.yml` (sem hardcodar segredos: só nomes de variáveis e `baseURL`s).
+Pantheon v1.6.0-beta.12 is **OpenCode 2-compatible**. `npx pantheon-opencode init` instala a geração selecionada. A seleção interativa de perfil/preset (3 perguntas; default = herdar do chat) é o caminho legado V1, não uma rota de modelo V2. No V2, `pantheon_model` oferece somente `status`, `show`, `set` e `reset` manuais, sem wizard de presets: o default do host fica intacto sem override explícito por agente; markers `preset` e `PANTHEON_MODEL_PRESET` são ignorados e preservados. Herança nativa para delegates: sem preset, os filhos herdam o modelo do chat pai no caminho V1. As tabelas dos presets abaixo são referência V1 legada e derivadas de `src/routing.yml` (sem hardcodar segredos: só nomes de variáveis e `baseURL`s).
 
 ## TL;DR (Quick Start)
 
@@ -18,7 +18,9 @@ npm run setup
 npm run doctor
 ```
 
-- Requisitos: **Node.js 22.22.2+** (ou 24.15.0+ / 26+), **OpenCode v1.18.4+**, **Python 3.11+** (opcional, MCP servers).
+- Requisitos: **Node.js >=26.4.0** para a CLI/instalador/ferramentas Node do Pantheon, **OpenCode v1.18.4+**, **Python 3.11+** (opcional, MCP servers). Node 22, Node 24 e Node 26.0–26.3 não são compatíveis com Beta 12.
+- Isso não pressupõe um runtime Node universal para o host OpenCode: o OpenCode V2.0.31 oficial tem um caminho de runtime Bun e um build Node separado fixado em Node 26.4.0; nenhum mínimo de Bun é declarado. `node:sqlite` >=22.5 é apenas um limite de capacidade do backend opcional `pantheon_cost`, não o requisito de suporte do pacote.
+- No resumo de uma configuração interativa em TTY, o instalador recomenda um local persistente externo para futuros worktrees: `<project-parent>/.pantheon-worktrees/<exact-repository-directory-basename>/<task>` (por exemplo, `/home/user/.pantheon-worktrees/My Project/feature-name`). Use o nome exato do diretório do projeto, incluindo espaços; não o normalize como slug. A recomendação é apenas orientação para agentes; o Pantheon não cria worktrees Git nem diretórios automaticamente.
 - Delegação e modo background dependem das ferramentas expostas pela versão/runtime do host. Na sessão Beta 10 reportada, Zeus tinha a ferramenta `subagent`, sem `task_status`/`cancel_task` ou garantia de acompanhamento/recuperação. Verifique o schema e a documentação do runtime; não presuma que `task()` ou background estejam disponíveis. A variável experimental abaixo só se aplica a hosts/versões que a documentem.
 - Passo a passo de 5 minutos: [QUICKSTART.md](QUICKSTART.md).
 
@@ -126,7 +128,7 @@ inventário legível, não há limpeza automática.
 ## Prerequisites
 
 - **OpenCode v1.18.4+** — [Install OpenCode](https://opencode.ai/docs/)
-- **Node.js 22.22.2+** (ou 24.15.0+ / 26+) — for `npx pantheon-opencode init` (`engines.node` = `^22.22.2 || ^24.15.0 || >=26.0.0`; `pantheon_cost` needs `node:sqlite`, Node >= 22.5)
+- **Node.js >=26.4.0** — for `npx pantheon-opencode init` and Node-based Pantheon tooling (`engines.node` = `>=26.4.0`). Node 22, Node 24, and Node 26.0–26.3 are unsupported. The optional `pantheon_cost` backend separately needs `node:sqlite` (Node >=22.5); this capability threshold does not lower package support. Official OpenCode V2.0.31 has a Bun runtime path and a separate Node build pinned to 26.4.0; no Bun minimum is implied.
 - **Python 3.11+** — for MCP servers (optional, used by `npm run setup`)
 - **Git** — for version detection in TUI sidebar
 
@@ -181,8 +183,8 @@ the same bundler, whose minifier output is part of the committed bundle. Pinning
 tsdown alone does not pin its dependency; a direct `devDependency` would not
 hold either because Node resolution can prefer a nearer nested copy. The root
 and standalone TUI overrides both enforce the same version. tsdown 0.23.0's
-engine range (`^22.18.0 || ^24.11.0 || >=26.0.0`) is compatible with the
-project's declared Node support (`^22.22.2 || ^24.15.0 || >=26.0.0`).
+engine range (`^22.18.0 || ^24.11.0 || >=26.0.0`) includes the project's
+declared Node support floor (`>=26.4.0`).
 
 Two consequences a maintainer must know before touching it:
 
@@ -472,7 +474,7 @@ dispatch tool, status/cancel tools, completion tracking, or recovery.
 
 | Mode | Command | Installs | Time | Dependencies |
 |------|---------|----------|------|-------------|
-| **Interactive** 🎯 | `npx pantheon-opencode init` (default TTY) | seletor visual de componentes | ~variavel | Node.js 22.22.2+ |
+| **Interactive** 🎯 | `npx pantheon-opencode init` (default TTY) | seletor visual de componentes | ~variavel | Node.js >=26.4.0 |
 | **Minimal** 🟢 | `npx pantheon-opencode init --headless --yes --no-mcp` | agents + commands | ~2s | None |
 | **Full** 🔵 | `npx pantheon-opencode init --headless --yes` | agents + MCPs + skills + TUI | ~60s | Python 3.11+ |
 | **Runtime** 🟡 | `npm run setup` | MCP servers + venv | ~30s | Python 3.11+ |

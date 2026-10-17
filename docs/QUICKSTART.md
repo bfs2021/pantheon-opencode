@@ -4,7 +4,7 @@
 
 A multi-agent framework for **OpenCode**. It provides 14 specialized agents,
 TDD enforcement, Themis quality gates, and persistent memory MCP. The current
-release is **v1.6.0-beta.1**, the first beta compatible with OpenCode 2.
+release candidate is **v1.6.0-beta.12**, compatible with OpenCode 2.
 
 ## Installation
 
@@ -58,9 +58,14 @@ npm run doctor
 
 ### Prerequisites
 
-- **Node.js 22+**
+- **Node.js >=26.4.0** for Pantheon's CLI, installer, and Node-based tooling
 - **OpenCode v1.18.4+**
 - **Python 3.11+** (optional, for MCP servers)
+
+The package's Node floor does not imply a universal OpenCode host runtime:
+official OpenCode V2.0.31 has a Bun runtime path and a separate Node build pinned
+to 26.4.0; no Bun minimum is asserted. `node:sqlite` >=22.5 is a separate
+optional `pantheon_cost` capability threshold, not the package support floor.
 
 
 ## Delegated Agents and Background Mode

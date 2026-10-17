@@ -20,21 +20,25 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-
 import { resolveInstallExitCode } from '../scripts/install/exit-codes.mjs'
 import {
   createPlanArtifact,
   loadPlanArtifact,
   savePlanArtifact,
 } from '../scripts/install/plan-artifact.mjs'
+import {
+  isSupportedNodeVersion,
+  MIN_SUPPORTED_NODE_VERSION,
+} from '../scripts/node-engine-policy.mjs'
 import { runUpdate } from '../scripts/update.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 
-const REQUIRED_NODE_MAJOR = 22
-if (parseInt(process.versions.node.split('.')[0], 10) < REQUIRED_NODE_MAJOR) {
-  console.error(`❌ Node.js >= ${REQUIRED_NODE_MAJOR} required (current: ${process.versions.node})`)
+if (!isSupportedNodeVersion(process.versions.node)) {
+  console.error(
+    `❌ Pantheon requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (current: ${process.versions.node})`,
+  )
   console.error('   Install a newer Node via nvm: https://github.com/nvm-sh/nvm')
   process.exit(1)
 }

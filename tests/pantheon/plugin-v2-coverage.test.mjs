@@ -72,7 +72,7 @@ test('fails when a target LCOV record contains multiple SF entries', () => {
   assert.throws(() => parse(record), /exactly one SF entry/i)
 })
 
-test('fails when LF does not equal the number of unique DA records', () => {
+test('fails when LF is smaller than the number of unique DA records', () => {
   assert.throws(
     () =>
       parse(
@@ -81,11 +81,25 @@ test('fails when LF does not equal the number of unique DA records', () => {
             [1, 1],
             [2, 0],
           ],
-          lf: 3,
+          lf: 1,
         }),
       ),
-    /LF 3.*2 unique DA/i,
+    /LF 1.*less than 2 unique DA/i,
   )
+})
+
+test('uses Node 26 LCOV aggregate totals when source-mapped DA records omit lines', () => {
+  const coverage = parse(
+    makeRecord({
+      da: [
+        [1, 1],
+        [3, 0],
+      ],
+      lf: 3,
+      lh: 2,
+    }),
+  )
+  assert.deepEqual(coverage.lines, { hit: 2, found: 3 })
 })
 
 test('rejects malformed, negative, and fractional DA counts', () => {
@@ -127,7 +141,7 @@ test('fails when LH disagrees with positive DA counts', () => {
           lh: 0,
         }),
       ),
-    /LH 0.*1 covered DA/i,
+    /LH 0.*less than 1 covered DA/i,
   )
 })
 

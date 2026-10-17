@@ -1,3 +1,4 @@
+import { basename, dirname, join, resolve } from 'node:path'
 import { strings } from './strings.mjs'
 
 export const icons = {
@@ -195,4 +196,76 @@ export function printSummary(target, _platforms, stats) {
   console.log(tag(S.summaryNextAgents))
   console.log(tag(S.summaryNextMcp))
   console.log(tag(S.summaryNextDoctor))
+}
+
+/**
+ * Build a persistent worktree location outside the project directory.
+ *
+ * @param {string} projectRoot - Project directory whose exact basename, including spaces, is retained.
+ * @returns {{ pattern: string, example: string }} Recommended paths for future worktrees.
+ */
+export function getWorktreeRecommendation(projectRoot = process.cwd()) {
+  const resolvedProject = resolve(projectRoot)
+  const projectName = basename(resolvedProject)
+  const repositoryWorktreeRoot = resolve(
+    dirname(resolvedProject),
+    '.pantheon-worktrees',
+    projectName || 'project',
+  )
+
+  return {
+    pattern: join(repositoryWorktreeRoot, '<task>'),
+    example: join(repositoryWorktreeRoot, 'feature-name'),
+  }
+}
+
+/**
+ * Show the suggested external worktree location in a real interactive TTY setup.
+ * Pantheon provides guidance only; it never creates a worktree or its directory.
+ *
+ * @param {object} [options]
+ * @param {string} [options.projectRoot=process.cwd()] - Project path for the recommendation.
+ * @param {boolean} [options.interactive=false] - Whether setup is interactive.
+ * @param {boolean} [options.dryRun=false] - Whether setup is preview-only.
+ * @returns {void}
+ */
+export function printWorktreeGuidance({
+  projectRoot = process.cwd(),
+  interactive = false,
+  dryRun = false,
+} = {}) {
+  if (!interactive || dryRun || !tty()) return
+
+  const recommendation = getWorktreeRecommendation(projectRoot)
+  const rows = [
+    { label: 'Default: ', value: recommendation.pattern, color: colors.green },
+    { label: 'Example: ', value: recommendation.example, color: colors.cyan },
+    {
+      label: 'Use: ',
+      value:
+        'Persistent location; preserve the exact project directory basename, including spaces.',
+      color: colors.dim,
+    },
+    {
+      label: 'Note: ',
+      value: 'Pantheon does not create Git worktrees or directories automatically.',
+      color: colors.yellow,
+    },
+  ]
+  const contentWidth = Math.max(
+    'Worktrees'.length,
+    ...rows.map(({ label, value }) => label.length + value.length),
+  )
+  const border = colors.cyan
+
+  console.log('')
+  console.log(`  ${border(`┌${'─'.repeat(contentWidth + 2)}┐`)}`)
+  console.log(`  ${border('│')} ${colors.bold('Worktrees'.padEnd(contentWidth))} ${border('│')}`)
+  console.log(`  ${border(`├${'─'.repeat(contentWidth + 2)}┤`)}`)
+  for (const { label, value, color } of rows) {
+    const padding = ' '.repeat(contentWidth - label.length - value.length)
+    console.log(`  ${border('│')} ${colors.bold(label)}${color(value)}${padding} ${border('│')}`)
+  }
+  console.log(`  ${border(`└${'─'.repeat(contentWidth + 2)}┘`)}`)
+  console.log('')
 }

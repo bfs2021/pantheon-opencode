@@ -19,10 +19,12 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_VERSION } from '../node-engine-policy.mjs'
 
-const REQUIRED_NODE_MAJOR = 18
-if (parseInt(process.versions.node.split('.')[0], 10) < REQUIRED_NODE_MAJOR) {
-  console.error(`❌ Node.js >= ${REQUIRED_NODE_MAJOR} required (current: ${process.versions.node})`)
+if (!isSupportedNodeVersion(process.versions.node)) {
+  console.error(
+    `❌ Pantheon requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (current: ${process.versions.node})`,
+  )
   process.exit(1)
 }
 
@@ -463,7 +465,10 @@ export function checkRuntimePrerequisites(env = process.env) {
   const problems = []
   const checks = [
     { cmd: 'python3', hint: 'install Python 3.10+ (https://www.python.org/downloads/)' },
-    { cmd: 'npm', hint: 'install Node.js 22+ (https://nodejs.org) — npm ships with it' },
+    {
+      cmd: 'npm',
+      hint: `install Node.js >= ${MIN_SUPPORTED_NODE_VERSION} (https://nodejs.org) — npm ships with it`,
+    },
   ]
   for (const { cmd, hint } of checks) {
     const probe = spawnSync(cmd, ['--version'], { encoding: 'utf8', timeout: 10_000, env })

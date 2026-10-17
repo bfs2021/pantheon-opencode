@@ -31,7 +31,9 @@ de planejar o trabalho, avançar, conferir resultados e preservar o contexto
 
 ## Comece em 2 minutos
 
-Requisitos: [OpenCode 1.18.4+](https://opencode.ai/docs/) e Node.js `^22.22.2 || ^24.15.0 || >=26.0.0`.
+Requisitos: [OpenCode 1.18.4+](https://opencode.ai/docs/) e Node.js `>=26.4.0` para a CLI, o instalador e as ferramentas Node do Pantheon. Node 22, Node 24 e Node 26.0–26.3 não são compatíveis com esta versão.
+
+Esse requisito do pacote não significa que todo host OpenCode execute Node: o OpenCode V2.0.31 oficial oferece um caminho de runtime Bun e um build Node separado fixado em Node 26.4.0. Não há aqui um requisito mínimo para Bun. O backend SQLite opcional de `pantheon_cost` tem um limite de capacidade distinto (`node:sqlite` requer Node >=22.5), que não reduz o requisito de suporte do pacote.
 
 No projeto em que você quer usar o Pantheon:
 
@@ -75,8 +77,7 @@ verificações repetíveis e passagens claras entre etapas do trabalho.
 
 ## Status
 
-Versão operacional neste checkout: **v1.6.0-beta.1** (primeira beta compatível
-com OpenCode 2; esta página não afirma publicação). O Pantheon foi feito para OpenCode e depende da
+Versão operacional neste checkout: **v1.6.0-beta.12** (esta página não afirma publicação). O Pantheon foi feito para OpenCode e depende da
 disponibilidade e da configuração do OpenCode e dos serviços opcionais que você
 escolher. Veja as [releases](https://github.com/ils15/pantheon-opencode/releases)
 e o [changelog](CHANGELOG.md) para acompanhar as mudanças publicadas.
@@ -536,7 +537,7 @@ anteriores foram preservadas separadamente em
 
 `npm run coverage:plugin-v2` executa a suíte `tests/pantheon/*.test.ts` com a
 cobertura nativa do Node habilitada para source maps e exige pelo menos 80% de
-cobertura de linhas somente para `src/plugin-v2.ts`. Requer Node `v24.15.0`;
+cobertura de linhas somente para `src/plugin-v2.ts`. Requer Node `>=26.4.0`;
 coberturas de branches e funções são informativas, não gates. Isso não é uma
 alegação de cobertura do repositório inteiro.
 

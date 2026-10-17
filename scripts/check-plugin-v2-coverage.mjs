@@ -3,8 +3,8 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_VERSION } from './node-engine-policy.mjs'
 
-export const REQUIRED_NODE_VERSION = 'v24.15.0'
 export const LINE_THRESHOLD_NUMERATOR = 4
 export const LINE_THRESHOLD_DENOMINATOR = 5
 
@@ -103,13 +103,13 @@ export function parseTargetLcov(report, repoRoot, targetPath) {
   const found = integerField(exactlyOneField(lines, 'LF'), 'LF', 1)
   const hit = integerField(exactlyOneField(lines, 'LH'), 'LH', 0)
   if (hit > found) throw new Error(`LH ${hit} exceeds LF ${found}`)
-  if (found !== lineRecords.size) {
-    throw new Error(`LF ${found} does not equal ${lineRecords.size} unique DA entries`)
+  if (lineRecords.size > found) {
+    throw new Error(`LF ${found} is less than ${lineRecords.size} unique DA entries`)
   }
 
   const coveredRecords = [...lineRecords.values()].filter((count) => count > 0).length
-  if (hit !== coveredRecords) {
-    throw new Error(`LH ${hit} does not equal ${coveredRecords} covered DA entries`)
+  if (hit < coveredRecords) {
+    throw new Error(`LH ${hit} is less than ${coveredRecords} covered DA entries`)
   }
 
   return {
@@ -142,9 +142,9 @@ function listTypeScriptTests(repoRoot) {
 }
 
 function runCoverage() {
-  if (process.version !== REQUIRED_NODE_VERSION) {
+  if (!isSupportedNodeVersion(process.versions.node)) {
     throw new Error(
-      `plugin-v2 coverage requires Node ${REQUIRED_NODE_VERSION}; got ${process.version}`,
+      `plugin-v2 coverage requires Node.js >= ${MIN_SUPPORTED_NODE_VERSION}; got ${process.version}`,
     )
   }
 

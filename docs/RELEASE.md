@@ -63,11 +63,12 @@ Labels de PR, push, merge e tag **não** disparam nenhum fluxo de release.
 1. Merge o PR de release na `main` com mensagem `chore(release): vX.Y.Z`.
 2. No GitHub Actions, execute manualmente `Release` (`workflow_dispatch`) na
    revisão desejada. Um push comum na `main` não inicia uma release.
-3. O workflow valida os manifests e locks do root (`package.json` +
-   `package-lock.json`) e do TUI (`src/plugins/tui/package.json` +
-   `src/plugins/tui/package-lock.json`) com um único `npm ci --ignore-scripts`
-   na raiz — o TUI é um *workspace* do root, então não há segunda etapa de
-   instalação — sem fallback para `npm install`, e valida o SHA exato antes de:
+3. O job de validação começa com `npm ci --ignore-scripts` na raiz, que instala
+   os *workspaces*, inclusive o TUI. Depois, `package:evidence` executa mais
+   duas instalações de produção (`npm ci --ignore-scripts --omit=dev
+   --no-audit --no-fund`): uma na raiz e outra em `src/plugins/tui`, validando
+   também o lock independente do TUI. Não há fallback para `npm install`; o
+   workflow valida o SHA exato antes de:
    - Publicar no npm com tag `latest`
    - Criar GitHub Release
 
