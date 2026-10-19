@@ -64,7 +64,7 @@ test('generated line counts use LF boundaries without assuming a final newline',
   assert.equal(logicalLineCount('one'), 1)
   assert.equal(logicalLineCount(''), 0)
   assert.equal(logicalLineCount(generated), 36)
-  assert.equal(logicalLineCount(globalArtifact), 206)
+  assert.equal(logicalLineCount(globalArtifact), 204)
 })
 
 test('Zeus can call the least-privilege Pantheon vision tool for diagnostics', () => {
@@ -113,10 +113,33 @@ test('subtask prompt preserves the canonical required return contract', () => {
     assert.match(subtaskPrompt, new RegExp(`\\*\\*${field}:\\*\\*`))
   }
 
-  assert.match(returnContract, /If memory affected the result, state the takeaway briefly/i)
+  const generatedSubtaskSummary = globalArtifact
+    .split('## subtask_summary\n')[1]
+    ?.split('\nFor investigation agents')[0]
+  assert.ok(generatedSubtaskSummary, 'generated return contract must include its subtask summary')
+  const generatedMemoryContextField = generatedSubtaskSummary
+    .split('\n')
+    .find((line) => line.startsWith('**memory_context:**'))
+  assert.ok(generatedMemoryContextField, 'generated subtask summary must include memory_context')
+  assert.match(generatedMemoryContextField, /"refs".*"takeaway"/)
+  assert.match(generatedMemoryContextField, /optional only if memory affected/i)
+  assert.match(generatedMemoryContextField, /non-sensitive.*no secrets.*copied memory/i)
   assert.match(
-    subtaskPrompt,
-    /If memory affected the result, state the takeaway briefly[\s\S]*do not repeat the entry/i,
+    generatedMemoryContextField,
+    /only in this summary, not Apollo\/Athena or council formats/i,
+  )
+  assert.equal(
+    (globalArtifact.match(/^\*\*memory_context:\*/gm) ?? []).length,
+    1,
+    'memory_context must be declared only under subtask_summary',
+  )
+  const subtaskMemoryContextField = subtaskPrompt
+    .split('\n')
+    .find((line) => line.startsWith('**memory_context:**'))
+  assert.ok(subtaskMemoryContextField, 'subtask return contract must include memory_context')
+  assert.ok(
+    subtaskMemoryContextField.includes('(optional;'),
+    'subtask memory_context must be optional',
   )
   assert.doesNotMatch(subtaskPrompt, /\*\*tokens:\*\*[^\n]*optional/i)
 })
