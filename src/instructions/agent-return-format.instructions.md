@@ -16,7 +16,7 @@ All implementation agents (Hermes, Aphrodite, Demeter, Hephaestus, Prometheus) M
 **tokens:** ~N input / ~M output (estimated)
 **status:** complete | partial (reason) | escalated (reason)
 **blockers:** [list any blockers or null]
-**memory_context:** {"refs":[{"namespace":"<safe namespace>","key":"<safe key>"}],"takeaway":"<concise relevant takeaway>"} (optional; omit when memory did not affect the result)
+**memory_context:** {"refs":[{"namespace":"<safe namespace>","key":"<safe key>"}],"takeaway":"<concise relevant takeaway>"} (optional only if memory affected; non-sensitive refs/takeaway, no secrets or copied memory; only in this summary, not Apollo/Athena or council formats)
 
 For investigation agents (Apollo, Athena), return structured findings with:
 - Key findings as bullet points
@@ -25,12 +25,12 @@ For investigation agents (Apollo, Athena), return structured findings with:
 
 ### Athena Plan Handoff
 
-When Athena is delegated to create a plan, its final task result MUST contain
-the complete Markdown plan, not just a summary, artifact path, or approval
-question. Include the goal, scope and assumptions, actionable phases, affected
-files or areas, dependencies, verification, risks, open questions, and
-acceptance criteria; mark unknowns instead of guessing. When called by Zeus,
-this plan contract supersedes the generic structured-findings format above.
+When Zeus delegates Athena through the root `subagent` dispatch, its final task
+result MUST contain the complete Markdown plan, not just a summary, artifact
+path, or approval question. Include the goal, scope and assumptions, actionable
+phases, affected files or areas, dependencies, verification, risks, open
+questions, and acceptance criteria; mark unknowns instead of guessing. This
+plan contract supersedes the generic structured-findings format above.
 Athena must not call `agent/askQuestions`, pause for user input, or ask for
 approval in the child session. Zeus must publish the returned full plan as a
 normal message in the main conversation before triggering any approval UI;
@@ -85,6 +85,3 @@ Equal self-reported counts (for example, several specialists each reporting 7) d
 **agreement_signals:** none
 **specific_claims:** 2 (self-reported; advisory)
 ```
-
-## Memory Context
-If memory affected the result, state the takeaway briefly; do not repeat the entry or task context. The optional machine-readable `memory_context` field belongs to `## subtask_summary` only when that return format applies; it does not change the Apollo/Athena structured-findings format or the council specialist-response contract. Both its refs and takeaway must be non-sensitive and contain no secrets or irrelevant memory content. The `refs` array may be empty if no source reference is safe to disclose. Never copy memory contents or duplicate the original task/entry; omit the field entirely when memory did not affect the result. If persistence was expected but no write tool was exposed or a write failed, state that it was not persisted; never imply a successful store without confirmation.
