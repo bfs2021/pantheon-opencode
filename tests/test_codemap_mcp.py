@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from pathlib import Path
 
@@ -161,9 +162,9 @@ class TestIncremental:
     ) -> None:
         p = tmp_path / "hello.py"
         p.write_text("def foo():\n    pass\n")
-        r1 = codemap.code_index(conn, path=p)
+        r1 = codemap.code_index(conn, path=p, project_root=tmp_path)
         assert r1["indexed"] == 1
-        r2 = codemap.code_index(conn, path=p)
+        r2 = codemap.code_index(conn, path=p, project_root=tmp_path)
         assert r2["skipped"] == 1 and r2["indexed"] == 0
 
     def test_code_index_force_reparses(
@@ -171,15 +172,82 @@ class TestIncremental:
     ) -> None:
         p = tmp_path / "hello.py"
         p.write_text("def foo():\n    pass\n")
-        codemap.code_index(conn, path=p)
-        r = codemap.code_index(conn, path=p, force=True)
+        codemap.code_index(conn, path=p, project_root=tmp_path)
+        r = codemap.code_index(conn, path=p, force=True, project_root=tmp_path)
         assert r["indexed"] == 1
 
     def test_large_file_skipped(self, conn: sqlite3.Connection, tmp_path: Path) -> None:
         p = tmp_path / "big.py"
         p.write_bytes(b"x" * (512 * 1024 + 1))
-        r = codemap.code_index(conn, path=p)
+        r = codemap.code_index(conn, path=p, project_root=tmp_path)
         assert r["large_skipped"] == 1
+
+
+class TestIndexConfinement:
+    @pytest.mark.parametrize(
+        ("project_root", "message"),
+        [
+            (None, "Trusted project root unavailable"),
+            ("relative-project", "Trusted project root must be absolute"),
+            ("{missing}", "Trusted project root is missing or invalid"),
+            ("/", "Trusted project root must be a directory"),
+        ],
+    )
+    def test_code_index_fails_closed_for_invalid_trusted_roots(
+        self,
+        conn: sqlite3.Connection,
+        tmp_path: Path,
+        project_root: str | None,
+        message: str,
+    ) -> None:
+        root = (
+            project_root.format(missing=tmp_path / "missing-project")
+            if project_root is not None
+            else None
+        )
+
+        result = codemap.code_index(conn, project_root=root)
+
+        assert message in result["error"]
+        assert conn.execute("SELECT COUNT(*) FROM code_files").fetchone()[0] == 0
+
+    @pytest.mark.parametrize(
+        ("target_kind", "message"),
+        [
+            ("traversal", "must not contain parent traversal"),
+            ("missing", "does not exist or is invalid"),
+            ("outside", "must resolve within the trusted project root"),
+            ("fifo", "must be a file or directory"),
+        ],
+    )
+    def test_code_index_rejects_targets_outside_supported_scope(
+        self,
+        conn: sqlite3.Connection,
+        tmp_path: Path,
+        target_kind: str,
+        message: str,
+    ) -> None:
+        project = tmp_path / "trusted-project"
+        project.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("class OutsideOnly:\n    pass\n", encoding="utf-8")
+        if target_kind == "traversal":
+            target: str | Path = "../outside.py"
+        elif target_kind == "missing":
+            target = "missing.py"
+        elif target_kind == "fifo":
+            target = project / "pipe.py"
+            try:
+                os.mkfifo(target)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                pytest.skip(f"FIFO unavailable: {exc}")
+        else:
+            target = outside
+
+        result = codemap.code_index(conn, path=target, project_root=project)
+
+        assert message in result["error"]
+        assert conn.execute("SELECT COUNT(*) FROM code_files").fetchone()[0] == 0
 
 
 class TestEdge:
@@ -188,7 +256,7 @@ class TestEdge:
     ) -> None:
         p = tmp_path / "empty.py"
         p.write_text("   \n")
-        r = codemap.code_index(conn, path=p)
+        r = codemap.code_index(conn, path=p, project_root=tmp_path)
         assert r["skipped"] == 1
         rows = conn.execute(
             "SELECT COUNT(*) FROM code_entities WHERE file_path=?", [str(p)]
@@ -200,7 +268,7 @@ class TestEdge:
     ) -> None:
         p = tmp_path / "notes.txt"
         p.write_text("hello")
-        r = codemap.code_index(conn, path=p)
+        r = codemap.code_index(conn, path=p, project_root=tmp_path)
         assert r["unsupported"] == 1
 
     def test_code_query_empty_returns_empty(self, conn: sqlite3.Connection) -> None:
@@ -214,7 +282,7 @@ class TestQuery:
     ) -> None:
         p = tmp_path / "mod.py"
         p.write_text("class UniqueXYZ123:\n    pass\n")
-        codemap.code_index(conn, path=p)
+        codemap.code_index(conn, path=p, project_root=tmp_path)
         res = codemap.code_query(conn, "UniqueXYZ123")
         assert any(r["name"] == "UniqueXYZ123" for r in res)
 
@@ -223,7 +291,7 @@ class TestQuery:
     ) -> None:
         p = tmp_path / "mix.py"
         p.write_text("class MyClass:\n    pass\ndef my_func():\n    pass\n")
-        codemap.code_index(conn, path=p)
+        codemap.code_index(conn, path=p, project_root=tmp_path)
         res = codemap.code_query(conn, "My", type_filter="class")
         assert len(res) > 0 and all(r["type"] == "class" for r in res)
 
@@ -232,7 +300,7 @@ class TestQuery:
     ) -> None:
         p = tmp_path / "fallback.py"
         p.write_text("class MySpecialClass:\n    pass\n")
-        codemap.code_index(conn, path=p)
+        codemap.code_index(conn, path=p, project_root=tmp_path)
         res = codemap.code_query(conn, "Spec")
         assert any("MySpecialClass" in r["name"] for r in res)
 
@@ -243,7 +311,7 @@ class TestNeighbors:
     ) -> None:
         p = tmp_path / "app.py"
         p.write_text("import os\n")
-        codemap.code_index(conn, path=p)
+        codemap.code_index(conn, path=p, project_root=tmp_path)
         mod_id = _entity_id(str(p), "app", "module")
         res = codemap.code_neighbors(conn, mod_id, depth=1)
         assert "entity" in res
@@ -295,7 +363,7 @@ class TestNeighbors:
     ) -> None:
         p = tmp_path / "app2.py"
         p.write_text("import os\n")
-        codemap.code_index(conn, path=p)
+        codemap.code_index(conn, path=p, project_root=tmp_path)
         mod_id = _entity_id(str(p), "app2", "module")
         res = codemap.code_neighbors(conn, mod_id, depth=1)
         placeholders = [
@@ -307,7 +375,9 @@ class TestNeighbors:
 class TestMcpIntegration:
     """Integration via memory_mcp wrappers — isolated DB via _set_memory_dir."""
 
-    def test_mcp_code_index_and_query_isolated(self, tmp_path: Path) -> None:
+    def test_mcp_code_index_and_query_isolated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # No importorskip: memory_mcp is stdlib + FTS5 only since the
         # vector pipeline was removed, so importing it no longer pulls a heavy
         # optional wheel. Gating on a backend the server does not use would
@@ -315,18 +385,24 @@ class TestMcpIntegration:
         import src.mcp.memory_mcp as mem
 
         mem._set_memory_dir(tmp_path / "memdb")
-        p = tmp_path / "isolated.py"
+        monkeypatch.setenv("PANTHEON_PROJECT", str(tmp_path))
+        p = tmp_path / "src" / "isolated.py"
+        p.parent.mkdir()
         p.write_text("class IsolatedXYZ:\n    pass\n")
         r = mem.code_index(path=str(p))
         assert r["indexed"] == 1
         res = mem.code_query(query="IsolatedXYZ")
         assert any(x["name"] == "IsolatedXYZ" for x in res)
 
-    def test_mcp_code_neighbors_isolated(self, tmp_path: Path) -> None:
+    def test_mcp_code_neighbors_isolated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import src.mcp.memory_mcp as mem
 
         mem._set_memory_dir(tmp_path / "memdb2")
-        p = tmp_path / "app_iso.py"
+        monkeypatch.setenv("PANTHEON_PROJECT", str(tmp_path))
+        p = tmp_path / "src" / "app_iso.py"
+        p.parent.mkdir()
         p.write_text("import os\n")
         mem.code_index(path=str(p))
         mod_id = _entity_id(str(p), "app_iso", "module")

@@ -1,5 +1,5 @@
 /**
- * Full-auto Goal Loop (Wave 3, PR #46) — one active goal per session,
+ * Goal Loop (Wave 3, PR #46) — when enabled, one active goal per session is
  * continued automatically while idle. `pantheon_goal_create` starts a goal;
  * `pantheon_goal_update` moves it pending → in_progress → done; while
  * active, `GoalLoop.onIdle` re-injects the continuation prompt (objective
@@ -7,7 +7,8 @@
  * completion-audit prompt — the state machine is the source of truth.
  *
  * Persistence: FILE-based GoalStore (`.pantheon/goals/<sessionID>.json`,
- * atomic tmp+rename). Opt-in `full_auto.enabled: false` default. Guards:
+ * atomic tmp+rename). The plugin uses hard-coded defaults; no runtime config
+ * enables the loop in this build. Guards:
  * board-running skip, in-flight Set, cooldown, max_continuations cap (25).
  * Injectable now() clock. Pure TypeScript — zero runtime deps.
  *
@@ -35,7 +36,7 @@ export { GoalStore }
 /** Continuation text injected into idle sessions. `{objective}` is substituted. */
 export const GOAL_CONTINUATION_PROMPT = 'Continue goal: {objective}'
 
-/** Defaults matching routing.yml `full_auto`. */
+/** Hard-coded runtime defaults; routing.yml is documentation-only. */
 export const GOAL_LOOP_DEFAULTS = {
   enabled: false,
   cooldownMs: 5000,
@@ -93,7 +94,7 @@ function toolFailure(prefix: string, err: unknown): string {
 // ─── Args schemas ──────────────────────────────────────────────────────
 
 const goalCreateArgs = {
-  objective: z.string().min(1).describe('The goal objective the session keeps working toward.'),
+  objective: z.string().min(1).describe('The objective recorded in this legacy session goal.'),
 } satisfies z.ZodRawShape
 
 const goalUpdateArgs = {
@@ -149,8 +150,9 @@ export class GoalLoop {
     this.warn = deps.logger?.warn ?? ((message: string) => log.warn(message))
   }
 
-  /** True when the session has an active (non-done) goal. Used by the idle dispatcher. */
+  /** True when the enabled loop can own idle for this session. */
   async hasActiveGoal(sessionID: string): Promise<boolean> {
+    if (!this.options.enabled) return false
     return this.store.hasActive(sessionID)
   }
 
@@ -243,7 +245,7 @@ export class GoalLoop {
     return {
       pantheon_goal_create: {
         description:
-          'Create the single active goal for this session. The goal loop then continues the session automatically on idle until the goal is marked done.',
+          'Deprecated legacy V1 tool. Create and store the single active goal for this session. Goals are stored but are not automatically continued in the current build. For durable manual goals, use the Persistence MCP `goal_*` tools available in this branch.',
         args: goalCreateArgs,
         execute: async (args, ctx) => {
           try {
@@ -270,7 +272,7 @@ export class GoalLoop {
       },
       pantheon_goal_update: {
         description:
-          'Update the active goal: set status (pending/in_progress/done) and/or rewrite the objective. Setting status to done stops all further continuations.',
+          'Deprecated legacy V1 tool. Update the stored active goal: set status (pending/in_progress/done) and/or rewrite the objective. Goal records are not automatically continued in the current build. For durable manual goals, use the Persistence MCP `goal_*` tools available in this branch.',
         args: goalUpdateArgs,
         execute: async (args, ctx) => {
           try {
@@ -292,7 +294,8 @@ export class GoalLoop {
         },
       },
       pantheon_goal_get: {
-        description: 'Return the active goal for this session (status, objective, continuations).',
+        description:
+          'Deprecated legacy V1 tool. Return the stored active V1 goal (status, objective, continuation count). Goals are not automatically continued in the current build. For durable manual goals, use the Persistence MCP `goal_*` tools available in this branch.',
         args: goalGetArgs,
         execute: async (_args, ctx) => {
           try {

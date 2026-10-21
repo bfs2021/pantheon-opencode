@@ -179,8 +179,13 @@ Memory is used selectively: the coordinator searches once only when project
 history could affect a task, then passes relevant results to specialists. Store
 one concise, reusable outcome at task completion when it will matter later;
 routine child summaries and phase updates stay in the current handoff. The
-session-checkpoint tools are separate, optional persistence APIs and are not
-called automatically by compaction hooks. See [Memory usage](docs/MEMORY.md).
+`pantheon-memory` MCP is the durable SQLite entry store; project files under
+`.pantheon/memory-bank/` are read on demand through `pantheon://memory-bank/{path}`
+and are not auto-loaded. Session-checkpoint tools are separate, optional
+Persistence APIs and are not called automatically by compaction hooks. Global
+and sandbox doctor profiles require `pantheon-memory`, `pantheon-resources`,
+and `pantheon-persistence`; lite mode keeps MCP checks optional. See
+[Memory usage](docs/MEMORY.md).
 
 Delegated handoffs may include optional `memory_context` only when useful
 memory affects the subtask: include safe references and a concise takeaway,
@@ -287,6 +292,71 @@ its tools, admits the valid Zeus→Apollo root dispatch, rejects an invalid edge
 before child creation, and rejects a matrix-valid dispatch from a child. The
 remaining V2 surface still has unsupported goal tools and registration-only
 session/compaction hooks, so the 1.6 line is not full V2 feature parity.
+
+### Manual goals are Persistence MCP tools, not V2 plugin tools
+
+The Persistence MCP exposes exactly six tools: `context_save`, `context_get`,
+`goal_create`, `goal_get`, `goal_update`, and `goal_done`. The KV table remains
+internal checkpoint storage; the former KV management/search and context
+list/statistics/rehydration/summary operations are not registered.
+
+The existing `pantheon-persistence` server provides manual `goal_create`,
+`goal_get`, `goal_update`, and `goal_done` tools for the current OpenCode
+session. The four goal tools are granted only to Zeus. Goals are partitioned by OpenCode session ID in the Persistence
+deployment database; the session ID is a correlation key, not authentication.
+In a global install, different projects share this database. The
+supported boundary is OpenCode v2.0.30 local stdio, not independent clients or
+HTTP. Same-user clients that bypass OpenCode, host bypasses, and compromised
+OpenCode configuration are outside the trust model. Athena and Themis do not
+receive `goal_get`: a child session cannot read Zeus's goal, and as root they
+cannot create a goal in their own session because only Zeus has `goal_create`.
+All other agents are also denied. Grant changes come from
+canonical agent frontmatter and take effect through controlled init/restart
+plus effective-permission verification, not promised hot reload.
+
+These are manual records only: they do not replace or migrate the V1
+`src/pantheon/goal-store.ts` authority, write to it, or trigger continuation,
+reinjection, an evaluator, loop, board, TUI/RPC, or `ctx.storage`. The V2 plugin's
+own goal tools remain unsupported. Persistence startup creates the database file
+and bootstraps its existing KV schema, but performs no goal-table DDL; goal
+operations fail closed until an explicit migration. First compare the resolved
+target with `--migrate-goals --dry-run`. Resolution precedence is explicit
+`--project-db`, then `PANTHEON_PROJECT`, then the runtime target directory (the
+parent of the installed `scripts/` directory), never the operator's shell cwd.
+An explicit relative `--project-db` is resolved against that runtime root;
+when `PANTHEON_PROJECT` is used, it must be absolute or the command stops with
+an actionable error. The CLI cannot independently witness the Persistence
+server's database binding, so a human must confirm the selected target (for
+example, compare it with the database open in the server process) before
+approving migration.
+Stop the Persistence server before the authoritative dry-run and keep it stopped
+for the whole migration; a concurrent writer that interferes with the safety
+check causes it to abort rather than proceed. For a global install, preview
+with `<runtime>/.venv/bin/python3 <runtime>/scripts/mcp_persistence.py
+--migrate-goals --dry-run`; for a project install, preview with
+`<project>/.venv/bin/python3
+<project>/.opencode/scripts/mcp_persistence.py --migrate-goals --dry-run`.
+The simplest reliable source of truth for the interpreter is `command[0]` in
+`opencode.json` for `pantheon-persistence`. The dry-run reports database size
+and `-wal`/`-shm` presence before opening the DB. If either sidecar exists, it
+uses plain read-only mode so committed WAL state is visible; if neither exists,
+it uses `immutable=1` to avoid creating sidecars, including in a read-only
+directory. If the goal-table state is `unknown`, the command exits with status
+2: stop and investigate, and do not treat it as a healthy result. Ask the user
+to approve before migration. The migration creates a timestamped
+adjacent full copy of the Persistence DB, including all KV data, with mode
+`0600`; backups live beside the selected DB. With the runtime-default target,
+uninstall/reinstall may replace that directory, so move any backup you need
+outside it first. Content-digest
+verification and backup-retention automation are deferred; for now the operator
+must prune old backups manually. An already-current schema creates no backup. If
+migration history exists but `pantheon_goals` is missing, stop and preserve the
+database; a human operator must restore a verified backup or recover the missing
+schema before approving another migration. The goal tests require the
+pinned `fastmcp==4.0.10` and `mcp==2.2.0` versions from
+`src/mcp/requirements-mcp.txt`. Tests use synthetic temporary databases only;
+no real DB or global configuration is changed, and rollout remains gated on
+Themis review and explicit user approval.
 
 ### Verified against which OpenCode versions
 
@@ -466,8 +536,10 @@ and a tool `execute.before` hook that enforces read-only sessions. The 3 goal
 tools are **not**
 registered on V2: the goal loop needs a `GoalStore`, a `GoalLoopClient` and a
 `BackgroundJobBoard`, none of which the V2 `PluginContext` exposes, so the gap
-is reported as the `goal-tools` unsupported-feature marker. Use the V1
-contract if you need the goal loop.
+is reported as the `goal-tools` unsupported-feature marker. The V1 contract
+still registers the deprecated legacy goal tools, but they store/read goals
+without automatically continuing the session in the current build. For durable
+manual goals, use the Persistence MCP `goal_*` surface available in this branch.
 
 V2 also registers `vision_describe` when `ctx.model.list()` is available. It
 checks the live catalog for image input, prefers the paid OpenCode Go
@@ -810,20 +882,14 @@ scripts/test-opencode-v2-sandbox.sh --prepare     # tarball + install + init in 
 ~/pantheon-sandbox/start-pantheon.sh              # interactive TUI in that isolated beta sandbox
 scripts/test-opencode-v2-sandbox.sh --run v2      # base validation only
 scripts/test-opencode-v2-sandbox.sh --prompts     # base validation + prompt battery
-scripts/test-opencode-v2-sandbox.sh --rehydrate   # offline context rehydration/session-summary probe
 scripts/test-opencode-v2-sandbox.sh --hooks       # V2 hook callback canary
-scripts/test-opencode-v2-sandbox.sh --rehydrate --hooks # run both canaries
 scripts/test-opencode-v2-sandbox.sh --reset       # wipe the sandbox root
 ```
 
-Modes are combinable (e.g. `--prepare --run v2 --prompts`). `--rehydrate` runs
-offline `context_rehydrate` and `context_session_summary` probes. `--hooks` runs
-a V2 hook canary against the sandbox binary to check that hook callbacks fire;
-it does not test transform callback effects or prove Pantheon's
-`execute.before` security enforcement. With the probe-only `--rehydrate --hooks`
-pair (without `--run`, `--prompts`, or `--cost`), the hooks canary still runs if
-rehydration fails, and the command returns a failing status afterward. These
-are test/sandbox canaries, not proof of Pantheon security enforcement. Binaries
+Modes are combinable (e.g. `--prepare --run v2 --prompts`). `--hooks` runs a V2
+hook canary against the sandbox binary to check that hook callbacks fire; it does
+not test transform callback effects or prove Pantheon's `execute.before` security
+enforcement. These are test/sandbox canaries, not proof of Pantheon security enforcement. Binaries
 are resolved strictly inside the sandbox npm prefix — a non-prepared sandbox
 fails fast instead of silently testing the host installation. The sandbox is
 always built from the checkout this script lives in; it never infers a
@@ -1001,14 +1067,14 @@ Env overrides:
 Exit codes: `0` no real failures · `1` real failure (see `prompts-report.md`
 in the sandbox root) · `2` usage error · `3` sandbox not prepared.
 
-### Intentional memory MCP divergence
+### Memory MCP source of truth
 
-`scripts/memory_mcp.py` and `src/mcp/memory_mcp.py` are
-intentionally different. The standalone `scripts/` copy keeps the lightweight
-`memory_*` contract; the installed `src/mcp/` copy additionally exposes the
-optional codemap schema and `code_index`, `code_query`, and `code_neighbors`.
-The other shared MCP copies remain identical. Do not overwrite one memory copy
-with the other.
+`src/mcp/memory_mcp.py` is the canonical Memory MCP server and exposes the six
+`memory_*` tools plus three `code_*` codemap tools. `scripts/memory_mcp.py` is a
+source-tree compatibility entrypoint that delegates to it. The runtime installer
+copies the canonical source into the installed scripts directory, while
+`install-mcp.mjs` prefers that installed copy and falls back to the source-tree
+entrypoint when running from a checkout.
 
 ### Task-result guard
 
