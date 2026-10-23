@@ -1552,7 +1552,7 @@ npm<span class="w"> </span>run<span class="w"> </span>release:dry-run
 <h1 id="package-version-and-the-ci-tui-dist-freshness-gate-fails-otherwise">package version and the CI "TUI dist freshness" gate fails otherwise.<a class="headerlink" href="#package-version-and-the-ci-tui-dist-freshness-gate-fails-otherwise" title="Permanent link">&para;</a></h1>
 <p>npm install --prefix src/plugins/tui &amp;&amp; npm run build --prefix src/plugins/tui</p>
 <p><code>apply</code> syncs the version manifests (<code>package.json</code>, <code>plugin.json</code>,
-<code>pyproject.toml</code>, <code>src/plugins/tui/package.json</code>) and promotes the
+<code>pyproject.toml</code>, <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugins/tui/package.json"><code>src/plugins/tui/package.json</code></a>) and promotes the
 <code>[Unreleased]</code> changelog section to a versioned entry. <code>apply --beta</code> (alias
 <code>beta</code>) does the same: it syncs the manifests to the next committed
 <code>X.Y.Z-beta.N</code> <strong>and</strong> promotes <code>[Unreleased]</code> to <code>## [vX.Y.Z-beta.N]</code>. Do not
@@ -1561,7 +1561,7 @@ edit <code>CHANGELOG.md</code> by hand. When the target version section already 
 and resets the template without advancing the package version or duplicating
 the release heading. Release validation also
 keeps the root pair (<code>package.json</code> + <code>package-lock.json</code>) and the TUI pair
-(<code>src/plugins/tui/package.json</code> + <code>src/plugins/tui/package-lock.json</code>) in the
+(<a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugins/tui/package.json"><code>src/plugins/tui/package.json</code></a> + <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugins/tui/package-lock.json"><code>src/plugins/tui/package-lock.json</code></a>) in the
 same versioned inventory. The TUI is a root <strong>workspace</strong>, so CI installs both
 with a single <code>npm ci --ignore-scripts</code> at the root; the nested TUI lock is
 still versioned and still shipped because the user-facing postinstall syncs
@@ -1575,7 +1575,7 @@ workflow-owned (see below).</p>
    <div class="highlight"><pre><span></span><code>node<span class="w"> </span>scripts/versioning.mjs<span class="w"> </span>apply<span class="w"> </span>minor<span class="w">   </span><span class="c1"># or patch/major</span>
 </code></pre></div>
    or edit <code>package.json</code> directly — the version is the release signal.
-   The TUI manifest (<code>src/plugins/tui/package.json</code>) carries the same version;
+   The TUI manifest (<a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugins/tui/package.json"><code>src/plugins/tui/package.json</code></a>) carries the same version;
    <code>npm run version:check</code> fails when the two drift. <code>node_modules/</code> state is
    irrelevant here: the TUI is a root workspace, so one root <code>npm ci
    --ignore-scripts</code> installs it.</li>
@@ -1587,7 +1587,7 @@ workflow-owned (see below).</p>
    <code>versioning.mjs</code> and any release docs deliberately edited. The paths below
    are illustrative and incomplete; check the full diff rather than treating
    this list as exhaustive. In particular, <strong>do not omit
-   <code>src/plugins/tui/dist/tui.js</code></strong>: the bundle embeds the package version and
+   <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugins/tui/dist/tui.js"><code>src/plugins/tui/dist/tui.js</code></a></strong>: the bundle embeds the package version and
    CI checks TUI dist freshness. Leave unrelated changes and untracked RED
    tests out of the release commit.</li>
 </ol>
@@ -1677,7 +1677,7 @@ npm<span class="w"> </span>run<span class="w"> </span>release:dry-run
 </code></pre></div>
 <p>The script exits 0 whenever it can generate. stdout is markdown ready to
 paste into the <code>[Unreleased]</code> CHANGELOG section (diagnostics go to stderr).</p>
-<h3 id="release-body-by-channel">Release body by channel<a class="headerlink" href="#release-body-by-channel" title="Permanent link">&para;</a></h3>
+<h2 id="release-body-by-channel">Release body by channel<a class="headerlink" href="#release-body-by-channel" title="Permanent link">&para;</a></h2>
 <p><code>release.yml</code> extracts the release body from the committed <code>CHANGELOG.md</code> for
 both dispatch channels; only the stable channel attaches it to a GitHub Release:</p>
 <table>
@@ -1791,7 +1791,7 @@ before any release credential is exposed.</p>
 <tbody>
 <tr>
 <td>(a) tests</td>
-<td><code>scripts/release-gates.mjs tests</code>: pytest + <code>src/mcp</code> coverage ≥ 80, <code>test:node</code>, <code>test:ts</code>, <code>coverage:plugin-v2</code>, <code>test:install</code>; pytest runs in an isolated venv built from <code>src/mcp/requirements-mcp.txt</code></td>
+<td><code>scripts/release-gates.mjs tests</code>: pytest + <a href="https://github.com/ils15/pantheon-opencode/tree/main/src/mcp"><code>src/mcp</code></a> coverage ≥ 80, <code>test:node</code>, <code>test:ts</code>, <code>coverage:plugin-v2</code>, <code>test:install</code>; pytest runs in an isolated venv built from <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/mcp/requirements-mcp.txt"><code>src/mcp/requirements-mcp.txt</code></a></td>
 <td>any suite, coverage threshold, or the mandatory install tier fails; an unsatisfiable or unverified pin set fails the gate</td>
 <td><code>tests.json</code></td>
 </tr>
@@ -1836,7 +1836,7 @@ known-broken set. A measured row that cannot run is a failure — the release pa
 has no <code>SKIP</code>.</p>
 <h4 id="python-test-environment-gate-a">Python test environment (gate a)<a class="headerlink" href="#python-test-environment-gate-a" title="Permanent link">&para;</a></h4>
 <p>The Python suite imports <code>fastmcp</code>/<code>mcp</code> at collection time, so its verdict only
-means something against the pins in <code>src/mcp/requirements-mcp.txt</code>. Gate (a)
+means something against the pins in <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/mcp/requirements-mcp.txt"><code>src/mcp/requirements-mcp.txt</code></a>. Gate (a)
 therefore does <strong>not</strong> use the runner's ambient interpreter:</p>
 <ul>
 <li>the <code>validate</code> job creates <code>$RUNNER_TEMP/gate-venv</code> with <code>python3 -m venv</code>
@@ -1872,7 +1872,7 @@ therefore does <strong>not</strong> use the runner's ambient interpreter:</p>
 <code>fastmcp 3.4.2</code> / <code>mcp 1.28.0</code> on <code>PATH</code>, <code>tests/test_persistence_goals.py</code>
 fails at <strong>collection</strong> by design, which is an environment defect, not a
 product defect.</p>
-<h3 id="test-tiers">Test tiers<a class="headerlink" href="#test-tiers" title="Permanent link">&para;</a></h3>
+<h2 id="test-tiers">Test tiers<a class="headerlink" href="#test-tiers" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Default (developer loop):</strong> <code>npm run test:node</code> runs <code>tests/*.mjs</code> and
   <code>tests/pantheon/*.mjs</code> <strong>excluding</strong> <code>tests/install-opencode.test.mjs</code> and
@@ -1885,16 +1885,16 @@ product defect.</p>
 </ul>
 <h3 id="coverage-contract">Coverage contract<a class="headerlink" href="#coverage-contract" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>Required:</strong> Python <code>src/mcp</code> branch coverage <strong>≥ 80%</strong>
-  (<code>coverage report --fail-under=80</code>) and the <code>src/plugin-v2.ts</code> line
+<li><strong>Required:</strong> Python <a href="https://github.com/ils15/pantheon-opencode/tree/main/src/mcp"><code>src/mcp</code></a> branch coverage <strong>≥ 80%</strong>
+  (<code>coverage report --fail-under=80</code>) and the <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugin-v2.ts"><code>src/plugin-v2.ts</code></a> line
   measurement (<code>npm run coverage:plugin-v2</code>). Both run in gate (a).</li>
 <li><strong>Not PASS:</strong> Node coverage (<code>npm run coverage</code>) is report-only and enforces
-  no threshold; TypeScript under <code>src/</code> outside the plugin-v2 measurement is
+  no threshold; TypeScript under <a href="https://github.com/ils15/pantheon-opencode/tree/main/src"><code>src/</code></a> outside the plugin-v2 measurement is
   unmeasured. Neither may be cited as evidence that a threshold passed.</li>
 <li>No new threshold is introduced by this contract.</li>
 </ul>
-<h3 id="memory-mcp-packaging">Memory MCP packaging<a class="headerlink" href="#memory-mcp-packaging" title="Permanent link">&para;</a></h3>
-<p><code>src/mcp/memory_mcp.py</code> is the canonical Memory MCP server. The
+<h2 id="memory-mcp-packaging">Memory MCP packaging<a class="headerlink" href="#memory-mcp-packaging" title="Permanent link">&para;</a></h2>
+<p><a href="https://github.com/ils15/pantheon-opencode/blob/main/src/mcp/memory_mcp.py"><code>src/mcp/memory_mcp.py</code></a> is the canonical Memory MCP server. The
 <code>scripts/memory_mcp.py</code> source-tree entrypoint delegates to it, and the runtime
 installer copies the canonical source into the installed scripts directory.
 <code>tests/test_mcp_scripts_sync.py</code> checks that the compatibility entrypoint exposes
@@ -2054,7 +2054,7 @@ protection does not replace them.</p>
       (<code>tag &lt; pkg</code>)</li>
 <li>[ ] <code>CHANGELOG.md</code> has a <code>## [X.Y.Z] - date</code> entry for the new version</li>
 <li>[ ] Version manifests match: <code>package.json</code> == <code>plugin.json</code> ==
-      <code>pyproject.toml</code> == <code>src/plugins/tui/package.json</code></li>
+      <code>pyproject.toml</code> == <a href="https://github.com/ils15/pantheon-opencode/blob/main/src/plugins/tui/package.json"><code>src/plugins/tui/package.json</code></a></li>
 <li>[ ] All required checks green on the bump PR <strong>and on the push run for the
       merged <code>main</code> SHA</strong> (<code>validate</code>, <code>test-suite</code>, <code>plugin-v2-ts-coverage</code>,
       <code>commitlint</code>, <code>security-scan</code>, <code>CodeQL</code>)</li>
@@ -2171,7 +2171,7 @@ DOI, and the record metadata on Zenodo.</p>
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 23, 2026 17:12:49 UTC">October 23, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="October 23, 2026 18:58:37 UTC">October 23, 2026</span>
   </span>
 
     
