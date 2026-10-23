@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
+         <loc>https://ils15.github.io/pantheon-opencode/1.6.0/</loc>
+         <lastmod>2026-10-23</lastmod>
+    </url>
+    <url>
          <loc>https://ils15.github.io/pantheon-opencode/1.6.0/ARCHITECTURE/</loc>
          <lastmod>2026-10-23</lastmod>
     </url>
@@ -10,10 +14,6 @@
     </url>
     <url>
          <loc>https://ils15.github.io/pantheon-opencode/1.6.0/COMPATIBILITY/</loc>
-         <lastmod>2026-10-23</lastmod>
-    </url>
-    <url>
-         <loc>https://ils15.github.io/pantheon-opencode/1.6.0/INDEX/</loc>
          <lastmod>2026-10-23</lastmod>
     </url>
     <url>
