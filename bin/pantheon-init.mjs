@@ -20,6 +20,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { configure as configureUi, tag } from '../scripts/install/cli-ui.mjs'
 import { resolveComponentSelection } from '../scripts/install/component-selection.mjs'
 import { resolveInstallExitCode } from '../scripts/install/exit-codes.mjs'
 import {
@@ -61,6 +62,7 @@ function printUsage() {
   console.log('  npx pantheon-opencode init --dry-run --save-plan <file> # Save reviewed plan')
   console.log('  npx pantheon-opencode init --apply-plan <file> [--yes] # Apply reviewed plan')
   console.log('  npx pantheon-opencode init --dry-run --json # Versioned JSON preview')
+  console.log('  npx pantheon-opencode init --verbose      # Step-by-step install detail')
   console.log('  npx pantheon-opencode init --no-mcp       # Skip MCP + venv')
   console.log('  npx pantheon-opencode init --force        # Overwrite + recreate venv')
   console.log('  npx pantheon-opencode init --doctor       # Run health check after install')
@@ -248,7 +250,8 @@ async function main() {
 
     if (name === 'none') {
       if (isDryRun) {
-        console.log('[dry-run] Would clear model preset')
+        configureUi({ dryRun: true })
+        console.log(tag('Would clear model preset'))
       } else {
         if (fs.existsSync(filePath)) {
           fs.mkdirSync(path.dirname(bakPath), { recursive: true })
@@ -391,6 +394,7 @@ async function main() {
           '--yes',
           '-y',
           '--json',
+          '--verbose',
         ].includes(bare)
       ) {
         console.error(`⚠️  Unknown option ignored: ${arg}`)
@@ -534,6 +538,7 @@ async function main() {
         noMcp: skipMCP,
         planTimestamp,
         quiet: isJson,
+        verbose: args.includes('--verbose') && !isJson,
       })
     } catch (err) {
       installError = err
@@ -610,6 +615,7 @@ async function main() {
       for (const file of files) {
         if (Object.hasOwn(totals, file.action)) totals[file.action] += 1
       }
+      const mcpServers = result.mcpServers ?? []
       process.stdout.write(
         `${JSON.stringify({
           schema_version: 1,
@@ -619,9 +625,14 @@ async function main() {
           target: result.target,
           open_code_version: result.openCodeVersion,
           advisories: result.versionAssumed
-            ? ['OpenCode host probe skipped to keep dry-run write-free; V1 was assumed.']
+            ? [
+                'The OpenCode host generation could not be detected; this plan assumes V1 ' +
+                  'and may diverge from the apply. Pass --opencode-version v1|v2 to pin it.',
+              ]
             : [],
           totals,
+          mcp_servers: mcpServers,
+          mcp_server_count: mcpServers.length,
           files: files.map(({ path: filePath, action, bytes }) => ({
             path: path.relative(result.target, filePath) || '.',
             action,
@@ -651,12 +662,23 @@ async function main() {
     if (runDoctor && !isDryRun) {
       console.log('')
       console.log(`  ${S.runningHealthCheck}`)
-      try {
-        const { spawnSync } = await import('node:child_process')
-        const doctorScript = path.join(ROOT, 'scripts', 'doctor.mjs')
-        spawnSync(process.execPath, [doctorScript], { stdio: 'inherit', cwd: ROOT })
-      } catch {
-        console.log('  ⚠️  Could not run doctor.mjs')
+      const doctorStartedAt = Date.now()
+      const { spawnSync } = await import('node:child_process')
+      const doctorScript = path.join(ROOT, 'scripts', 'doctor.mjs')
+      const doctor = spawnSync(process.execPath, [doctorScript], { stdio: 'inherit', cwd: ROOT })
+      const doctorSeconds = ((Date.now() - doctorStartedAt) / 1000).toFixed(1)
+      // Never leave "Running health check..." as the last word: report the
+      // outcome and duration, and propagate the child's exit code so CI sees
+      // the failure instead of a silent zero.
+      if (doctor.error) {
+        console.error(`  ⚠️  Could not run doctor.mjs: ${doctor.error.message}`)
+        process.exitCode = 1
+      } else if (doctor.status === 0) {
+        console.log(`  ${S.healthCheckFinished(doctorSeconds, 0)}`)
+      } else {
+        const status = doctor.status ?? 1
+        console.error(`  ${S.healthCheckExit(doctorSeconds, status)}`)
+        process.exitCode = status
       }
     }
 

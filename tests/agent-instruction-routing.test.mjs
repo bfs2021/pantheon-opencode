@@ -34,7 +34,7 @@ test('applyTo remains a file glob and never acts as an agent selector', () => {
 
 test('shared global baseline excludes agent-scoped and language-specific instructions', () => {
   const baseline = generateGlobalAgentsMd(instructions)
-  assert.ok(baseline.includes('YAGNI Principles'))
+  assert.ok(baseline.includes("Don't add abstractions before the third repetition"))
   assert.ok(!baseline.includes('INLINE COUNCIL SYNTHESIS'))
   assert.ok(!baseline.includes('Backend Development Standards (Hermes)'))
   assert.ok(!baseline.includes('Frontend Development Standards (Aphrodite)'))
@@ -154,7 +154,7 @@ test('context_save guidance documents the object content contract', () => {
   assert.match(skill, /JSON\.stringify\(state\)/)
   assert.match(skill, /omit the key rather than passing a string/)
 
-  const persistence = read('../docs/persistence-mcp.md')
+  const persistence = read('../docs/MEMORY.md')
   assert.match(persistence, /JSON-encoded string/)
   assert.match(persistence, /`goal` is optional/)
   assert.match(persistence, /`tail` is an array/)

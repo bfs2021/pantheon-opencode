@@ -22,6 +22,10 @@ const TABLE = {
     failHintForce:
       '   Or retry with --force to recreate the venv:\n     npx pantheon-opencode init --force',
     runningHealthCheck: 'Running health check...',
+    healthCheckFinished: (seconds, status) =>
+      `Health check finished in ${seconds}s (exit ${status})`,
+    healthCheckExit: (seconds, status) =>
+      `Health check finished in ${seconds}s and reported problems (exit ${status}); the installation itself completed`,
     installedTitle: (v) => `Pantheon OpenCode v${v} installed.`,
     nextSteps: 'Next steps:',
     nextVerify: '1. Verify installation:\n     npx pantheon-opencode doctor',
@@ -37,7 +41,17 @@ const TABLE = {
     installingPrompts: 'Installing prompts',
     installingCommands: 'Installing commands',
     installingPlugins: 'Installing plugins',
+    installingTuiDeps: 'Installing TUI dependencies',
+    creatingBackup: 'Creating exact backup set',
+    planningBackup: 'Planning backup set',
+    checkingPrerequisites: 'Checking prerequisites',
+    installingRuntime: 'Installing runtime',
+    writingConfiguration: 'Writing configuration',
+    writingConfig: 'Writing opencode.json',
+    runningMigrations: 'Running migrations',
+    recordingState: 'Recording install state',
     settingUpRuntime: 'Setting up Python virtual environment',
+    runtimeVerifiedAfterApply: 'Python runtime will be verified after apply',
     healthSection: 'Health Check',
     runningHealthChecks: 'Running health checks',
     runtimeFailed: (msg) => `Python runtime setup failed: ${msg}`,
@@ -46,6 +60,10 @@ const TABLE = {
       'Fix python3 (or free disk space) and re-run init to add them; everything else was installed.',
     prereqMissing:
       'runtime prerequisites missing — install the tools above, or re-run with --no-mcp to install without Python MCP servers',
+    mcpAskNotEnforceable: (server) =>
+      `MCP permission "permission.mcp.${server} = ask" is not enforceable on OpenCode 2.x: ` +
+      `the server's tools remain available and no permission prompt is shown. ` +
+      `Use "deny" with action "${server}_*" in "permissions", or disable the server in the host MCP config.`,
     v2Migrating: 'Migrating config to V2 native format...',
     nothingApplied: 'Nothing applied.',
     planOnlyNoYes: 'Plan only — re-run with --yes to apply.',
@@ -80,6 +98,10 @@ const TABLE = {
     failHintForce:
       '   Ou tente de novo com --force para recriar a venv:\n     npx pantheon-opencode init --force',
     runningHealthCheck: 'Rodando verificação de saúde...',
+    healthCheckFinished: (seconds, status) =>
+      `Verificação de saúde concluída em ${seconds}s (exit ${status})`,
+    healthCheckExit: (seconds, status) =>
+      `Verificação de saúde concluída em ${seconds}s e reportou problemas (exit ${status}); a instalação em si foi concluída`,
     installedTitle: (v) => `Pantheon OpenCode v${v} instalado.`,
     nextSteps: 'Próximos passos:',
     nextVerify: '1. Verifique a instalação:\n     npx pantheon-opencode doctor',
@@ -95,7 +117,17 @@ const TABLE = {
     installingPrompts: 'Instalando prompts',
     installingCommands: 'Instalando comandos',
     installingPlugins: 'Instalando plugins',
+    installingTuiDeps: 'Instalando dependências da TUI',
+    creatingBackup: 'Criando conjunto de backup exato',
+    planningBackup: 'Planejando conjunto de backup',
+    checkingPrerequisites: 'Verificando pré-requisitos',
+    installingRuntime: 'Instalando runtime',
+    writingConfiguration: 'Escrevendo configuração',
+    writingConfig: 'Escrevendo opencode.json',
+    runningMigrations: 'Executando migrações',
+    recordingState: 'Registrando estado da instalação',
     settingUpRuntime: 'Configurando ambiente virtual Python',
+    runtimeVerifiedAfterApply: 'O runtime Python será verificado após a aplicação',
     healthSection: 'Verificação de saúde',
     runningHealthChecks: 'Rodando verificações de saúde',
     runtimeFailed: (msg) => `Falha ao configurar o runtime Python: ${msg}`,
@@ -104,6 +136,10 @@ const TABLE = {
       'Corrija o python3 (ou libere espaço em disco) e rode init de novo para adicioná-los; todo o resto foi instalado.',
     prereqMissing:
       'pré-requisitos do runtime ausentes — instale as ferramentas acima, ou rode de novo com --no-mcp para instalar sem os MCPs Python',
+    mcpAskNotEnforceable: (server) =>
+      `A permissão MCP "permission.mcp.${server} = ask" não é aplicável no OpenCode 2.x: ` +
+      `as tools do servidor continuam disponíveis e nenhum prompt de permissão é exibido. ` +
+      `Use "deny" com a action "${server}_*" em "permissions", ou desative o servidor na config de MCP do host.`,
     v2Migrating: 'Migrando config para o formato nativo V2...',
     nothingApplied: 'Nada foi aplicado.',
     planOnlyNoYes: 'Apenas o plano — rode de novo com --yes para aplicar.',

@@ -2,7 +2,8 @@
 
 Canonical reference for Pantheon agents. Lists every tool across the 5 native MCP servers, with signatures, descriptions, and which agents use them.
 
-> **Agent tip:** Tool names are platform-dependent. See [Platform Naming Conventions](#platform-naming-conventions) below to map these names to your runtime.
+> **Agent tip:** OpenCode exposes an MCP tool as `{server}_{tool}`. See
+> [Naming in OpenCode](#naming-in-opencode) below.
 
 ---
 
@@ -58,12 +59,12 @@ or vector index. The Memory server registers no resources.
 
 | Tool | Signature | Description | Who uses it |
 |------|-----------|-------------|-------------|
-| `memory_store` | `(value, namespace?: "default", key?, metadata?: "{}")` | Store a reusable memory entry (FTS5 index updated by trigger); metadata is a JSON string | Mnemosyne when durable context is warranted and write access is granted |
-| `memory_search` | `(query, namespace?, top_k?: 5, decay_days?)` | FTS5 BM25 keyword search (stopwords dropped, 4+ char terms prefix-matched); optional freshness decay via `decay_days` (default off). Empty results mean nothing matched; structured errors mean the memory store could not be read. | Coordinator or specialist only when prior project context is relevant |
-| `memory_recall` | `(key, namespace?: "default")` | Exact recall of an entry by key within a namespace | Exact-key lookup when needed |
-| `memory_forget` | `(id?, key?, namespace?: "default")` | Delete an entry by ID or key (FTS index cleaned via trigger) | mnemosyne only |
-| `memory_list` | `(namespace?, prefix?, limit?: 50)` | List entries chronologically with namespace and key-prefix filters | Mnemosyne — explicit maintenance |
-| `memory_stats` | `()` | Database statistics: totals, namespaces, disk usage | Mnemosyne — explicit maintenance |
+| `memory_store` | `(value, namespace?: "default", key?, metadata?: "{}", ttl_seconds?)` | Store a reusable memory entry (FTS5 index updated by trigger); `metadata` is a JSON string. Over-cap writes are rejected, never truncated (see [entry cap and expiry](#entry-cap-expiry-and-purge-contract)). `ttl_seconds` gives the entry a lifetime; on success returns `{id, namespace, key, status, expires_at}`, where `expires_at` is `null` when the entry does not expire | Mnemosyne when durable context is warranted and write access is granted |
+| `memory_search` | `(query, namespace?, top_k?: 5, decay_days?, include_expired?: false)` | FTS5 BM25 keyword search (stopwords dropped, 4+ char terms prefix-matched); `top_k` is clamped to 1–50. Expired entries are filtered in SQL before `LIMIT`, so they cannot consume a candidate slot; `include_expired=true` opts back in. Optional freshness decay via `decay_days` (default off) only re-ranks, it does not expire. Empty results mean nothing matched; structured errors mean the memory store could not be read. | Coordinator or specialist only when prior project context is relevant |
+| `memory_recall` | `(key, namespace?: "default")` | Exact recall of an entry by key within a namespace, including `expires_at`. Expiry is ignored on purpose: an expired entry is still returned (see [entry cap and expiry](#entry-cap-expiry-and-purge-contract)) | Exact-key lookup when needed |
+| `memory_forget` | `(id?, key?, namespace?: "default", expired_only?: false)` | Delete an entry by ID or key (FTS index cleaned via trigger), or purge every expired entry with `expired_only=true` — the only path that removes expired rows. Returns `{deleted, purged, expired_only}` on the purge path; not combinable with `id`/`key` | Mnemosyne only — expiry purge is explicit maintenance |
+| `memory_list` | `(namespace?, prefix?, limit?: 50)` | List entries chronologically with namespace and key-prefix filters; `limit` is clamped to 1–500. Still lists expired entries, because this maintenance view is how they are inspected before purging | Mnemosyne — explicit maintenance |
+| `memory_stats` | `()` | Database statistics: `total_entries`, `namespaces`, `db_size_bytes`, `db_size_human`, plus payload-size accounting — `max_entry_bytes` (cap in force), `warning_threshold_bytes` (half the cap, minimum 1 byte), `total_bytes` (summed serialized entry bytes), `oversized_entries` (count above the warning threshold) and `largest_entries` (up to 5 `{namespace, key, bytes}`) | Mnemosyne — explicit maintenance |
 | `code_index` | `(path?, force?)` | Index codebase files into a knowledge graph (hash-based skip) | No agent — blocked by design |
 | `code_query` | `(query, type?, limit?: 10)` | Search code entities via FTS5 | apollo, athena |
 | `code_neighbors` | `(entity_id, depth?: 1)` | Graph neighbors of a code entity (BFS depth 1-3) | apollo, athena |
@@ -86,6 +87,48 @@ exception. Callers should parse the returned JSON content and distinguish an
 array (including `[]`, a successful search) from an object with an `error` key
 (a failed search); do not use `isError` or an empty array alone to detect this
 failure.
+
+### Entry cap, expiry and purge contract
+
+**Size.** A write is rejected when the serialized entry — `value`, `metadata`,
+`namespace` and `key` as UTF-8 — exceeds the per-entry cap: 65,536 bytes
+(64 KiB) by default, the same bound the Persistence MCP applies to checkpoint
+content. Set `PANTHEON_MEMORY_MAX_ENTRY_BYTES` in the memory server's
+environment to change the cap; it is read on every write, accepts any positive
+integer, and an unparseable or non-positive value falls back to 64 KiB. An
+over-cap write is rejected, never truncated — a shortened memory is silent data
+loss — and the error states the actual size, the cap in force, and that
+variable with an actionable value. The per-entry size behind `memory_stats`
+(`total_bytes` and `largest_entries[].bytes`) is measured the same way, so
+`oversized_entries` and the write guard agree.
+
+**Expiry.** `memory_store(ttl_seconds=...)` accepts 1 to 31,536,000 seconds
+(365 days) and stores an ISO-8601 UTC `expires_at`. Omitting it stores `NULL`,
+meaning "never expires" — which is how every entry written before TTL support
+behaves. An entry is expired when `expires_at` is non-null and at or before the
+current UTC time.
+
+**What expiry changes.** `memory_search` excludes expired entries by default and
+filters them in SQL before `LIMIT`, so an expired row cannot consume one of the
+candidate slots; `include_expired=true` returns them. `memory_recall` and
+`memory_list` still expose expired entries: `null` is already the answer for a
+key that does not exist, so hiding an expired entry from exact recall would make
+"expired" indistinguishable from "never existed", and the maintenance listing is
+how an operator inspects them before purging. `decay_days` is unrelated to
+expiry — it only multiplies BM25 scores by a freshness factor.
+
+**Explicit purge.** No read deletes a row. `memory_forget(expired_only=true)`
+deletes every entry whose `expires_at` has passed, across all namespaces,
+returns `{deleted, purged, expired_only}`, is idempotent (`purged: 0` once
+drained), cannot be combined with `id`/`key`, and never touches entries with a
+`NULL` expiry.
+
+**Older databases.** A `memory.db` created before TTL support is upgraded on
+open: the server checks `PRAGMA table_info(memories)` and runs
+`ALTER TABLE memories ADD COLUMN expires_at TEXT` only when the column is
+missing, then creates its index with `IF NOT EXISTS`. A second open is a no-op,
+no row is rewritten or dropped, and no migration command is required from the
+user.
 
 Apollo and Athena receive only the read-only code map operations
 (`code_query`, `code_neighbors`). No agent is granted `code_index`; its
@@ -162,7 +205,7 @@ across sessions. Athena and Themis run in child sessions and cannot read Zeus's
 goal; as root they cannot create a goal in their own session because only Zeus
 has `goal_create`. Manual goals do not enable automatic continuation and do not
 replace the V1 `GoalStore`. See
-[Persistence MCP](persistence-mcp.md#manual-session-goals) for details.
+[Memory](MEMORY.md#manual-session-goals) for details.
 
 ---
 
@@ -226,34 +269,82 @@ MCP servers listed above.
 | Tool | Arguments | What it reports |
 |------|-----------|-----------------|
 | `pantheon_model` | `action?: status\|show\|set\|reset`, plus action-specific agent/model/effort and optional `scope: project` | V2 manual overrides are **project-only**: status reads project configuration, and the agent transform applies only explicit project per-agent model/variant overrides; global files are neither read nor applied. `set`/`reset` reject `scope: global` and any `confirm`/`authorize_global` fields before writing. Global overrides require separate explicit human authorization in a future surface and are not supported by this tool; flags in the same tool call are not approval. V2 ignores static preset markers and `PANTHEON_MODEL_PRESET`, leaving host defaults intact otherwise. Invalid or malformed project overrides preserve the host model and expose warnings via status. The V2 server plugin has no documented toast or other proactive user-visible notification API during transform, so no toast/proactive warning is promised. V1 behavior remains legacy. |
-| `pantheon_cost` | `days?: 1..365` (default `7`) | Read-only token totals by agent and phase in a rolling `days × 24-hour` window from query time. It is not a calendar-day or session window. |
+| `pantheon_cost` | `days?: 1..365` (default `7`), `session?: <root session id>`, `refreshPricing?: boolean` | Read-only token totals and USD cost by agent and phase, by model, and by session, in a rolling `days × 24-hour` window from query time. It is not a calendar-day or session window. |
 
-`pantheon_cost` is not grouped by session, task, model, or provider; on V2 the
-phase can be `unknown`. It reports token counts, not dollars, so it cannot prove
-monetary savings or a model-specific usage delta. Its aggregate is not a
-per-session or per-task ledger.
+Prices come from the public `models.dev` catalog (USD per 1M tokens: input,
+output, cache read and cache write), cached at
+`<configDir>/cache/models-dev.json`, where `<configDir>` follows the usual
+resolution — `PANTHEON_HOME`, else `$XDG_CONFIG_HOME/opencode`, else
+`~/.config/opencode`. A tool call reads that cache and never waits on the
+network: a missing or older-than-24 h cache is refreshed in the background with a
+3 s timeout and the report says the prices it used are stale. Only
+`refreshPricing: true` waits for that bounded refresh, and it is how new prices
+are forced. `PANTHEON_COST_OFFLINE=1` forbids every network request on every
+path: the lazy background refresh is not scheduled, and `refreshPricing: true`
+is refused outright — the report then says `Pricing: REFUSED`, names this
+variable, and makes no request at all. An unknown or
+ambiguous model, or cache tokens with no published cache rate, read `—` and are
+excluded from the total, which then says `(partial)` — a model the catalog prices
+at zero stays `$0.00`, because an unknown model is never reported as free.
+Passing `session` scopes the whole report to that root session plus its
+descendant sessions, resolved through the `parent_id` links already in the
+database. Costs are catalog list prices, not a provider invoice; on V2 the phase
+can be `unknown`; and the `node:sqlite` CLI-fallback path still reports tokens
+only, with the report saying so.
+
+### Cost backend and attribution
+
+`pantheon_cost` prefers a read-only `node:sqlite` connection to the selected
+`opencode.db` (`src/pantheon/cost-command.ts`). When `node:sqlite` is
+unavailable in the host runtime — for example under Bun — the tool falls back to
+spawning `node scripts/cost.mjs` as a read-only subprocess. The fallback
+resolves a real Node binary, `PANTHEON_NODE` first and then `node` on `PATH`,
+verifies that it supports `node:sqlite` (Node >= 22.5), and runs the script with
+an argument array, never through a shell. If neither source resolves, the tool
+returns `status: UNSUPPORTED`. Database failures return a contract status such
+as `UNAVAILABLE` or `CORRUPT_DATA` and include diagnostic detail, including
+captured stderr when available.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PANTHEON_NODE` | `node` from `PATH` | Node >= 22.5 binary used only for the `node:sqlite` capability in the CLI fallback. An explicit path must exist and be executable, otherwise the tool fails fast |
+| `PANTHEON_COST_OFFLINE` | unset | Set to `1` to forbid every network request, including `refreshPricing: true`. The report uses the cached catalog only, an explicit refresh is refused with a `Pricing: REFUSED` notice naming this variable, and no socket is opened |
+| `PANTHEON_COST_DB` | unset | Absolute path to the database, checked before `OPENCODE_DB` |
+| `OPENCODE_DB` | unset | Absolute path to the database, checked before the XDG default |
+
+The database is resolved by path in this order: an explicit `dbPath` from the
+tool caller, `PANTHEON_COST_DB`, `OPENCODE_DB`, then the XDG default
+`opencode.db`. There is no per-version filename in that chain: `opencode-v2.db`
+is not a host 2.x database — it is a name a sandbox gives its own state
+database through `OPENCODE_DB`.
+
+The v1/v2 distinction is the **detected schema**, not the file name. The report
+looks for the `message` and `session_message` tables and reads whichever the
+open database actually holds, because a migrated database carries both families
+at once. `PANTHEON_OPENCODE_VERSION=v1|v2` selects no file: it only narrows an
+already-detected set to one table family, and fails fast when the value is
+invalid or the requested family is not there. A database carrying neither table
+returns `CORRUPT_DATA`; a ledger that exists but yields no readable tokens
+returns `UNSUPPORTED`, never a successful empty report.
+
+The report always includes `## Cost by agent` and adds `## Cost by model` and
+`## Cost by session` tables. A session row covers that session alone; passing
+`session:<id>` sums the root session and its descendants. An unpriced row reads
+`—` and is excluded from the total, which then says `(partial)`.
 
 ---
 
-## Platform Naming Conventions
+## Naming in OpenCode
 
-Each platform exposes MCP tools with different naming. The same tool `memory_recall` from server `pantheon-memory` gets different names:
-
-| Platform | Naming Pattern | Example for `memory_recall` |
-|----------|---------------|-----------------------------|
-| **OpenCode** | `{server}_{tool}` | `pantheon-memory_memory_recall` |
-| **** | `mcp__{server}__{tool}` | `mcp__pantheon-memory__memory_recall` |
-| **** | `<use_mcp_tool>` XML | `<use_mcp_tool><server_name>pantheon-memory</server_name><tool_name>memory_recall</tool_name></use_mcp_tool>` |
-| **** | Original name | `memory_recall` (injected via schema) |
-| **** | Original name | `memory_recall` (injected via schema) |
-| **Continue** | Original name | `memory_recall` (injected via schema) |
-| ** ** | Original name | `memory_recall` (injected via schema) |
+Pantheon runs only on OpenCode, which exposes an MCP tool as
+`{server}_{tool}` — for example `pantheon-memory_memory_recall`. The older
+multi-platform naming examples were removed with multi-platform support in
+v1.0.
 
 > **In the Code Mode `execute` sandbox the visible catalog is a subset, not the
 > registry above.** Resolve a hidden tool by calling `search()` for its exact path
 > and then invoking that path **literally** — passing the whole path string as a
-> single key fails even though `search()` returned it (see **P1-10** in
-> [ROADMAP.md](../ROADMAP.md)).
+> single key fails even though `search()` returned it.
 
 ---
 

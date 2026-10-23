@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url'
 
 import { listV2UnsupportedFeatures } from '../src/pantheon/v2-unsupported.mjs'
 import { classifyFileInventory } from './install/file-inventory.mjs'
+import { staleTuiRefs } from './install/plugin.mjs'
 import { readState } from './install/state.mjs'
 import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_VERSION } from './node-engine-policy.mjs'
 
@@ -133,10 +134,31 @@ const ICON = {
   info: '\u2139\uFE0F', // ℹ️
 }
 
+// Per-section tally of PASS checks. Without --verbose the individual passing
+// lines are suppressed, so a section used to print its header and then nothing
+// — indistinguishable from a check that never ran. The tally is flushed when
+// the next section starts (and before the summary) so every section accounts
+// for itself.
+let sectionPasses = 0
+
+function verboseOutput() {
+  return process.argv.includes('--verbose')
+}
+
+function flushSectionPasses() {
+  const passed = sectionPasses
+  sectionPasses = 0
+  if (passed === 0 || verboseOutput()) return
+  console.log(`  ${ICON.pass} ${passed} ${passed === 1 ? 'check' : 'checks'} passed`)
+}
+
 function emit(category, message, metadata = {}) {
   counts[category]++
   results.push({ category, message, ...metadata })
-  if (category === 'pass' && !process.argv.includes('--verbose')) return
+  if (category === 'pass' && !verboseOutput()) {
+    sectionPasses++
+    return
+  }
   const prefix = ICON[category] ?? category
   console.log(`  ${prefix} ${message}`)
 }
@@ -151,11 +173,12 @@ function error(msg, metadata = {}) {
   emit('error', msg, metadata)
   exitCode = 2
 }
-function info(msg) {
-  emit('info', msg)
+function info(msg, metadata = {}) {
+  emit('info', msg, metadata)
 }
 
 function section(title) {
+  flushSectionPasses()
   console.log(`\n${'='.repeat(60)}`)
   console.log(`  ${title}`)
   console.log(`${'='.repeat(60)}`)
@@ -184,6 +207,7 @@ function showHelp() {
    E. Git Status           — uncommitted changes
     F. Runtime Layer        — runtime Python + pinned pip dependencies
    H3. Plugin Drift        — registered plugin version vs this package
+   H5. TUI Plugin          — copied TUI payload + host registration (fail-closed)
    K. Node Runtime         — node:sqlite availability for pantheon_cost
 
  Exit codes:
@@ -1334,6 +1358,80 @@ export function resolveInstalledPackageRoot(pluginPath) {
 }
 
 /**
+ * The plugin identities the installer writes into the host config
+ * (`resolveInstalledPlugin` in scripts/install/opencode.mjs). Only these refs —
+ * and absolute paths to them inside an installed package — are owned by
+ * Pantheon; anything else belongs to the user and is never checked here.
+ */
+const MANAGED_PLUGIN_IDENTITIES = new Set([
+  'src/plugin.ts',
+  'src/plugins/pantheon-hooks.ts',
+  'src/plugin-v2',
+  // Legacy V2 file ref from before the directory contract (still migrated by
+  // the installer, so a pre-migration config is ours too).
+  'src/plugin-v2.ts',
+])
+
+/**
+ * Return the normalized path of a Pantheon-owned plugin registration, or null
+ * when the ref is not a filesystem path this installer writes.
+ *
+ * P0-6: the installer stores an ABSOLUTE path (`join(ROOT, identity)`) and only
+ * `init` re-resolves it. A dangling registration is therefore a real install
+ * defect, and telling it apart from a third-party path requires this identity
+ * check rather than a basename test — an unrelated user plugin may legitimately
+ * end in `src/plugin.ts`.
+ *
+ * npm specs (`pantheon-opencode`, `pantheon-opencode/plugin-v2`) and
+ * third-party paths are NOT paths this installer owns, so they return null and
+ * are never reported.
+ *
+ * @param {unknown} ref
+ * @returns {string|null}
+ */
+export function managedPluginPath(ref) {
+  if (typeof ref !== 'string') return null
+  const normalized = ref.replaceAll('\\', '/').replace(/\/$/, '')
+  if (MANAGED_PLUGIN_IDENTITIES.has(normalized)) return normalized
+  const index = normalized.toLowerCase().lastIndexOf(INSTALLED_PACKAGE_MARKER.toLowerCase())
+  if (index === -1) return null
+  const suffix = normalized.slice(index + INSTALLED_PACKAGE_MARKER.length)
+  return MANAGED_PLUGIN_IDENTITIES.has(suffix) ? normalized : null
+}
+
+/**
+ * Report every Pantheon-owned plugin registration whose target is missing.
+ *
+ * Fail-closed by design: the host drops a plugin it cannot load without an
+ * error, so a dangling registration silently downgrades the install to "no
+ * Pantheon tool surface at all". A version comparison cannot catch this — there
+ * is no package to read a version from — which is exactly how the defect stayed
+ * invisible.
+ *
+ * @param {{path: string, configPath: string, configLabel: string}[]} refs
+ * @returns {boolean} true when at least one dangling registration was reported
+ */
+function reportDanglingPluginRegistrations(refs) {
+  let reported = false
+  for (const ref of refs) {
+    if (managedPluginPath(ref.path) === null) continue
+    // Relative refs resolve against the config directory, never the doctor's
+    // cwd — the same rule the host loader and the drift comparison use.
+    const absolute = isAbsolute(ref.path) ? ref.path : resolve(dirname(ref.configPath), ref.path)
+    if (existsSync(absolute)) continue
+    reported = true
+    error(
+      `${ref.configLabel}: Pantheon plugin is registered at ${ref.path}, which does not exist — ` +
+        'the host silently drops a plugin it cannot load, so this install runs without the Pantheon tool surface ' +
+        '(an upgrade that did not run `init` leaves the previous absolute path behind). ' +
+        'Run `pantheon-opencode init` to re-resolve the registration to the installed tree',
+      { code: 'plugin_path_missing', classification: 'error' },
+    )
+  }
+  return reported
+}
+
+/**
  * Read the version of the installed pantheon-opencode package a registered
  * plugin path points into.
  * @param {string} pluginPath - absolute or config-relative plugin ref
@@ -1378,14 +1476,21 @@ export function collectRegisteredPluginRefs(configs) {
       if (!Array.isArray(list)) continue
       for (const ref of list) {
         if (typeof ref === 'string') {
-          refs.push({ path: ref, configPath: cfg.path, configLabel: cfg.label })
+          refs.push({ path: ref, key, configPath: cfg.path, configLabel: cfg.label })
         } else if (ref && typeof ref === 'object') {
-          // Object-shaped entries carry their path under `path`/`source`.
-          const objectPath = ['path', 'source', 'id', 'name'].find(
+          // Object-shaped entries carry their path under `package` (what the
+          // V2 writer emits when it preserves plugin options), `path`/`source`
+          // (host spellings) or `id`/`name`.
+          const objectPath = ['package', 'path', 'source', 'id', 'name'].find(
             (k) => typeof ref[k] === 'string',
           )
           if (objectPath) {
-            refs.push({ path: ref[objectPath], configPath: cfg.path, configLabel: cfg.label })
+            refs.push({
+              path: ref[objectPath],
+              key,
+              configPath: cfg.path,
+              configLabel: cfg.label,
+            })
           }
         }
       }
@@ -1397,25 +1502,32 @@ export function collectRegisteredPluginRefs(configs) {
 /**
  * Compare the version of the package each registered plugin points into (when
  * it is an installed copy under node_modules/pantheon-opencode) against this
- * package's own version, and warn on divergence. Advisory only — a drift
- * warning never changes the exit code, and a healthy install stays silent.
+ * package's own version, and warn on divergence. A drift warning is advisory
+ * (a pinned copy is a legitimate choice); a Pantheon registration that points
+ * at a path that no longer exists is a blocking error ('stale').
  * @param {object} args
- * @returns {'drift'|'sync'|'skip'|'no-plugin'|'no-version'}
+ * @returns {'stale'|'drift'|'sync'|'skip'|'no-plugin'|'no-version'}
  */
 export function checkPluginVersionDrift(args) {
   section('H3. Plugin Version Drift')
-
-  const pkg = readJson(join(ROOT, 'package.json'))
-  const packageVersion = pkg?.version
-  if (!packageVersion) {
-    info('Plugin version drift skipped — this package has no readable version')
-    return 'no-version'
-  }
 
   const refs = collectRegisteredPluginRefs(collectMcpConfigs(args))
   if (refs.length === 0) {
     info('No plugin registrations found in opencode.json — version drift skipped')
     return 'no-plugin'
+  }
+
+  // P0-6: a missing tree has no version to compare, so the comparison loop
+  // below used to `continue` past it and report "skipped" — the defect was
+  // silent. Check existence first so the dangling case fails closed regardless
+  // of whether this package's own version is readable.
+  const staleReported = reportDanglingPluginRegistrations(refs)
+
+  const pkg = readJson(join(ROOT, 'package.json'))
+  const packageVersion = pkg?.version
+  if (!packageVersion) {
+    info('Plugin version drift skipped — this package has no readable version')
+    return staleReported ? 'stale' : 'no-version'
   }
 
   const seen = new Set()
@@ -1439,6 +1551,7 @@ export function checkPluginVersionDrift(args) {
     )
   }
 
+  if (staleReported) return 'stale'
   if (driftReported) return 'drift'
   if (compared === 0) {
     info(
@@ -1595,6 +1708,126 @@ export function checkV2UnsupportedFeatures(args) {
   else warn(verdict.message)
 
   return verdict.status
+}
+
+/**
+ * Where the TUI checker must look for a config dir's plugin payload.
+ *
+ * Mirrors the installer's own layout rule (`isGlobalConfigDir` + flat global
+ * layout vs `.opencode/` project layout) through the installer exports rather
+ * than re-deriving it, so the check cannot drift from what init writes.
+ *
+ * @param {{target: string}} args
+ * @returns {Promise<{isGlobal: boolean, configDir: string, copyDir: string, tuiJsonPath: string}>}
+ */
+export async function resolveTuiInstallPaths(args) {
+  const { isGlobalConfigDir, resolveTuiCopyTarget } = await import('./install/opencode.mjs')
+  const isGlobal = isGlobalConfigDir(args.target)
+  const configDir = isGlobal ? args.target : join(args.target, '.opencode')
+  return {
+    isGlobal,
+    configDir,
+    copyDir: resolveTuiCopyTarget(configDir),
+    tuiJsonPath: join(configDir, 'tui.json'),
+  }
+}
+
+/** Resolve the module a copied TUI package.json advertises for its host. */
+function tuiExportTarget(pluginDir) {
+  const pkg = readJson(join(pluginDir, 'package.json'))
+  const exported = pkg?.exports?.['./tui'] ?? pkg?.main
+  if (typeof exported !== 'string') return null
+  const targetPath = isAbsolute(exported) ? exported : join(pluginDir, exported)
+  return existsSync(targetPath) ? targetPath : null
+}
+
+function samePath(left, right) {
+  if (typeof left !== 'string') return false
+  return resolve(left) === resolve(right)
+}
+
+/**
+ * Check H5: the installed TUI plugin (fail-closed).
+ *
+ * The TUI is the one component whose failure is silent: a missing payload or a
+ * stale `tui.json` entry leaves the host loading nothing, with no error
+ * anywhere. Every defect here gets its own `code` so a report can be acted on.
+ *
+ * Detection reuses the installer's own classifiers — `isPantheonTuiRef` /
+ * `staleTuiRefs` for ownership — instead of a second, weaker notion of "looks
+ * like our plugin".
+ *
+ * @param {{target:string, env?:object}} args
+ * @returns {Promise<'not-installed'|'missing-dir'|'missing-dist'|'unregistered'|'stale-ref'|'ok'>}
+ */
+export async function checkTuiPlugin(args) {
+  section('H5. TUI Plugin')
+
+  const state = readState(args.target)
+  const { copyDir, tuiJsonPath } = await resolveTuiInstallPaths(args)
+  const pluginsInstalled = state?.components?.plugins?.status === 'installed'
+
+  if (!pluginsInstalled && !existsSync(copyDir) && !existsSync(tuiJsonPath)) {
+    info('TUI plugin is not installed for this target — check skipped')
+    return 'not-installed'
+  }
+
+  if (!existsSync(copyDir)) {
+    error(
+      `TUI plugin directory is missing: ${copyDir} — the plugins component is recorded as ` +
+        'installed but its payload is absent. Run `npx pantheon-opencode init` to restore it.',
+      { code: 'tui_plugin_dir_missing', classification: 'missing' },
+    )
+    return 'missing-dir'
+  }
+
+  const v1Bundle = join(copyDir, 'dist', 'tui.js')
+  const v2Bundle = join(copyDir, 'dist', 'tui-v2.js')
+  if (!existsSync(v1Bundle) && !existsSync(v2Bundle)) {
+    error(
+      `TUI bundle is missing under ${join(copyDir, 'dist')} — the copied plugin cannot be ` +
+        'loaded by either host. Run `npx pantheon-opencode init` to reinstall it.',
+      { code: 'tui_plugin_dist_missing', classification: 'missing' },
+    )
+    return 'missing-dist'
+  }
+
+  const tuiConfig = readJson(tuiJsonPath)
+  const pluginRefs = Array.isArray(tuiConfig?.plugin) ? tuiConfig.plugin : []
+  const registered = pluginRefs.some((ref) => samePath(ref, copyDir))
+  // V2 discovers local plugins from the plugins directory instead of tui.json;
+  // its payload is identified by the sibling index.ts server entrypoint plus a
+  // package export that resolves to the compiled V2 bundle.
+  const v2Target = tuiExportTarget(copyDir)
+  const v2Discovered =
+    existsSync(join(copyDir, 'index.ts')) &&
+    typeof v2Target === 'string' &&
+    v2Target.endsWith('tui-v2.js')
+
+  if (!registered && !v2Discovered) {
+    error(
+      `TUI plugin is copied to ${copyDir} but no host discovery finds it: ` +
+        `${tuiJsonPath} does not reference it and the V2 discovery files are incomplete. ` +
+        'Run `npx pantheon-opencode init` to re-register it.',
+      { code: 'tui_plugin_not_registered', classification: 'ambiguous' },
+    )
+    return 'unregistered'
+  }
+
+  // Anything our classifier still owns that is NOT the current registration is
+  // a leftover the host would also load — stale copies accumulate per init run.
+  const stale = staleTuiRefs(pluginRefs, [copyDir]).filter((ref) => !samePath(ref, copyDir))
+  if (stale.length > 0) {
+    error(
+      `tui.json still registers ${stale.length} stale Pantheon TUI reference(s): ` +
+        `${stale.join(', ')} — run \`npx pantheon-opencode init\` to clean them.`,
+      { code: 'tui_plugin_stale_ref', classification: 'ambiguous' },
+    )
+    return 'stale-ref'
+  }
+
+  pass(`TUI plugin installed at ${copyDir} and discoverable by the host`)
+  return 'ok'
 }
 
 // ---------------------------------------------------------------------------
@@ -1850,12 +2083,305 @@ export function classifyNodeSqliteProbe(probe) {
   if (probe.available) {
     return {
       status: 'ok',
-      message: `node:sqlite available on ${probe.version} — pantheon_cost read-only backend supported`,
+      message: `node:sqlite available on ${probe.version} — pantheon_cost read-only backend available`,
     }
   }
   return {
     status: 'unsupported',
     message: `pantheon_cost will report UNSUPPORTED on Node ${probe.version} — node:sqlite requires Node >= ${NODE_SQLITE_MIN}`,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool registration — a SEPARATE fact from backend capability (P0-3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Where each plugin generation declares its tool surface, relative to the
+ * package root a registered plugin points into.
+ *
+ * The backend probe answers "can this Node read opencode.db?". It does NOT
+ * answer "is `pantheon_cost` registered on the host at all?" — a tool removed
+ * from (or never added to) the surface still had a green doctor before P0-3.
+ * These files are the surface the doctor already ships and can inspect without
+ * importing or executing plugin code.
+ *
+ * The V2 generation has TWO surfaces: `src/pantheon/v2-tools.ts` from beta.3
+ * and the 1.5.0+ entry `src/plugin-v2.ts`, which declares the tools itself.
+ * Reading only the first reported a healthy 1.5 tree as "pantheon_cost is NOT
+ * declared", so every declared surface of the generation is inspected and their
+ * declarations are unioned.
+ */
+const TOOL_SURFACE_FILES = Object.freeze({
+  v1: Object.freeze([join('src', 'plugin.ts')]),
+  v2: Object.freeze([join('src', 'plugin-v2.ts'), join('src', 'pantheon', 'v2-tools.ts')]),
+})
+
+/** The published package name — the only package identity this installer owns. */
+const PANTHEON_PACKAGE_NAME = 'pantheon-opencode'
+
+/** Remove comments so a name mentioned only in prose never counts as a tool. */
+function stripSourceComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/** Extract the first `key: { ... }` object-literal body, or null. */
+function extractObjectLiteralBody(source, key) {
+  const match = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(source)
+  if (!match) return null
+  let depth = 0
+  const start = match.index + match[0].length - 1
+  for (let index = start; index < source.length; index++) {
+    if (source[index] === '{') depth++
+    else if (source[index] === '}') {
+      depth--
+      if (depth === 0) return source.slice(start + 1, index)
+    }
+  }
+  return null
+}
+
+/**
+ * Tool names declared by a plugin-generation source file.
+ *
+ * V2 declares each tool as `name: 'x'` in `createV2ToolDefinitions`, or — from
+ * the 1.5.0 entry — as quoted elements of a `toolNames` array. V1 keys the
+ * `tool:` object by tool name. Returns null when the generation's shape cannot
+ * be located (unverifiable), which the classifier treats as a failure rather
+ * than a pass: "cannot prove registration" is not "registered".
+ *
+ * @param {string} source
+ * @param {'v1'|'v2'} generation
+ * @returns {string[]|null}
+ */
+export function readDeclaredToolNames(source, generation) {
+  const body = stripSourceComments(source)
+  if (generation === 'v2') {
+    const names = new Set(
+      [...body.matchAll(/\bname:\s*['"]([A-Za-z0-9_-]+)['"]/g)].map((match) => match[1]),
+    )
+    for (const match of body.matchAll(/^\s*['"]([A-Za-z0-9_-]+)['"],?\s*$/gm)) names.add(match[1])
+    return [...names]
+  }
+  const toolBlock = extractObjectLiteralBody(body, 'tool')
+  if (toolBlock === null) return null
+  return [...toolBlock.matchAll(/^\s*([a-z][a-z0-9_]*)\s*:/gm)].map((match) => match[1])
+}
+
+/**
+ * Return the Pantheon package specifier a ref names, or null when it is not
+ * one. Covers `pantheon-opencode`, `pantheon-opencode@1.2.3` and an export
+ * subpath (`pantheon-opencode/plugin-v2`): the host resolves all of them
+ * through its own module graph, not from a path this process can inspect.
+ *
+ * @param {unknown} refPath
+ * @returns {string|null}
+ */
+export function pantheonPackageSpecifier(refPath) {
+  if (typeof refPath !== 'string' || refPath.length === 0) return null
+  if (isAbsolute(refPath) || refPath.startsWith('.') || refPath.includes('\\')) return null
+  return refPath.split('/')[0].split('@')[0] === PANTHEON_PACKAGE_NAME ? refPath : null
+}
+
+/**
+ * Resolve the package root a registered plugin ref points into.
+ *
+ * Path-shaped refs resolve against the config that declares them, exactly as
+ * the loader does. A bare package specifier cannot be located from here, so it
+ * resolves to null: the package the host loads is NOT necessarily the package
+ * running this doctor, and standing ROOT in for it validated a surface the host
+ * may never load (a false green, not evidence).
+ *
+ * @param {{path:string, configPath:string}} ref
+ * @returns {string|null}
+ */
+export function resolveRegisteredPluginRoot(ref) {
+  const refPath = typeof ref === 'string' ? ref : ref?.path
+  if (typeof refPath !== 'string' || refPath.length === 0) return null
+
+  let absolute = null
+  if (isAbsolute(refPath)) {
+    absolute = refPath
+  } else if (ref?.configPath && /[\\/]/.test(refPath)) {
+    absolute = resolve(dirname(ref.configPath), refPath)
+  }
+  if (!absolute) return null
+
+  const normalized = absolute.replaceAll('\\', '/').replace(/\/+$/, '')
+  const marker =
+    /^(.*?)\/src\/plugin-v2(?:\/index\.ts|\.ts)?$/.exec(normalized) ??
+    /^(.*?)\/src\/plugin(?:-v2)?\.ts$/.exec(normalized)
+  const root = marker ? marker[1] : normalized
+  return existsSync(join(root, 'package.json')) ? root : null
+}
+
+/**
+ * Whether a registered ref belongs to Pantheon — the subject of this check.
+ *
+ * The same ownership criterion P0-6 uses: the plugin identity the installer
+ * writes (or a path inside an installed `pantheon-opencode` tree), or a
+ * `package.json` naming this package. Everything else belongs to the user, so a
+ * third-party plugin registered under `plugins` is ignored instead of being
+ * read as a Pantheon surface with a missing `src/pantheon/v2-tools.ts` (which
+ * failed a healthy installation as blocking).
+ *
+ * @param {{path:string, configPath:string}} ref
+ * @returns {boolean}
+ */
+export function isPantheonPluginRef(ref) {
+  const refPath = typeof ref === 'string' ? ref : ref?.path
+  if (typeof refPath !== 'string' || refPath.length === 0) return false
+  if (managedPluginPath(refPath) !== null) return true
+  if (pantheonPackageSpecifier(refPath) !== null) return true
+  const root = resolveRegisteredPluginRoot(ref)
+  if (!root) return false
+  return readJson(join(root, 'package.json'))?.name === PANTHEON_PACKAGE_NAME
+}
+
+/** Describe one registered surface for a finding message. */
+function describeSurface(surface) {
+  if (surface.files.length === 0) {
+    return `${surface.generation}: no tool surface under ${surface.root}`
+  }
+  return `${surface.generation}: ${surface.files.join(' + ')}`
+}
+
+/**
+ * Inspect every registered Pantheon plugin and report the tool names its
+ * declared surface contains. Non-Pantheon refs are ignored rather than failed:
+ * they are not this check's subject. An npm specifier is Pantheon's own subject
+ * but cannot be inspected, so it is carried as an explicit unverifiable surface
+ * instead of being skipped or passed against the running package.
+ *
+ * @param {{target:string, env?:object}} args
+ * @returns {{generation:'v1'|'v2'|null, root:string|null, files:string[], declared:string[]|null, unverifiable?:string}[]}
+ */
+export function resolveRegisteredToolSurfaces(args) {
+  const refs = collectRegisteredPluginRefs(collectMcpConfigs(args))
+  const surfaces = []
+  const seen = new Set()
+  for (const ref of refs) {
+    if (!isPantheonPluginRef(ref)) continue
+
+    if (pantheonPackageSpecifier(ref.path) !== null) {
+      const key = `spec:${ref.path}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      surfaces.push({
+        generation: null,
+        root: null,
+        files: [],
+        declared: null,
+        unverifiable:
+          `"${ref.path}" is an npm specifier, not a path — the host resolves it through its own ` +
+          'module graph, so the surface it loads cannot be inspected from here',
+      })
+      continue
+    }
+
+    const root = resolveRegisteredPluginRoot(ref)
+    if (!root) continue
+    const generation = ref.path?.includes('plugin-v2') || ref.key === 'plugins' ? 'v2' : 'v1'
+    const key = `${generation}:${root}`
+    if (seen.has(key)) continue
+    seen.add(key)
+
+    const files = TOOL_SURFACE_FILES[generation]
+      .map((relative) => join(root, relative))
+      .filter((file) => existsSync(file))
+    const declared = new Set()
+    let readable = 0
+    for (const file of files) {
+      let source = null
+      try {
+        source = readFileSync(file, 'utf8')
+      } catch {
+        continue
+      }
+      const names = readDeclaredToolNames(source, generation)
+      if (names === null) continue
+      readable++
+      for (const name of names) declared.add(name)
+    }
+    surfaces.push({
+      generation,
+      root,
+      files,
+      // No readable surface stays null so the classifier fails closed. With
+      // several generation files present the declarations are unioned, so a
+      // tool any of them declares is never reported absent.
+      declared: readable === 0 ? null : [...declared],
+    })
+  }
+  return surfaces
+}
+
+/**
+ * Decide the registration verdict for one tool. Backend availability is NOT an
+ * input: this answers only "is the tool in the registered surface?". A missing
+ * registration is a blocking error, never a warning (P0-3). A registration that
+ * cannot be inspected (npm specifier) is an explicit informative finding — it
+ * is neither proof of registration nor a blocking defect.
+ *
+ * `lite` is the only profile where no registration is expected: it describes a
+ * checkout, not a managed OpenCode install.
+ *
+ * @param {{profile:string, surfaces:{generation:string|null, files:string[], root:string|null, declared:string[]|null, unverifiable?:string}[], toolName:string}} input
+ * @returns {{status:'skip'|'unregistered'|'missing'|'registered'|'unverifiable'|'partially-verified', level:'info'|'error'|'pass', message:string}}
+ */
+export function classifyToolRegistration({ profile, surfaces, toolName }) {
+  if (surfaces.length === 0) {
+    if (profile === 'lite') {
+      return {
+        status: 'skip',
+        level: 'info',
+        message: `${toolName} registration check skipped — a lite checkout has no managed plugin registration`,
+      }
+    }
+    return {
+      status: 'unregistered',
+      level: 'error',
+      message: `${toolName} is not registered: no Pantheon plugin is declared in any reachable opencode.json, so an available backend does not expose the tool (run \`pantheon-opencode init\`)`,
+    }
+  }
+
+  const unverifiable = surfaces.filter((surface) => typeof surface.unverifiable === 'string')
+  const inspectable = surfaces.filter((surface) => typeof surface.unverifiable !== 'string')
+  const unverifiableDetail = unverifiable.map(({ unverifiable: reason }) => reason).join('; ')
+
+  const missing = inspectable.filter(
+    (surface) => surface.declared === null || !surface.declared.includes(toolName),
+  )
+  if (missing.length > 0) {
+    const detail = missing.map(describeSurface).join(', ')
+    return {
+      status: 'missing',
+      level: 'error',
+      message: `${toolName} is NOT declared in the registered tool surface (${detail}) — a working read-only backend does not register the tool`,
+    }
+  }
+
+  if (inspectable.length === 0) {
+    return {
+      status: 'unverifiable',
+      level: 'info',
+      message: `${toolName} registration cannot be verified: ${unverifiableDetail} — this is NOT a registration pass`,
+    }
+  }
+
+  const detail = inspectable.map(describeSurface).join(', ')
+  if (unverifiable.length > 0) {
+    return {
+      status: 'partially-verified',
+      level: 'info',
+      message: `${toolName} is declared in the inspectable Pantheon tool surface (${detail}), but another registration cannot be verified: ${unverifiableDetail} — not a full registration pass`,
+    }
+  }
+
+  return {
+    status: 'registered',
+    level: 'pass',
+    message: `${toolName} is registered in the Pantheon tool surface (${detail})`,
   }
 }
 
@@ -1875,7 +2401,7 @@ export function classifyNodePackageRuntime(version) {
   }
 }
 
-function checkNodeRuntime() {
+function checkNodeRuntime(args = {}) {
   section('K. Node Runtime')
   const packageRuntime = classifyNodePackageRuntime(process.versions.node)
   if (packageRuntime.status === 'supported') {
@@ -1904,6 +2430,38 @@ function checkNodeRuntime() {
       `Upgrade to Node >= ${NODE_SQLITE_MIN} (or a runtime with node:sqlite) to enable pantheon_cost`,
     )
   }
+
+  // Backend capability is NOT tool health (P0-3). A working node:sqlite with a
+  // tool absent from the registered surface used to produce a green doctor;
+  // this second, independent finding refuses to pass without registration.
+  const registration = classifyToolRegistration({
+    profile: args.profile,
+    surfaces: resolveRegisteredToolSurfaces(args),
+    toolName: 'pantheon_cost',
+  })
+  if (registration.level === 'pass') {
+    pass(registration.message, {
+      code: 'tool_registration_present',
+      classification: 'capability',
+    })
+  } else if (registration.level === 'error') {
+    error(registration.message, {
+      code: 'tool_registration_missing',
+      classification: 'capability',
+    })
+  } else if (
+    registration.status === 'unverifiable' ||
+    registration.status === 'partially-verified'
+  ) {
+    // Never a registration PASS: an npm specifier names a package the host may
+    // resolve elsewhere, so reporting it as registered would be a false green.
+    info(registration.message, {
+      code: 'tool_registration_unverifiable',
+      classification: 'capability',
+    })
+  } else {
+    info(registration.message)
+  }
 }
 
 /**
@@ -1931,6 +2489,7 @@ export function summaryMessage(summaryCounts, summaryExitCode) {
 }
 
 function printSummary(targetPath) {
+  flushSectionPasses()
   console.log(`\n${'='.repeat(60)}`)
   console.log('  Summary')
   console.log(`${'='.repeat(60)}`)
@@ -2130,6 +2689,7 @@ async function main() {
   checkCodeModeManifest(args)
   checkInstallVersionDrift(args)
   checkPluginVersionDrift(args)
+  await checkTuiPlugin(args)
   await checkInstallerFileInventory(args)
   if (jsonMode) {
     info('MCP runtime smoke skipped to keep --json read-only')

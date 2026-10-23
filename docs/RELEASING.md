@@ -45,7 +45,7 @@ node scripts/versioning.mjs changelog 1.6.0-beta.10
 node scripts/release-notes.mjs             # stable vX.Y.Z tags only
 node scripts/release-notes.mjs --draft     # last 30 commits, no tag lookup
 
-# CI-side consistency check (run in the version-check workflow job)
+# CI-side consistency check (run in the `validate` job of ci.yml)
 node scripts/version-check.mjs
 
 # Dry-run of the release payload (status + release notes + pack)
@@ -113,9 +113,10 @@ workflow-owned (see below).
    git push -u origin <branch>
    ```
 
-5. Wait for CI. The PR must pass `version-check` (package.json must be
-   **ahead** of the latest stable tag; pre-releases excluded) plus the other
-   required checks before merging.
+5. Wait for CI. The PR must pass `validate` (version manifests, engine,
+   packaging, sandbox), `test-suite`, `plugin-v2-ts-coverage`, `commitlint`,
+   `security-scan`, and `CodeQL` before merging. `ci.yml` also runs on pushes
+   to `main`, so the merged SHA carries its own CI evidence.
 
 > No tag is created locally. Merging an ordinary PR does **not** release. To
 > publish a stable version, use the explicit `Release` workflow dispatch after
@@ -207,7 +208,7 @@ conventional-commit notes.
 
 ## Stable Release (manual dispatch)
 
-Dispatching [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+Dispatching [`.github/workflows/release.yml`](https://github.com/ils15/pantheon-opencode/blob/main/.github/workflows/release.yml)
 without recovery inputs runs the stable release path:
 
 1. **Type**: channel=`stable`, npm dist-tag=`latest`.
@@ -255,6 +256,97 @@ The release evidence is fail-closed and has one artifact identity:
 
 Any `npm ci` failure blocks the run. There is no `npm install` fallback, and
 `PANTHEON_ALLOW_NPM_INSTALL_FALLBACK` is not part of the current contract.
+
+### Six release gates
+
+The `validate` job of `release.yml` runs six gates on the frozen `TARGET_SHA`.
+Each prints `GATE <name>: PASS` and writes a named evidence file to
+`$RUNNER_TEMP/gate-evidence/<name>.json`; the directory is uploaded as
+`release-gate-evidence-<run_id>` (90-day retention). There is no fallback: a
+command that cannot run, a missing artifact, an unsupported host, or a `SKIP`
+is a failed gate, and a failed gate aborts before the artifact upload and
+before any release credential is exposed.
+
+| Gate | Executed by | Fails when | Evidence |
+|---|---|---|---|
+| (a) tests | `scripts/release-gates.mjs tests`: pytest + `src/mcp` coverage ≥ 80, `test:node`, `test:ts`, `coverage:plugin-v2`, `test:install`; pytest runs in an isolated venv built from `src/mcp/requirements-mcp.txt` | any suite, coverage threshold, or the mandatory install tier fails; an unsatisfiable or unverified pin set fails the gate | `tests.json` |
+| (b) host compatibility | `scripts/release-gates.mjs host`: each **measured** host installed and exercised in an isolated sandbox; the gate reports a supported family with no row as "supported, unmeasured" instead of failing it | a measured row fails, or a known-broken host is listed | `host.json` |
+| (c) install | `scripts/release-gates.mjs install`: the immutable `.tgz` installed globally, headless init, `validate-sandbox-install.mjs`, and a host-backed tool canary | install, init, source comparison, MCP/doctor checks, or canary fails or skips | `install.json`, `install-canary.log` |
+| (d) package | `scripts/release-gates.mjs package`: SHA-256 recomputed over the same `.tgz`, payload inspected, `package:validate` | the digest, name, version, target SHA, or payload disagree; no second `npm pack` is accepted | `package.json` |
+| (e) changelog | `scripts/release-gates.mjs changelog`: `changelog-extract.mjs` | the `[version]` section is missing or empty; recovery checks the tag instead | `changelog.json`, `changelog.md` |
+| (f) metadata | `scripts/release-gates.mjs metadata`: `version-check.mjs` + `validate-node-engine-policy.mjs` | manifests drift, the channel/version shape is wrong, or the SHA is not 40 hex | `metadata.json` |
+
+The host evidence matrix is declared in `release.yml` (`PANTHEON_RELEASE_MATRIX`)
+and is validated by the gate, not trusted. Support is family-level: the gate
+requires no row per family, reports a family with no row as "supported,
+unmeasured", and fails only when a measured row fails or a known-broken host is
+listed. See [Compatibility](COMPATIBILITY.md) for the support policy and the
+known-broken set. A measured row that cannot run is a failure — the release path
+has no `SKIP`.
+
+#### Python test environment (gate a)
+
+The Python suite imports `fastmcp`/`mcp` at collection time, so its verdict only
+means something against the pins in `src/mcp/requirements-mcp.txt`. Gate (a)
+therefore does **not** use the runner's ambient interpreter:
+
+- the `validate` job creates `$RUNNER_TEMP/gate-venv` with `python3 -m venv`
+  from the interpreter pinned by `actions/setup-python`
+  (`python-version: '3.12'`, i.e. CPython 3.12.x on `ubuntu-latest`; the
+  package metadata declares `requires-python >= 3.11`), installs
+  `coverage pytest pyyaml`, `pytest-asyncio==1.3.0`, and
+  `-r src/mcp/requirements-mcp.txt -r src/mcp/requirements-vision.txt`;
+- `PANTHEON_PYTHON` is exported to that venv and `release-gates.mjs` resolves
+  every Python command through it. A set-but-missing or non-executable
+  `PANTHEON_PYTHON` is a hard failure, never a fallback to the ambient
+  `python3`;
+- `pip check` and an explicit assertion that every `==` pin in both
+  requirements files is installed at exactly that version run **before** pytest.
+  A failed venv creation, download, install, or pin assertion aborts the job
+  (fail-closed via `set -euo pipefail`); no failure is downgraded to a skip;
+- `actions/setup-python`'s `cache: pip` still applies: the venv's pip shares
+  `~/.cache/pip`, so the download cache is reused while the install itself
+  stays isolated;
+- the CI `test-suite` job builds the same venv (`$RUNNER_TEMP/ci-venv`) and
+  points `PANTHEON_PYTHON` at it, so CI and the release gate share one
+  environment contract;
+- `tests.json` records the interpreter path and `python --version` used for the
+  run.
+
+Local equivalent of the gate's Python step:
+
+```bash
+python3 -m venv /tmp/pantheon-gate-venv
+/tmp/pantheon-gate-venv/bin/python -m pip install -r src/mcp/requirements-mcp.txt -r src/mcp/requirements-vision.txt
+PANTHEON_PYTHON=/tmp/pantheon-gate-venv/bin/python \
+  node scripts/release-gates.mjs tests --evidence-dir /tmp/gate-evidence
+```
+
+Running `pytest` on an interpreter without these pins is not evidence: with
+`fastmcp 3.4.2` / `mcp 1.28.0` on `PATH`, `tests/test_persistence_goals.py`
+fails at **collection** by design, which is an environment defect, not a
+product defect.
+
+### Test tiers
+
+- **Default (developer loop):** `npm run test:node` runs `tests/*.mjs` and
+  `tests/pantheon/*.mjs` **excluding** `tests/install-opencode.test.mjs` and
+  `tests/install-e2e.test.mjs`. A bare `node --test` over those files skips
+  their cases with an explicit reason unless the tier is opted into.
+- **Heavy tier (optional locally, mandatory in release):**
+  `npm run test:install` sets `PANTHEON_RUN_INSTALL_TESTS=1` and runs both
+  real-install files. `npm test` / `test:all` does not include it, so the local
+  loop stays fast; gate (a) always includes it.
+
+### Coverage contract
+
+- **Required:** Python `src/mcp` branch coverage **≥ 80%**
+  (`coverage report --fail-under=80`) and the `src/plugin-v2.ts` line
+  measurement (`npm run coverage:plugin-v2`). Both run in gate (a).
+- **Not PASS:** Node coverage (`npm run coverage`) is report-only and enforces
+  no threshold; TypeScript under `src/` outside the plugin-v2 measurement is
+  unmeasured. Neither may be cited as evidence that a threshold passed.
+- No new threshold is introduced by this contract.
 
 ### Memory MCP packaging
 
@@ -346,85 +438,105 @@ npm deprecate pantheon-opencode@<ver> "reason: <why it should not be used>"
 
 ---
 
-## Branch Protection (main)
+## Rollback
 
-> **Status: ACTIVE as of Phase 5 (release-standardization).** `main` requires
-> a PR review plus 5 passing checks. Enabling required checks on an existing
-> `main` is effectively a one-way door — verify the pre-flight checklist
-> before applying changes.
+> **Manual step with human approval.** The release workflow never rolls back —
+> it publishes forward only. Re-pointing the npm `latest` tag is decided and
+> executed by a maintainer, outside the automated path.
 
-### Protection
+A rollback re-points the `latest` dist-tag. It does not delete the released
+artifact and it does not rewrite history.
 
-- `required_pull_request_reviews[required_approving_review_count]=1`
-- 5 required status checks: **`version-check`**, **`validate`**,
-  **`commitlint`**, **`security-scan`**, **`CodeQL`**
-- `enforce_admins=false` initially (owner/admin bypass for release unblock)
+### Trigger
 
-### Enable / verify
+Roll back when a blocking defect is discovered **after** the stable publication
+and `latest` carries a regression that prevents use — for example an installer
+that cannot complete, or a package that does not start on the supported OpenCode
+line. A defect that can wait for the next patch does not qualify: publish
+forward instead.
 
-```bash
-gh api -X PUT repos/ils15/pantheon-opencode/branches/main/protection \
-  -F required_status_checks[strict]=true \
-  -f 'required_status_checks[checks][][context]=version-check' \
-  -f 'required_status_checks[checks][][context]=validate' \
-  -f 'required_status_checks[checks][][context]=commitlint' \
-  -f 'required_status_checks[checks][][context]=security-scan' \
-  -f 'required_status_checks[checks][][context]=CodeQL' \
-  -F 'required_pull_request_reviews[required_approving_review_count]=1' \
-  -F enforce_admins=false
-```
-
-> GitHub reports checks by **job name** (or the name set by the action).
-> The contexts above map to: `validate` + `version-check` (jobs in
-> `.github/workflows/ci.yml`), `commitlint` (job in
-> `commit-lint.yml`), `security-scan` (job in `security-scan.yml`), and
-> `CodeQL` (analysis reported by `github/codeql-action` in `codeql.yml`).
-> Verify the exact reported names before enforcing:
+### Restore the stable channel
 
 ```bash
-gh api repos/ils15/pantheon-opencode/commits/HEAD/check-runs \
-  --jq '.check_runs[].name' | sort -u
+npm dist-tag add pantheon-opencode@1.5.2 latest
 ```
 
-### MANDATORY pre-flight checklist
+Syntax: `npm dist-tag add <package-spec (with version)> [<tag>]`
+(`npm dist-tag --help`).
 
-If a required check never passes, **every** push to `main` is locked out,
-including the release pipeline. Confirm ALL of the following before the PUT:
+`1.6.0` **remains published** on npm — only the `latest` pointer moves back to
+`1.5.2`. Consumers without a lockfile resolve `1.5.2` again, while the
+regressed version stays reachable by exact version. Nothing is re-tagged on
+git, and no workflow runs.
 
-- [ ] **(a)** All 5 checks exist as workflow jobs: `ci.yml`
-      (`validate`, `version-check`), `commit-lint.yml` (`commitlint`),
-      `security-scan.yml` (`security-scan`), `codeql.yml` (`analyze`/CodeQL).
-- [ ] **(b)** They all PASS on current `main` (or a PR). If any fails, fix
-      the workflow first — never enable protection on a failing check.
-- [ ] **(c)** ONLY then apply the PUT. After the fact, verify with:
-      ```bash
-      gh api repos/ils15/pantheon-opencode/branches/main/protection
-      ```
+### Do not
 
-### Admin bypass
+- **Do not `npm unpublish`.** Unpublishing is destructive and irreversible: it
+  breaks every consumer whose lockfile pins the affected version, and it defeats
+  the `npm_check` idempotency gate. Versions are deprecated, never removed (see
+  [npm Policy](#npm-policy)).
+- **Do not rewrite the GitHub Release without a note.** The Release is the
+  published record of what shipped; editing or deleting it silently hides the
+  incident from everyone who reads the changelog later.
 
-- **Initial:** `enforce_admins=false` — repo owner can push past failing
-  checks to unblock the release pipeline.
-- **After 2 stable releases:** remove the bypass:
-  ```bash
-  gh api -X PATCH repos/ils15/pantheon-opencode/branches/main/protection \
-    -F enforce_admins=true
-  ```
+### What a rollback does not undo
 
-### Grandfather policy
+- **Zenodo archival** — once the GitHub Release exists, the Zenodo integration
+  has deposited the record and version DOI. That deposit is irreversible.
+- **The git tag** — `v1.6.0` stays on its commit. The tag is immutable and is
+  not moved or deleted during a rollback.
 
-Commitlint is enforced **from this point forward** on all new commits (local
-`.husky/commit-msg` hook + CI `commitlint` job). **All commits before
-2026-08 are grandfathered** — they are never rewritten or retroactively
-linted. Known example in current history:
+### Required record
 
-- `release: v1.2.1 (#13)` — type `release` is not a conventional type
+Log the rollback on the release (or the tracking issue) before or immediately
+after the command runs:
 
-`git log -15 --format=%s | npx --no commitlint` will list such commits as
-violations; that output is expected and accepted. New commits must follow
-Conventional Commits (see `commitlint.config.js`).
+- the defect that triggered it, with evidence;
+- the command executed, verbatim;
+- the resulting `npm view pantheon-opencode dist-tags` output.
+
+Without that record, a later reader cannot tell a rollback apart from a failed
+publication.
 
 ---
+
+## Retiring the `next` dist-tag
+
+> **Manual step with human approval.** Not part of the automated release
+> workflow.
+
+`next` was the pre-stable preview channel. Once stable `v1.6.0` is published and
+verified it has no remaining purpose, and leaving it in place invites new
+releases to be tagged into a channel nobody resolves. It is removed exactly
+once.
+
+**Prerequisite:** the post-publication verification of the stable release
+passed — `npm view pantheon-opencode dist-tags` reports `latest` = `1.6.0`, and
+installing `pantheon-opencode@1.6.0` from the public registry works. Removing
+`next` before that check leaves consumers who follow `next` without a
+resolution target while the stable channel is still unproven.
+
+```bash
+# Only after the post-publication verification passed.
+npm dist-tag rm pantheon-opencode next
+
+# Prove the result: latest = 1.6.0, beta preserved, next absent.
+npm view pantheon-opencode dist-tags
+```
+
+Syntax: `npm dist-tag rm <package-spec> <tag>` (`npm dist-tag --help`).
+
+The removal only drops a tag — no published version is deleted. `beta`
+continues to point at the beta line and is **not** touched by this step.
+
+---
+
+## Branch protection (main)
+
+The `main` protection policy — required checks, admin bypass, and the manual
+enable/verify procedure — lives in [Branch Protection](BRANCH-PROTECTION.md).
+The release job still re-runs the six gates on the frozen `TARGET_SHA`;
+protection does not replace them.
 
 ## Pre-Release Checklist
 
@@ -435,8 +547,11 @@ Before cutting a release, verify:
 - [ ] `CHANGELOG.md` has a `## [X.Y.Z] - date` entry for the new version
 - [ ] Version manifests match: `package.json` == `plugin.json` ==
       `pyproject.toml` == `src/plugins/tui/package.json`
-- [ ] All required checks green on the bump PR (`version-check`, `validate`,
+- [ ] All required checks green on the bump PR **and on the push run for the
+      merged `main` SHA** (`validate`, `test-suite`, `plugin-v2-ts-coverage`,
       `commitlint`, `security-scan`, `CodeQL`)
+- [ ] The six release gates are expected to PASS for the frozen `TARGET_SHA`;
+      the dispatch's `validate` job is the authority (it re-runs all six)
 - [ ] `npm run release:dry-run` passes (status + pack)
 
 ---
@@ -478,7 +593,7 @@ Release. Only the stable channel creates a GitHub Release, so only stable
 versions are archived. Beta releases create a git tag and publish to npm but no
 Release, and are therefore intentionally absent from the Zenodo family.
 
-[`.zenodo.json`](../.zenodo.json) is the source of the deposited metadata
+[`.zenodo.json`](https://github.com/ils15/pantheon-opencode/blob/main/.zenodo.json) is the source of the deposited metadata
 (title, creators/ORCID, description, license, keywords, and related
 identifiers). `scripts/versioning.mjs` bumps its `version`, `publication_date`,
 and `url` alongside the other manifests on every release, so the file must stay

@@ -10,526 +10,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 <!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. -->
 
-## 🆕 What's New
+## [v1.6.0] - 2026-10-22
 
-## 🐞 Fixed
+### Added
 
-## ⚠️ Known Issues
+- OpenCode 1.19.x and 2.x support with `auto` generation detection; OpenCode 2.0.22 is known broken.
+- Per-agent MCP permissions on both generations; omitted servers and undeclared tools are denied by default.
+- `pantheon_cost` now reports USD by agent, model and session, accepts `session` scope, and has a hard offline gate that refuses `refreshPricing`.
+- Opt-in V2 memory injection can add the most relevant entries to the request context; it is off by default.
+- V2 compaction prunes repeated tool output before summarization, keeping the newest result and recent turns.
+- The V2 sidebar aggregates child work in a `Dispatch` block, and `/dispatch` opens a full-width panel over the same data.
+- The installer previews each file before apply, detects drift, keeps an exact backup, and provides `restore`, `reconcile` and `uninstall`.
+- A pristine project database now starts with both checkpoint and goal schemas; startup never adds goal DDL to an existing database.
+- Migrating an existing database for the manual goal tools is an explicit step: dry-run first, server stopped, target confirmed, verified `0600` backup.
+- When the goal schema is absent, the goal tools return the exact migration command.
 
-## ✅ Closed Issues
+### Changed
 
-## [v1.6.0-beta.18] - 2026-10-22
+- V2 installs no longer duplicate global and project instruction context, reducing the first-request payload.
+- Memory entries are capped at 64 KiB, can expire via `ttl_seconds`, and `memory_search` returns typed errors when the store is unreadable.
+- Node.js 26.4.0 is the package floor; the `node:sqlite` cost backend keeps its separate >=22.5 threshold.
+- Plan approval always shows the full plan in the main conversation, never a pointer into a child session.
 
-- **Persistence goal-schema initialization and migration guidance:** a pristine
-  project database now starts with both checkpoint and goal schemas; startup
-  does not add goal DDL to an existing database. Existing-DB migration is only
-  for users who want manual goal tools. When the schema is absent, the goal tools
-  themselves return the exact migration command. User-facing guidance covers
-  dry-run first, a stopped server, target confirmation, and verified `0600`
-  backups.
+### Deprecated
 
-## [v1.6.0-beta.17] - 2026-10-21
+- V1 `pantheon_goal_create`, `pantheon_goal_update` and `pantheon_goal_get` are soft-deprecated; stored goals no longer continue a session automatically.
 
-- **Persistence MCP reduced to six registered tools:** only `context_save`,
-  `context_get`, and the four `goal_*` tools remain exposed; the twelve KV and
-  context-management tools were unregistered while internal SQLite KV helpers
-  remain for checkpoint storage. Goal tools are Zeus-only because goals are
-  session-scoped and cannot be read across sessions, so Athena/Themis cannot
-  read Zeus's goal or create one in their own root session.
-- **Phase 7 — Memory search error contract:** `memory_search` now returns a
-  typed, sanitized error when the memory store cannot be read instead of an
-  empty list; an empty result now means nothing matched. All-stopword queries
-  previously fell back to a literal FTS match and now return no results, making
-  the behavior uniform with queries whose stopwords are dropped.
-- **Phase 8 — Memory MCP packaging:** `scripts/memory_mcp.py` is now a thin shim
-  delegating to canonical `src/mcp/memory_mcp.py`, removing the stale divergent
-  copy; the sync test now asserts that their registered tool lists are equal.
+**Upgrade required:** `npm install -g pantheon-opencode@beta && pantheon-opencode update` — see [UPGRADING.md](docs/UPGRADING.md).
 
-## 🆕 What's New
+### Removed
 
-- **V1 goal tools soft-deprecated:** `pantheon_goal_create`,
-  `pantheon_goal_update`, and `pantheon_goal_get` remain available with
-  unchanged behavior, but stored legacy goals are not automatically continued
-  in the current build. The durable manual replacement is the Persistence MCP
-  `goal_*` surface available in this branch. Tool removal is deferred to a
-  future release and requires explicit human approval.
+- Twelve Persistence KV and context-management tools are unregistered; checkpoints and manual goals remain.
+- The legacy vector/embedding memory path is removed; SQLite FTS5/BM25 search and the `code_*` tools remain.
+- The V2 goal tools are removed and replaced by the manual Persistence `goal_*` tools.
+- `steps` is no longer written into managed agents; the host applies no native step ceiling by default.
+- The maintainer's `opencode.json` and `.opencode/` are no longer shipped in the package.
 
-## 🐞 Fixed
+**Upgrade required:** `npm install -g pantheon-opencode@beta && pantheon-opencode update` — see [UPGRADING.md](docs/UPGRADING.md).
 
-- **Disabled goal loop does not suppress idle enforcement:** `hasActiveGoal`
-  now returns false while the loop is disabled, so stored legacy goals do not
-  prevent the todo enforcer from receiving idle events.
-- **Empty child-dispatch result is an explicit error:** an empty result returned by a child dispatch is now surfaced as an error instead of being passed through as a normal result.
+### Fixed
 
-## ⚠️ Known Issues
+- V2 plugin tools now execute instead of reporting a false success, and every tool declares the `output` schema the host requires.
+- An empty child dispatch result is surfaced as an error instead of a silent completed call.
+- Scoped `pantheon_cost` reports with no matching rows render an empty report instead of `UNSUPPORTED`.
+- Sub-cent costs render as `< $0.0001`; a real zero stays `$0.00`.
+- Cache-only assistant turns count as readable cost usage.
+- A session-scoped cost request on the CLI fallback returns `UNSUPPORTED` instead of an unscoped total.
 
-- **`pantheon_cost` aggregates by agent and phase:** V1 reports both dimensions; V2 reports the literal phase `unknown`. The shipped tool has no per-session, per-model, per-provider or USD dimension; per-session aggregation exists only in the unpublished benchmark harness.
-- **An empty child result can arrive as a completed call:** the host supplies the placeholder `Subagent completed without a text response.`; Pantheon’s guard replaces the payload with its explicit error text, while the host’s completed status remains unchanged.
-- **A user `opencode.jsonc` can change the effective plugin set:** the host merges `opencode.json` with a sibling `opencode.jsonc` (scalars from `.jsonc` win, arrays are unioned), and Pantheon registers its plugin only in `opencode.json`.
+### Security
 
-## ✅ Closed Issues
+- Three permission holes are closed: `hashline_edit` no longer bypasses `edit: deny`, and the V2 read-only guard and secret scan are active.
 
-## [v1.6.0-beta.15] - 2026-10-19
-
-## 🆕 What's New
-
-- **Safe memory handoffs and agent contracts:** delegation briefs can pass
-  minimized, non-sensitive memory references and takeaways as untrusted context;
-  return formats and discovery/review routing are clarified across agent roles.
-- **Optional per-session token breakdowns:** benchmark reports can show root and
-  descendant usage when session data is complete; incomplete data remains
-  unavailable rather than being zero-filled.
-
-## 🐞 Fixed
-
-- **Empty task/subagent results:** empty child-dispatch results are surfaced as
-  explicit errors while non-empty structured results remain intact.
-
-## [v1.6.0-beta.14] - 2026-10-17
-
-_Published manually to npm on 2026-10-17; source commit and tag unknown._
-
-## 🆕 What's New
-
-- **Installer model profiles:** choose Inherit, OpenCode Go (hybrid), OpenAI, or
-  Anthropic. Inherit leaves the active preset unset; OpenCode Go combines the
-  premium lineup for Zeus, Athena, Themis, and Hephaestus with the Go lineup for
-  other agents. Existing `go-free`, `go-fast`, and `go-premium` preset IDs remain
-  available for compatibility.
-- **Anthropic key guidance:** the profile identifies `ANTHROPIC_API_KEY` as the
-  required environment variable. The installer does not collect or inspect API
-  keys; configure the key in your environment.
-- **Modernized installer progress and terminal safety:** Clack spinners are used
-  in interactive TTYs, with readable output in headless/non-TTY runs. Canceling
-  or selecting no components stops safely without writes; `--no-mcp` continues
-  to exclude runtime, and `--yes` does not override an explicit decline.
-- **Proportional delegation guidance:** prompts now route bounded work directly
-  to the relevant specialist and call for planning, broad discovery, review, or
-  parallel work only when the request, uncertainty, dependencies, or risk
-  warrant it.
-
-## 🐞 Fixed
-
-- **Reduce duplicated CI work:** plugin V2 coverage now measures one focused
-  TypeScript contract test while retaining its required 80% line-coverage
-  threshold. The hook canary has one CI owner (`test:node`); its duplicate
-  standalone CI invocation was removed. This records the CI configuration
-  change, not a claim that the current CI run passed.
-
-## [v1.6.0-beta.13] - 2026-10-17
-
-## 🆕 What's New
-
-- **Modernize interactive TTY setup** with `@clack/prompts` while keeping the
-  existing component, install-location, authorization, and worktree guidance
-  choices. Canceling the setup wizard leaves configuration unchanged; headless,
-  `--yes`, dry-run, and non-TTY behavior remain available.
-
-## 🐞 Fixed
-
-- **Let npm finish on an unsupported Node runtime:** postinstall now warns and
-  skips Node-dependent TUI/config sync, leaving the CLI to show its explicit
-  Node >=26.4.0 hard gate and user-managed upgrade instructions.
-- **Synchronize Beta 13 package and release metadata** across manifests and
-  lockfiles without changing the Node >=26.4.0 engine floor.
-
-## [v1.6.0-beta.12] - 2026-10-17
-
-## 🆕 What's New
-
-- **Raise the Node.js support floor to 26.4.0** for the package, CLI, installer,
-  and Node-based tooling. This release drops Node 22, Node 24, and Node
-  26.0–26.3; the npm `beta` dist-tag remains the intended publication channel.
-- **Clarify runtime boundaries:** this package requirement is not a universal
-  OpenCode host-runtime claim. Official OpenCode V2.0.31 has a Bun runtime path
-  and a separate Node build pinned to 26.4.0; no Bun minimum is asserted.
-- **Keep `node:sqlite` as a separate capability threshold:** Node >=22.5 may
-  provide the optional `pantheon_cost` backend, but does not imply package
-  support on that Node version.
-- **Recommend a persistent external Git worktree location** in interactive TTY
-  setup summaries and the shipped worktrees skill. This is guidance only;
-  Pantheon does not create worktrees or directories automatically.
-
-## 🐞 Fixed
-
-- **Synchronize Beta 12 version metadata and Node engine policy** across package
-  manifests, locks, citation/release metadata, CLI guards, doctor, and CI.
-
-## [v1.6.0-beta.11] - 2026-10-15
-
-## 🆕 What's New
-
-- **record final Beta 11 scope decisions**
-- **record Setup delivery and final-gate lessons in roadmap**
-- **forbid hook bypass in Iris commit contract**
-- **add installer failure reporting and secret-safe output audit**
-- **detect drift between installer plan and apply**
-- **require explicit --yes authorization before installer apply**
-- **exact installer backup set with restore**
-- **add Beta 11 test-economy requirement to shared instructions**
-- **preview per-file change set in installer dry-run**
-- **reconcile Beta 11 roadmap status with completed phases**
-- **describe pantheon_cost window and aggregation limits**
-- **align lean-flow guidance and cost wording**
-- **add project-scoped V2 model overrides**
-- **align host tool and background contracts**
-
-## 🐞 Fixed
-
-- **restore explicit "both" in zeus memory operations instruction**
-- **correct council protocol and persistence bounds**
-
-## [v1.6.0-beta.10] - 2026-10-12
-
-## 🆕 What's New
-
-- **Visible plan approval:** Zeus displays Athena's complete plan in the main
-  conversation before requesting approval, including for `/pantheon-deepwork`.
-- **OpenCode V2 Vision:** adds `vision_describe` using the live image-capable
-  model catalog and OpenCode Zen authentication; relative image paths resolve
-  from the active project directory.
-
-- **Menos contexto de instruções duplicadas no OpenCode V2:** regras comuns
-  entre as instruções globais e de projeto são emitidas uma vez, preservando
-  regras exclusivas. Na medição intercalada do beta-10 com OpenCode v2.0.29, o
-  proxy de contexto do primeiro request caiu 11,8%; input total e latência de
-  parede permanecem inconclusivos.
-
-- **Admissão segura de subagents no OpenCode V2:** quando o host registra o
-  hook de permissões, Pantheon correlaciona o
-  agente, a sessão e o alvo do evento nativo `subagent` com o `source` da
-  avaliação de permissão, antes da criação da sessão filha. A matriz permite
-  Zeus→Apollo em uma sessão root e nega dispatches fora da matriz ou originados
-  em uma sessão filha. A canary isolada passou em 18/18 verificações no
-  OpenCode v2.0.29.
-
-Evidência de F1 e F4A: `bench/results/f1-di-v229-interleaved-2026-10-14.md` e
-`bench/results/f4a-v229-admission-identity-2026-10-14.md`. O resultado de
-latência total e wall de F1 segue inconclusivo.
-
-- **Especialista explícito como root no V2 (F3a):** no cenário one-shot B,
-  Talos iniciado explicitamente como agente root produziu o artefato correto
-  sem child em 5/5 runs na amostra inicial. Um recheck de integração posterior
-  encontrou 4/5; a instrução de Talos passou a exigir que arquivos pedidos
-  sejam realmente gravados com a ferramenta nativa. Uma nova coorte
-  pré-registrada passou em 5/5, sem children nem chamadas `subagent`. Nessa
-  coorte, o proxy de contexto do primeiro request foi 9.675 tokens para Talos
-  e 13.009 para Zeus (−25,6%, confirmado contra o spread intra-braço). Input
-  total e wall permanecem sem claim de ganho; não há claim de economia
-  monetária ou roteamento geral. O primeiro recheck e o follow-up são mantidos
-  separadamente em `bench/results/beta10-final-integration-2026-10-15.md` e
-  `bench/results/beta10-final-integration-followup-2026-10-15.md`; a evidência
-  inicial está em `bench/results/f3a-root-paired-2026-10-14.md`.
-
-- **Leitura bounded no OpenCode V2:** adiciona `pantheon_bounded_read` para
-  sessões root do Zeus, com aprovação nativa por arquivo, sem grant persistente,
-  limites de chamadas/arquivos/linhas/bytes e scanner de segredos fail-closed.
-  Validado no OpenCode v2.0.29; detalhes e limitações em
-  `bench/results/f3b-v229-bounded-read-2026-10-15.md`.
-
-## [v1.6.0-beta.9] - 2026-10-12
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🆕 What's New
-
-- **Entry point TUI dedicado ao OpenCode V2.** O pacote agora compila e instala
-  separadamente os loaders V1/V2, e adiciona `/pantheon-focus` para foco de
-  sessão sem depender das goal-tools ausentes no host V2.
-
-## 🐞 Fixed
-
-- **Instalação V2:** agentes e slash commands de projeto são instalados nos
-  diretórios descobertos pelo host; o TUI seleciona o bundle da geração correta
-  e o estado dos componentes só é marcado como instalado após sucesso.
-- **`/pantheon-audit`:** inclui o scanner heurístico no pacote e localiza a cópia
-  instalada antes de executar a primeira camada.
-- **`/pantheon-consolidate`:** delega a consolidação ao agente Mnemosyne, dono
-  da qualidade do banco de memória.
-
-## ⚠️ Known Issues
-
-- **Sidebar V2 na sessão inicial:** a captura do TUI recém-aberto ainda não
-  mostra o conteúdo Pantheon antes do primeiro prompt; validar o render inicial
-  interativo continua sendo um gate aberto para a beta.
-- **Goal persistente no OpenCode V2:** as goal-tools não fazem parte da
-  superfície V2 suportada; `/pantheon-focus` não substitui uma goal-tool
-  persistente/removível do host.
-
-## [v1.6.0-beta.8] - 2026-10-11
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🐞 Fixed
-
-- **opencode-v2** — repair session lookup and beta sandbox reuse
-- **scripts** — isolate beta background service port
-## [v1.6.0-beta.7] - 2026-10-10
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🆕 What's New
-
-- **Permissões MCP nativas por agente no OpenCode V1 e V2.** O instalador
-  converte a allowlist `mcp_tools` de cada agente em regras nativas: nega por
-  padrão os servidores Pantheon omitidos, libera apenas as ferramentas
-  declaradas e preserva MCPs de terceiros. O V2 mantém os servidores
-  conectados; as regras limitam quais ferramentas cada agente vê.
-- **Guarda V2 de delegação alinhada ao contrato de permissões.** Os hooks de
-  permissão e de sessão aplicam as restrições de sessão somente-leitura e a
-  matriz caller→target sem conceder acesso além do configurado pelo host.
-- **Menos chamadas automáticas de memória e compressão.** A busca de contexto
-  do Zeus reutiliza o resultado de início de tarefa, e o protocolo de
-  compressão deixa de recomendar pipelines automáticos extensos.
-- **Prova de identidade da instalação do sandbox.** O teste global compara a
-  versão e arquivos do pacote instalado com este checkout e rejeita referências
-  npm antigas nas configurações ativas antes de validar o runtime.
-- O `--prepare` agora gera `start-pantheon.sh` para abrir o TUI interativo com o
-  beta instalado e HOME, configuração XDG, projeto e banco de dados isolados do
-  sandbox. O launcher fixa a porta do serviço gerenciado em `49376` e falha sem
-  parar serviços existentes se a porta dedicada já estiver ocupada.
-
-## 🐞 Fixed
-
-- Referências versionadas/alias do pacote Pantheon que sobravam na lista
-  `plugins` agora são reconhecidas pelo instalador e substituídas pelo caminho
-  do plugin local correto, sem afetar plugins de terceiros com nomes parecidos.
-- A suíte CI foi separada do caminho crítico de instalação/empacotamento para
-  reduzir o tempo até o resultado das verificações do pacote.
-- O `run-test.sh` gerado agora define seu timeout do `mcp list` antes do uso
-  sob `set -u`; antes, a variável ausente interrompia o teste antes de chamar
-  o CLI. A saída do comando também fica disponível quando o gate falha.
-
-## ⚠️ Known Issues
-
-- **A delegação real ainda precisa de confirmação nesta beta.** O teste manual
-  anterior de `HERMES-PONG` foi negado com
-  `Pantheon delegation denied: authoritative caller session is unavailable`;
-  a correção de permissões e a instalação isolada precisam ser verificadas no
-  TUI OpenCode V2 antes de considerar a delegação validada.
-## [v1.6.0-beta.6] - 2026-10-05
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🆕 What's New
-
-- **Política de suporte documentada: a linha 1.6.x é a ÚLTIMA compatível com OpenCode 1.X.** A partir de **1.7, toda release é breaking change com alvo em OpenCode 2.** O limite está escrito no `README.md` (seção "Compatibility and support policy", com matriz de suporte) e em `docs/INSTALLATION.md` (seção "OpenCode V1/V2 — contrato de plugin"), não duplicado em um documento novo: os dois arquivos já eram o ponto de entrada do contrato de plugin, e um terceiro documento seria um terceiro lugar para divergir. O texto distingue as duas células da linha 1.6.x — a célula 1.X é o contrato V1 (6 tools, lifecycle do board, hooks V1, compaction V1) e a célula OpenCode 2 é o contrato V2, que é real porém **menor**: 3 tools, sem as `pantheon_goal_*` e sem a matriz de delegação caller→target. **O suporte a OpenCode 2 na linha 1.6 é documentado como parcial, e não como completo**, por duas razões verificadas: (a) o canário de ferramentas V2 foi escrito contra `opencode 2.0.22`, host que não é publicado em nenhum canal npm — contra o `@opencode-ai/cli` instalável o mesmo canário falha 12/12, porque `/api/experimental/session/{id}/wait` foi promovido para `/api/session/{id}/wait` (404 no caminho antigo) e `ctx.tool.list` não existe mais; corrigindo apenas a rota, 10/12 passam no mesmo host, o que caracteriza descasamento canário/host e não regressão medida do plugin (issue #216, PR #213); (b) não existe perna V1 de validação end-to-end — `scripts/test-opencode-v2-sandbox.sh` é V2-only e rejeita `--run v1` — portanto a versão exata de host 1.X exercitada end-to-end pela linha 1.6 fica registrada como **não verificada**, e o caminho 1.X é sustentado pelo pin de dependência (`@opencode-ai/plugin` / `@opencode-ai/sdk` `1.18.33`), pelos testes unitários do gate de geração e pelos testes end-to-end do installer sobre a config emitida.
-
-## 🐞 Fixed
-
-- **Os exemplos de chamada MCP nos arquivos de prompt ensinavam um contrato que não existe no schema real.** Um `pantheon-persistence.kv_get` ao vivo foi rejeitado com `namespace: Missing key`; a linha que o produziu foi `src/agents/zeus.md:189` (`depth = kv_get("deleg:depth") ?? 0`), cuja cópia instalada em `~/.config/opencode/agents/zeus.md` é a que executou. A causa não era o servidor MCP: os arquivos de agente e de instrução ensinavam chamadas posicionais sem `namespace`, enquanto o schema real é `kv_get({ namespace /* obrigatório, sem default */, key, scope? })` — `kv_store.namespace` é igualmente obrigatório e `kv_store.value` é `str`. **A correção está nos docs, e não em adicionar um `namespace` default:** um default escreveria estado de coordenação no namespace errado silenciosamente, então *obrigatório* é o desenho correto. A mesma classe de defeito foi corrigida em `context_save` (posicional, com um helper `json()` inexistente e sem o `session_id` obrigatório → forma por palavra-chave com `content=JSON.stringify(...)`), em `memory_store` (`value` precisa ser uma string JSON codificada → agora iguala o padrão já correto de `metadata`, o que resolveu uma aut contradição no mesmo arquivo), na aritmética de profundidade (envolvida em `String(...)`, porque `kv_store.value` é `str` e não `int`) e em `memory_search(query, ...)` → `query=` em todas as instâncias. `AGENTS.md` é artefato gerado e foi reconstruído, nunca editado à mão.
-- **Um bypass de permissão vivo: `edit: deny` não cobria `hashline_edit`.** A regra `edit: deny` é avaliada por nome de ferramenta, e `hashline_edit` não é `edit` — então os agentes restritos a `edit: deny` (`zeus`, `athena`, `iris`, `nyx`, `themis`) podiam editar arquivos assim mesmo, escrevendo no disco por um caminho que a negação não cobria. `hashline_edit: deny` foi adicionado a esses cinco agentes. **Não era uma condição de corrida nem um erro de configuração: era uma tabela de permissões incompleta**, o que significa que a negação nunca esteve de fato aplicada a quem só deveria ler.
-- **`test:node` reportava sucesso tendo coletado zero testes.** `node --test <glob>` sai com 0 quando o glob não expande (Node >= 22), e foi exatamente o que aconteceu: um glob que nunca expandiu produziu um gate verde que não executou nada. Pior, `tests/` estava ausente da allow-list `files` do pacote, então um consumidor que rodasse `npm test` recebia esse verde. Agora os scripts de teste falham em voz alta quando a coleta é zero, e a guarda tem teste próprio (`tests/run-node-tests.test.mjs`) que a dirige como subprocesso — o contrato é o código de saída, então testá-la em processo não provaria nada.
-## [v1.6.0-beta.5] - 2026-10-05
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🆕 What's New
-
-- **O gate de geração do plugin passa a ler a versão do host — e a superfície de ferramentas deixa de desaparecer num host OpenCode 2.x.** O seletor de geração tinha três defaults `'v1'` (`bin/pantheon-init.mjs`, `scripts/install/opencode.mjs` e a assinatura do resolver em `scripts/install/opencode-version.mjs`). Nesse ramo, o installer grava caminhos de arquivo `.ts` na chave singular `plugin`; um host 2.x rejeita caminhos de arquivo ali (`configured plugin path must be a directory`), **descarta** as entradas e, ao fazer isso, **remove** a entrada de diretório V2 que já estava registrada e funcionando. O sintoma era um host aparentemente saudável — a frota MCP subia normalmente — com um único WARN no log e **nenhuma** ferramenta do plugin no catálogo: sem `pantheon_cost`, sem `hashline_edit`, sem `pantheon_model`, sem BackgroundJobBoard e sem hooks. Os três defaults passam a `'auto'`, e `auto` consulta a versão do host. Precedência: flag explícita > `OPENCODE_VERSION` > basename `opencode2` > probe de `--version` > aviso e fallback `v1`. Isto restaura as **3** ferramentas que o contrato V2 registra (`hashline_edit`, `pantheon_cost`, `pantheon_model`); não é paridade com o V1 — ver **Issues Conhecidas**.
-- **Uma instalação na geração V2 e o `doctor` agora declaram a superfície reduzida em vez de deixá-la ser descoberta.** A lista de recursos não suportados no V2 (`getUnsupportedFeatures()`) não tinha nenhum consumidor em produção — só testes a liam. O installer passa a imprimi-la ao lado do aviso de destino V2, e o `doctor` a reporta como um achado próprio, sem alterar o código de saída (uma instalação V2 é uma configuração suportada, não quebrada). A V2 registra 3 ferramentas, não 6, e não tem BackgroundJobBoard; as 3 ferramentas de goal não são registradas na V2 por desenho. O texto agora é único, vindo de `src/pantheon/v2-unsupported.mjs`.
-- **Renomeação dos entrypoints MCP (issue #198).** Os cinco entrypoints Python deixaram de compartilhar o token `server.py`, então um `pkill -f server.py` amplo não derruba mais a frota inteira como efeito colateral. Inclui uma migração em tempo de instalação para que as instalações existentes não fiquem órfãs.
-- **O pacote npm deixou de versionar e distribuir a configuração pessoal de desenvolvimento do OpenCode.** `opencode.json` e `.opencode/` (comandos, plugins e skills) saíram do controle de versão: a config carregava um endpoint MCP privado e overrides de permissão por desenvolvedor, e o harness V1 de comandos/plugins foi substituído por `src/plugin-v2.ts`. O `init` continua gerando a config do projeto do usuário, então instalações não são afetadas; para contribuidores, um `opencode.json` pessoal deve ir em `.git/info/exclude`.
-- **Documentação: `ROADMAP.md` reescrito e um novo documento de fronteira.** O roadmap foi reescrito com as causas-raiz verificadas, e um novo documento — `docs/PERMISSIONS-QUALITY-DELEGATION.md` — mapeia os gates de qualidade, as quatro camadas de permissão e a delegação num só lugar, marcando explicitamente o que ainda não foi verificado.
-
-## 🐞 Fixed
-
-- **A leitura do banner de versão do host era quadrática.** Um banner longo custava **11,1 s** para ser interpretado, contra o timeout de **5 s** do spawn de `--version`; o timeout guarda o processo, não a leitura, então um host verboso conseguia estourá-lo. A interpretação passou a ser **linear**.
-- **O `readOnlyRegistry` do V2 não era podado no `session.deleted`.** O registro é global ao processo e nunca era limpo quando uma sessão do V2 terminava, então entradas de sessões encerradas acumulavam. O `session.deleted` do V2 passa a podar o registro, como a V1 já fazia.
-
-## ⚠️ Known Issues
-
-- **Ação necessária: re-executar o `init` numa instalação afetada.** O `postinstall` **não** roda o `init`. Quem teve a configuração corrompida por uma instalação `v1` anterior **não** é auto-corrigido apenas por atualizar o pacote — é preciso rodar o installer de novo (`npx pantheon-opencode init`). Uma escolha correta de geração **auto-corrige** a configuração (o ramo V2 já remove as referências `.ts` do V1), mas só quando o installer roda. O mesmo vale para a renomeação dos entrypoints: instalações existentes continuam funcionando porque os arquivos antigos são mantidos, mas os caminhos só são corrigidos numa nova execução do installer; até lá, esses usuários permanecem nos entrypoints antigos e sujeitos ao efeito colateral do `server.py`.
-- **A superfície V2 é menor que a V1 por desenho.** A V2 registra 3 ferramentas (`hashline_edit`, `pantheon_cost`, `pantheon_model`), não 6, e não tem BackgroundJobBoard; as 3 `pantheon_goal_*` são V1-only e a matriz de delegação caller→target não é replicada. O installer e o `doctor` agora **dizem** isso (ver What's New), mas a funcionalidade ausente não é restaurada.
-- **O fallback continua a ser `v1`.** Quando o probe do host falha, não consegue ser interpretado, ou traz versões contraditórias, o resolver avisa **uma vez** e cai para `v1`, em vez de arriscar um host 1.x com uma entrada `plugins` que ele ignoraria. É um erro alto e visível, mas ainda é uma queda para a configuração V1.
-
-## ✅ Closed Issues
-
-- **A justificativa da matriz de delegação V1→V2 foi corrigida.** O texto dizia que o V2 "não expõe esse caminho de semeadura"; os tipos do SDK refutam isso. A causa real da matriz não replicada não é a ausência de um caminho de semeadura (`session.created` do V2 traz `properties.info: Session` com `parentID?`, o mesmo campo que a V1 semeia), mas a *segunda* fonte da V1 — o seed de `client.session.list()` para sessões anteriores ao carregamento do plugin — porque o `PluginContext` do V2 não expõe `client`. Se um host 2.0.22 ao vivo popula `info.parentID` nesse evento continua **não verificado** (nenhum canário lê payload de evento). A linha publicada em `v1.6.0-beta.4` fica como registro.
-## [v1.6.0-beta.4] - 2026-10-03
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🆕 What's New
-
-- **Canário host-backed que dirige `hashline_edit` end-to-end** (`tests/canary/plugin-v2-tool-canary.test.mjs`, 12 casos): carrega `src/plugin-v2.ts` pelo loader real do host `opencode 2.0.22` e registra `Object.keys(ctx)` de dentro do host — medidos, `tool`/`event`/`permission`/`session` existem e `catalog` não. É o primeiro gate que dirige uma ferramenta do Pantheon por um host real. O canário existente só dirige o `read` embutido, e foi por isso que `draft.add()` sem `output` sobreviveu 26 dias com todos os testes verdes.
-- **Os quatro domínios que o SDK `@opencode-ai/plugin` não tipa** (`tool`, `event`, `permission`, `session`) passaram a uma declaração estrutural local (`HostPluginContext`) e **um** cast documentado (`hostDomains()`), no lugar de seis `as unknown as Record<string, unknown>` que não verificavam tipo nenhum. Todo membro continua opcional e todo chamador reconferir antes de usar. A linha estável do SDK é `1.18.x` e não carrega o contrato do host — `1.18.34` (`latest`) é idêntica a `1.18.33`, então seguir o `dev` diário resolveria pior, não melhor.
-
-## 🐞 Fixed
-
-- `pantheon_cost` respondia `CORRUPT_DATA` em **toda** chamada contra o host 2.0.22: exigia a tabela `message`, que não existe nesse banco. Os tokens de assistant **estão** legíveis em `session_message`. **Não é renomeação:** `session_message` tem coluna `data`, mas não tem a chave `role` dentro dela — `json_type(data,'$.role')` é nulo em **0 de 40 307** linhas válidas. O V1 marca turnos de assistant com `data.role`; o V2 marca pela **coluna** `type`. Trocar apenas o nome da tabela casaria com nada e devolveria `status: OK` em silêncio. A detecção passa a ser por **presença de tabela**, porque as duas famílias coexistem em bancos migrados.
-- `PANTHEON_OPENCODE_VERSION` nunca selecionou o schema: só mudava o **nome do arquivo**, e `opencode-v2.db` é o isolamento do sandbox via `OPENCODE_DB`, não um banco de host 2.x. A distinção v1/v2 é o **schema detectado**; a variável agora apenas restringe um conjunto já detectado e falha rápido quando pede uma família ausente.
-- `scripts/cost.mjs` duplicava o mesmo bug literal, com o mesmo assert — o fallback continuava morto. `probe-pantheon-cost.mjs` acompanha.
-- O report agora **declara a cobertura temporal** que ele mediu (janela varrida, linha mais antiga), em vez de apresentar totais como se cobrissem meses.
-
-## ⚠️ Known Issues
-
-- O canário **host-backed pula no CI**: o runner não tem binário `opencode`. O skip é **visível** no log (`::notice`), e os dois casos sem host rodam incondicionalmente, com `PANTHEON_TOOL_CANARY_BIN` apontado para um caminho inexistente. Rodar de verdade exige um modo no script de sandbox — **não feito**.
-- A cobertura de custo do banco v2 é de **~8,3 dias** nesta máquina (primeiro registro em 2026-09-25). O histórico v1 (~96 dias) fica num diretório irmão com nome de epoch, que **não** é contrato e por isso não é descoberto automaticamente. Quem quiser aponta `PANTHEON_COST_DB`.
-- `metadata.phase` nunca existiu em v1 nem em v2 — medido: 0 linhas de `session_message` têm `$.metadata.phase` nem `$.phase`. A coluna Phase sempre foi `unknown`. Não é regressão, é feature que nunca funcionou.
-## [v1.6.0-beta.3] - 2026-10-03
-
-&lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. --&gt;
-
-## 🆕 What's New
-- **Três ferramentas V2 agora executam de verdade**: `hashline_edit`,
-  `pantheon_cost` e `pantheon_model` rodam no host `opencode v2.0.x`. Antes
-  eram placeholders que declaravam sucesso sem fazer nada.
-- **Enforcement de sessão read-only no caminho V2**: `apollo` e `gaia` voltam
-  a ter escrita bloqueada, com o guard registrado no próprio plugin V2 — sem
-  depender de uma ponte que a instalação V2 não monta.
-- **Varredura de segredos de alta confiança no caminho V2**: o único hard block
-  de segurança que a V1 tinha, e que estava inerte por viver num plugin que a
-  instalação V2 não carrega, passa a rodar.
-
-## 🐞 Fixed
-- **As 6 ferramentas de plugin do V2 falhavam em 100% das chamadas**:
-  `hashline_edit`, `pantheon_cost` e `pantheon_model` lançavam
-  `Tool result declared output without an output schema` em toda invocação. A
-  causa era assimetria local — `draft.add()` não declarava `output` enquanto o
-  `execute` resolvia `{ output: string }`. O host exige simetria nos dois
-  sentidos: resultado com `output` e nenhuma declaração lança, assim como
-  declaração sem `output` no resultado. `output` passou a ser **obrigatório** na
-  interface `V2ToolDef`, então o compilador exige a declaração daqui em diante.
-- **A suíte exigia o defeito**: `tests/pantheon/plugin-v2-contract.test.ts`
-  afirmava que o resultado carregava `.output` string — literalmente a condição
-  de falha, contra um mock que não reproduzia a exigência do host. O teste foi
-  reescrito para o invariante de simetria, contra um mock que constrói o
-  `outputSchema` a partir de `def.output` como o host faz
-  (`output: I.outputSchema ?? {}`), cobrindo as duas direções do bicondicional.
-- **A imposição read-only não existia na superfície V2**: `createEnforcementGuard`
-  só era instanciado em `src/plugin.ts`, que o `opencode.json` da release não
-  declara — V2 nunca carrega V1. Com `hashline_edit` funcional, uma sessão
-  somente-leitura podia escrever arquivos. O guard passou a ser registrado no
-  hook `execute.before` do V2, e `pantheon_model` — que escreve
-  `active-preset.json` em escopo project e global — foi acrescentado a
-  `DEFAULT_BLOCKED_TOOLS`, o que corrige também a V1. `pantheon_cost` ficou de
-  fora de propósito: só lê `opencode.db`.
-- **O único hard block de segurança da V1 estava inerte**: o scan de segredos de
-  alta confiança vivia em `src/plugins/pantheon-hooks.ts`, um plugin que a
-  instalação V2 não carrega — inerte por construção, não por má configuração.
-  Passou a rodar dentro do `execute.before` do V2
-  (`scripts/hooks/scan-secrets.sh`; exit 2 bloqueia, exit 1 é advisory e só
-  registra). O caminho do script foi verificado a partir do tarball instalado,
-  não só do repo.
-- **Cinco comentários afirmavam cobertura que não existe** ("wired through the
-  V1…"). Corrigidos — é o defeito "anunciado como vivo, morto no caminho", a
-  mesma classe do bug original, transferida do tool para o controle de segurança.
-
-## ⚠️ Known Issues
-- **A release entrega 3 ferramentas V2 funcionais, não 6**:
-  `pantheon_goal_create`, `pantheon_goal_get` e `pantheon_goal_update` foram
-  **removidos** da superfície V2. `GoalLoopDeps` exige `store`, `client` e
-  `board`, que não existem no `PluginContext` V2, e a bridge V1 resolve para
-  `null` fora da V1. Registrá-las como placeholders não funcionais seria pior
-  que a ausência: anunciá-las seria mentira silenciosa. Marcador `goal-tools`
-  em `V2_UNSUPPORTED_FEATURES`. **Breaking** para quem usava esses tools no
-  host V2 — o contrato V1 permanece disponível para o goal loop.
-- **A matriz de delegação nativa da V1 não é replicada na V2**: o guard V2 cobre
-  a lista de ferramentas bloqueadas, mas não a matriz caller→target nem a negação
-  de `task` em sessão filha. A matriz precisa de uma hierarquia de sessões
-  semeada a partir dos metadados de sessão, e o V2 não expõe esse caminho de
-  semeadura — `SessionHierarchyRegistry.isRoot` reporta `true` para sessões
-  desconhecidas enquanto não semeada, então semeá-la pela metade negaria todo
-  `task()`. O branch é pulado em vez de negado indiscriminadamente. Marcador
-  `delegation-matrix`. `task` continua negada em sessão somente-leitura pela
-  lista de ferramentas bloqueadas, então a profundidade 2 se sustenta; o que
-  não existe é a matriz. Coberto por `experimental.subagent_depth` nesta
-  configuração, mas a garantia do plugin não existe.
-- **O log do scan de segredos escreve só em `.pantheon/logs/hooks.log`**: o
-  `PluginContext` V2 não expõe `client` nem `directory`, então os canais de log
-  estruturado e de toast da V1 não existem nessa superfície. É menos
-  observabilidade, não menos bloqueio.
-- **Falha de infraestrutura do scanner é fail-open por decisão**: script ausente
-  ou timeout não bloqueiam. `runHook` nunca rejeita e um erro de infraestrutura
-  não deve negar chamadas não relacionadas. Ausência do script não bloqueia.
-
-## ✅ Closed Issues
-- **Drift de documentação no `README.pt-BR.md`**: a tabela de contrato de
-  runtime e o parágrafo de superfície listavam 6 ferramentas V2 e as 3 de goal,
-  que não estão registradas. Corrigido para 3 ferramentas, com a razão da
-  ausência e o ponto de imposição read-only.
-- **Cinco comentários de falsa cobertura** sobre a imposição read-only e o scan
-  de segredos.
-- **Shim do loader JSON do ajv elevado a bootstrap de módulo**: o patch de
-  `Module._extensions['.json']` era aplicado de dentro de `loadAjv()` e ficava
-  vivo durante todo o run, podendo vazar entre arquivos de teste e se manifestar
-  longe da causa. Agora instala, carrega e restaura em nível de módulo, antes de
-  qualquer corpo de teste, com `finally`.
-## [v1.6.0-beta.2] - 2026-10-02
-
-## 🆕 What's New
-- **`steps` não é mais definido pelo Pantheon**: removido dos 14 agentes em
-  `src/agents/`. No OpenCode 2 o campo é opcional e **sem default** — ausente
-  significa **sem teto nativo**. O host não impõe teto; o Pantheon estava
-  escrevendo um.
-- **Instalador v2 remove `steps` residual**: configs já instalados passam a ter
-  o `steps` apagado dos agentes gerenciados. Escopo restrito aos agentes que o
-  Pantheon gerencia — um agente definido pelo usuário nunca é tocado. O bloco V1
-  singular `agent` é deliberadamente intocado (V1 em retirada).
-- **Substitutos ao teto**: `task(background=true)` para trabalho fora da
-  foreground, `experimental.subagent_depth` para aninhamento de subagentes e
-  paralelismo entre delegações independentes.
-- **Limpeza**: `max_steps` e `max_compaction_items` removidos de
-  `src/routing.yml`. `loadRoutingMaxSteps` nunca teve um único import — 2
-  matches no repo (definição e typedef), ambos removidos.
-
-## 🐞 Fixed
-- **`migrateV1toV2` descartava campos gerenciados**: com os blocos `agent` (V1)
-  e `agents` (V2) coexistindo — o caso de qualquer config já instalado — o
-  spread raso fazia um substituir o outro por inteiro. Na ordem de chaves do
-  `opencode.json` real, o lado perdedor era o do usuário. Agora **mescla**: a
-  base é o bloco V2, os campos gerenciados do V1 sobrescrevem, e os campos do
-  usuário são preservados. Mesma semântica já usada em `install/opencode.mjs`.
-- **`docs/platforms/README.md` tinha tabela de step limits errada**: 14 linhas
-  listando limites por agente, **nenhum valor batendo** com `src/agents/`.
-  Tabela removida e a seção reescrita.
-
-## ⚠️ Known Issues
-- **Permissões de agente**: V1 usa `permission` e V2 usa `permissions`; ao mesclar esses blocos, a chave legada `permission` pode permanecer inerte ao lado de `permissions`.
-- **Migração — rode o init uma vez**: `npx pantheon-opencode init
-  --opencode-version=v2` **uma única vez** limpa o `steps` residual. Sem isso o
-  config instalado continua carregando o teto antigo.
-- **O `.md` de agente instalado é sobrescrito no próximo sync**: editar
-  `~/.config/opencode/agents/*.md` esperando persistência **não funciona**.
-  Comportamento **pré-existente**, não é regressão desta mudança — mas agora
-  está documentado para não ser reportado como uma.
-- **`steps` definido à mão num agente gerenciado é removido a cada install v2**:
-  o instalador não distingue um valor que ele escreveu de um valor que você
-  escreveu (mesma chave, mesmo valor). Workaround: definir no frontmatter do
-  agente — e lembrar que ele **também** é sobrescrito no próximo sync.
-## [v1.6.0-beta.1] - 2026-09-30
-
-<!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
-     move this section to a versioned entry and reset the template below. -->
-
-## 🆕 What's New
-- **OpenCode 2** — first Pantheon beta compatible with the OpenCode 2 plugin
-  contract.
-- **memory** — preserve SQLite FTS5/BM25 keyword search and the `code_*` codemap
-  tools.
-
-## 🐞 Fixed
-- **memory** — remove the legacy vector-memory scripts and embedding/KNN/RRF
-  path.
-- **CI/release** — keep validation fail-closed; expand `doctor` checks and add
-  the OpenCode 2 V2-only sandbox validator.
+Pre-release history (1.6.0-beta.*) is archived in [docs/internal/changelog-prereleases.md](docs/internal/changelog-prereleases.md).
 
 ## [v1.5.2] - 2026-09-22
 
-## 🐞 Fixed
+## Fixed
 - **install** — guard undefined collection in init (#174)
 - **release** — compare Zenodo file checksum in the format the API returns (#173)
 ## [v1.5.1] - 2026-09-22
 
-## 🐞 Fixed
+## Fixed
 - **agents** — declare explicit read: allow for zeus
 - **ci** — drop fastembed from CI, keep pytest collection green (#163)
 - **plugin** — detect registered-plugin version drift after pantheon_delegate removal (#169)
@@ -539,7 +80,7 @@ latência total e wall de F1 segue inconclusivo.
 - **tui** — remove dead pantheon_delegate refs after v1.5.0 V1 removal (#166)
 - **mnemosyne** — grant scoped write to memory-bank and deepwork paths (#164)
 
-## ✅ Closed Issues
+## Closed Issues
 - #94 - drop fastembed from CI, keep pytest collection green (#163)
 - #158 - detect registered-plugin version drift after pantheon_delegate removal (#169)
 - #114 - correct node floor and warn on unsupported runtime (#168)
@@ -551,7 +92,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.5.0] - 2026-09-16
 
-### 🆕 What's New
+### Added
 
 - **Delegação nativa**: `task()` é agora o único canal de delegação — motor legado
   de dispatch removido por completo, simplificando o fluxo de subagents.
@@ -563,7 +104,7 @@ latência total e wall de F1 segue inconclusivo.
 - **CI/CD**: Dependabot alerts, CodeQL analysis, SHA pins em actions, gitleaks
   v3 para detecção de secrets, e workflow de release dispatch-only.
 
-### 🐞 Fixed
+### Fixed
 
 - **Painel Delegations vazio (crítico)**: canal `session.children` da TUI
   chamava API com shape v1 num cliente v2 — placeholder `{sessionID}` não era
@@ -576,7 +117,7 @@ latência total e wall de F1 segue inconclusivo.
 - **Signal leak**: timer independente do spinner separado do poll de dados,
   evitando bloqueio visual durante operações longas.
 
-### ✅ Closed Issues
+### Closed Issues
 
 - 38% dos testes consolidados (de ~1200 para ~744) com cobertura mantida.
 - 17 módulos mortos removidos, reduzindo superfície de manutenção.
@@ -587,7 +128,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🐞 Fixed
+## Fixed
 
 - **Fixed — painel Delegations**: children com status `busy` stale (>30min sem
   atualização) agora são classificadas como `completed` (não `running`). O
@@ -598,7 +139,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Improved — painel Delegations**: status ausente de children antigas agora é
   `done` (não `running`); grace 60s para sessões recém-criadas; janela de
@@ -612,7 +153,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🐞 Fixed
+## Fixed
 
 - **Painel Delegations voltou a funcionar (crítico):** o canal
   `session.children` da TUI chamava a API com a shape v1 (`{ path: { id } }`)
@@ -632,7 +173,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Delegação nativa no host:** o motor `pantheon_delegate` foi removido
   (~3,9k linhas) junto com as tools `pantheon_delegate`,
@@ -646,7 +187,7 @@ latência total e wall de F1 segue inconclusivo.
 - **Camada fina preservada:** `task-result-guard` (verified completion de child
   vazio), `native-task-status` e guards de enforcement.
 
-## 🐞 Fixed
+## Fixed
 
 - **Read-only enforcement re-apontado para sessões nativas:** aplicado no
   público via hook `chat.params` e `hashline_edit` bloqueado para `apollo`/`gaia`,
@@ -660,7 +201,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Modernização CI/supply-chain:** 22 actions SHA-pinadas; `gitleaks-action` v3
   (fix crítico — a v2 morria com Node 20 em 2026-09-16) com CLI 8.30.1; cache
@@ -674,7 +215,7 @@ latência total e wall de F1 segue inconclusivo.
 - **Instructions:** deduplicação das instruções compartilhadas — contexto menor
   sem perder nenhuma regra.
 
-## 🐞 Fixed
+## Fixed
 
 - **2 flakes determinísticos eliminados:** TTL do MCP persistence
   (`test_ttl_expiry_real_time`) e `logger.test.mjs` deixaram de depender de
@@ -687,7 +228,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Delegation `read` devolve o relatório completo:** o retorno de `read` passa a
   ler o relatório integral do disco (com cap configurável e marker explícito de
@@ -700,7 +241,7 @@ latência total e wall de F1 segue inconclusivo.
   ser pintada pelo estado — vermelho = falha, verde = concluído, amarelo = em
   andamento — com o glyph mantido como canal redundante para acessibilidade.
 
-## 🐞 Fixed
+## Fixed
 
 - **TUI — painel Delegations só da sessão ativa:** o painel deixa de renderizar
   rows cross-session/órfãs que causavam "Session not found" ao clicar; a lista
@@ -725,19 +266,19 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Ordenação active-first:** delegações ativas aparecem antes das concluídas,
   falhas e canceladas no painel TUI.
 - **Overflow active:** quando há mais delegações ativas que o teto visível, o
   excedente ativo permanece representado na linha de overflow.
 
-## 🐞 Fixed
+## Fixed
 
 - **Retenção visual:** concluídas permanecem visíveis por 2 min e falhas por
   10 min antes de saírem do painel; canceladas seguem a retenção configurada.
 
-## ⚠️ Known Issues
+## Known Issues
 
 - **Stale running warning:** jobs em estado `running` além do limite esperado
   recebem um aviso visual de stale no painel.
@@ -746,7 +287,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **TUI status-only — rows simplificadas:** cada linha do painel Delegations passa
   a ser `{glyph} {alias} {elapsed}` + `desc` muted — um glyph de status, uma única
@@ -764,7 +305,7 @@ latência total e wall de F1 segue inconclusivo.
   118/118 passando, cobrindo rows status-only, header active/done/failed, ceiling
   e board read cross-session.
 
-## 🐞 Fixed
+## Fixed
 
 - **Sanitização de dead code:** removidos helpers, tipos e estado órfãos do
   painel Delegations (toggle de escopo `[Sessão]`/`[Tudo]`, prefixos curtos
@@ -777,7 +318,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **TUI lê o board (4º canal):** o painel Delegations passa a ler o
   BackgroundJobBoard via `readBoardState()` — jobs `pantheon_delegate` de todas
@@ -793,7 +334,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Glyphs da FSM real no painel Delegations:** cada estado do BackgroundJobBoard
   tem agora um glifo Unicode geométrico próprio — `⠋` running (spinner 1s),
@@ -808,7 +349,7 @@ latência total e wall de F1 segue inconclusivo.
 - **104 testes TUI delegations:** `tests/pantheon/tui-delegations.test.ts` com
   104/104 passando, cobrindo glifos/marker/tone dos estados reais da FSM.
 
-## 🐞 Fixed
+## Fixed
 
 - **Doctor F.2 (`hasUsableScripts`):** a resolução do diretório code-mode agora
   exige um `.py`/`.sh` regular (paridade com `_has_usable_scripts` do MCP), então
@@ -821,7 +362,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **TUI delegations com prefixos curtos `nat:` / `pan:`:** cada linha do painel passa
   a usar `nat:<agent>` para child nativo do `task()` (sem report no board) ou
@@ -837,7 +378,7 @@ latência total e wall de F1 segue inconclusivo.
 - **100 testes TUI delegations:** `tests/pantheon/tui-delegations.test.ts` com 100/100
   passando (tsc + biome OK), acima dos 93 da beta.9.
 
-## 🐞 Fixed
+## Fixed
 
 - **`appendFile` sem import (log do painel volta a escrever):** o log em arquivo do
   painel parou de escrever silenciosamente porque `appendFile` era chamado sem import
@@ -858,13 +399,13 @@ latência total e wall de F1 segue inconclusivo.
 <!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. -->
 
-## 🆕 What's New
+## Added
 
 - **TUI delegations nativas (gated):** painel Delegations renderiza N delegações native + M pantheon com tag [native], live task em tempo real, click navega para sessão. Implementado em `src/plugins/tui/src/index.tsx` com dist rebuildado.
 - **93 testes TUI delegations:** suite `tests/pantheon/tui-delegations.test.ts` com 93/93 passando (tsc + biome OK).
 - **E2E beta.8 PASS (referência):** baseline E2E da beta.8 mantido como referência de estabilidade para beta.9.
 
-## 🐞 Fixed
+## Fixed
 
 - Removido diretório `testyes/` (artefato de teste).
 - Truncado `hooks.log` para baseline limpo de beta.9.
@@ -874,7 +415,7 @@ latência total e wall de F1 segue inconclusivo.
 <!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. -->
 
-## 🐞 Fixed
+## Fixed
 
 - **Board persistence is corruption- and concurrency-safe:** state writes now go
   through a UNIQUE temp file (per-process, per-write counter + random suffix), are
@@ -906,7 +447,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Cost CLI fallback + `PANTHEON_NODE`:** `pantheon_cost` falls back to a
   read-only `node scripts/cost.mjs` subprocess when `node:sqlite` is
@@ -920,7 +461,7 @@ latência total e wall de F1 segue inconclusivo.
   experimental via `PANTHEON_DELEGATE_MODE=native` until v1.6. See
   [ADR-0011](https://github.com/ils15/pantheon-opencode/pull/126) (Proposed).
 
-## 🐞 Fixed
+## Fixed
 
 - **Legacy read-only bypass on retry (P0):** a retried delegation now
   re-applies read-only enforcement (the same rule as the initial child) and
@@ -951,7 +492,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Delegation panel v2:** live tool activity per running delegation
   (`↳ bash npm test` — what the child is doing right now), a paginated
@@ -959,7 +500,7 @@ latência total e wall de F1 segue inconclusivo.
   distinct `retry` state (⟳ marker, RETRYING label) instead of lumping
   retries into running.
 
-## 🐞 Fixed
+## Fixed
 
 - **Stale plugin refs from old installs:** the installer now prunes
   `pantheon-opencode` plugin references pointing at other installed copies of
@@ -976,7 +517,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Native background tasks in the delegation panel:** tasks dispatched via
   the native `task(background=true)` tool are now mirrored onto the shared
@@ -1000,7 +541,7 @@ latência total e wall de F1 segue inconclusivo.
   nunca implementados dos planos v1.0/v1.0+ foram removidos; o contrato atual
   passou a documentar o code-mode (manifest SHA-256, resolução project-first).
 
-## 🐞 Fixed
+## Fixed
 
 - **Code-mode project resolution (#112):** the MCP now resolves project code-mode
   scripts before global scripts, honors `PANTHEON_PROJECT`, and fails closed on
@@ -1012,7 +553,7 @@ latência total e wall de F1 segue inconclusivo.
 &lt;!-- Add new changes here. Running `node scripts/versioning.mjs apply` will
      move this section to a versioned entry and reset the template below. --&gt;
 
-## 🆕 What's New
+## Added
 
 - **Native delegation contract (B3-05):** adds the nine-code `NativeTaskStatus` contract, a session-lazy cached capability probe, atomic board registration for native children, strict `PANTHEON_DELEGATE_MODE=native` without fallback/failover/retry, and status in delegation receipts.
 
@@ -1022,7 +563,7 @@ latência total e wall de F1 segue inconclusivo.
 
 - **Code-mode explicit installation (B3-08):** `pantheon-code-mode` no longer executes scripts implicitly. A script runs only when listed in `.pantheon/code-mode/manifest.json` with a matching SHA-256; the installer seeds the manifest for bundled scripts and a new `approve_code_script` tool opts in or refreshes a script. Missing manifest reports `INVALID_STATE`, unlisted scripts `CONFLICT`, and hash mismatches `CORRUPT_DATA`.
 
-## 🐞 Fixed
+## Fixed
 
 - **ECIGLOBAL fix (sync-tui):** `npm install -g` no longer fails with ECIGLOBAL — `scripts/sync-tui.mjs` now sanitizes `npm_config_*` global-context vars (case-insensitive) from the nested `npm ci` environment.
 - **npm tarball inclusion:** CHANGELOG.md is now included in the npm tarball
@@ -1212,7 +753,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [1.3.6-beta] - 2026-08-21
 
-## 🆕 What's New
+## Added
 
 - **Recency decay in `memory_search` (src/mcp/memory_mcp_server.py)** — new `decay_days` param (default `None`, backward compatible) applies a freshness half-life `2^(-days_since_created/decay_days)` to RRF-fused scores, so older memories rank lower when enabled. `_rrf_fuse` accepts an optional `created_at_map`; tool description and docs updated (docs/MEMORY.md, docs/MCP.md, docs/mcp-tools.md).
 - **Themis Comment Checker (src/agents/themis.md)** — Layer 1 review now flags generated code that is indistinguishable from human-written: excessive/obvious comments (`// increment i`, `# set x to 5`), commented-out dead code, and boilerplate headers.
@@ -1231,7 +772,7 @@ latência total e wall de F1 segue inconclusivo.
 - **O5 permission.task globs (src/pantheon/permission-globs.ts)** — allow/deny glob rules controlling which subagents may be delegated; deny rules remove the target from Zeus's task tool entirely (`delegation-enforce`), with matching filtering in finalize and the agent-list description.
 - **plugin-eval certification suite (.pantheon/code-mode/)** — `eval-static.py` (structural checks: frontmatter/secrets/file refs), `eval-llm-judge.py` (LLM quality layer), `eval-monte-carlo.py` (simulated-run reliability, exits 1 below 75%), `eval-run.py` (orchestrator emitting one report JSON; below-threshold layers still score), plus `eval_store` persistence and `pantheon://eval` resources exposing latest certification scores.
 
-## 🐞 Fixed
+## Fixed
 
 - memory_search doc drift: freshness decay was documented but not implemented — now real via `decay_days`.
 - scripts/ copies stale vs src/mcp/ canonical sources (missing routing project fallback, stale comments).
@@ -1239,12 +780,12 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [1.3.5] - 2026-08-21
 
-## 🆕 What's New
+## Added
 
 - **PT patterns para delegação (routing.yml)** — adiciona 5 padrões PT (`procure`/`busque`/`encontre`/`localize`/`pesquise`) ao `intent_gate` research → apollo, corrigindo detecção de intenção para prompts em português (PR #61).
 - **Zeus read guard (delegation-enforce.ts + plugin.ts)** — `ZEUS_READ_DENY_PATTERNS` bloqueia `src`/`tests`/`scripts`/`glob`/`grep` por Zeus via `tool.execute.before` (primeiro guard da cadeia); `ALLOWED_PATHS` libera `.md` e `.pantheon/memories`; 10 casos de teste em `tests/pantheon/delegation-enforce.test.ts`; `apollo.md`/`gaia.md` com `visible:false` e `tools.task:false` para depth-1 (PR #61).
 
-## 🐞 Fixed
+## Fixed
 
 - **session-guard + retry helper (session-guard.ts + zeus-delegate-with-retry.ts)** — guard de `session_id` e helper `zeusDelegateWithRetry` com retry/backoff para delegações; `goal-loop.ts`/`todo-enforcer.ts`/`todo-preserve.ts`/`delegation.ts` ajustados (PR #61).
 - **validate doctor filter (scripts/doctor.mjs)** — `isValidAgentFile` verifica frontmatter YAML (`name`/`description`/`mode`) para filtrar `README.md` e docs não-agente de `getCanonicalAgentNames`/`deriveInstalledAgentFiles`; evita contagem espúria no `doctor` (PR #61).
@@ -1255,7 +796,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.3.4] - 2026-08-11
 
-## 🆕 What's New
+## Added
 
 - **Compaction summary V2** (preservation directive + mission/todo/delegation sections): `buildCompactionContext` is now async and accepts goal/todo sources — `PANTHEON_COMPACTION_DIRECTIVE` prefix section (emitted before any other section, skipped on totally-empty state), `<mission_context>` with active goals (id/objective/status), `<todo_context>` with pending (not completed/cancelled) todos; delegation blocks byte-for-byte unchanged; failing/disabled sources are skipped fail-open (logged to hooks.log)
 - **Post-compaction todo preservation**: TodoPreserver captures the session's todo list on `experimental.session.compacting`, activates the snapshot on `session.compacted`, and rewrites the first post-compaction `todowrite` with the exact pre-compaction list — additive + fail-open (every step degrades to a logged warn, never throws in a hook)
@@ -1267,7 +808,7 @@ latência total e wall de F1 segue inconclusivo.
 - **README docs**: 1.3.4 compaction + delegation features documented
 - **Zero chat-notification policy**: removed the `chat.message` injection channel for delegation signals — completion visibility lives in the board `[unread]` marker, `pantheon_delegation_read`, TUI toasts and compaction carry-forward, never in the chat transcript
 
-## 🐞 Fixed
+## Fixed
 
 - **Delegate dispatch with missing provider API key** (P1): `resolveChildModel` never checked whether the resolved model's provider had a configured API key — a child dispatched to a keyless provider (e.g. gpt-5.6-luna/opencode-go) died instantly with `AI_LoadAPIKeyError`. Auto-resolved models (agentModels/preset) whose provider key is missing now fall back to `opencode/deepseek-v4-flash-free`; explicit caller models are respected (warned); when nothing is usable the tool returns a clear error TEXT and registers NO job on the board
 - **delegations.log typing**: `task_id` was always `""` (now omitted when empty) and `duration_ms` was logged as a STRING (now parsed to a number, null when unset), breaking downstream aggregation
@@ -1281,7 +822,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.3.3] - 2026-08-11
 
-## 🆕 What's New
+## Added
 
 - **Todo continuation enforcer**: auto-continues sessions with incomplete todos on `session.idle` (4 guards: board-running, in-flight, exponential cooldown, max-failures cap) + kill-switch `PANTHEON_TODO_ENFORCER=off`
 - **Hashline hash-anchored edits**: `hashline_edit` tool with sha256-truncated line tags, additive read enhancer, validate-before-write with `>>>` mismatch hints + Did-you-mean suggestions; blocked in read-only sessions
@@ -1291,7 +832,7 @@ latência total e wall de F1 segue inconclusivo.
 - **Themis phase reviews** route to deepseek-v4-flash (pro reserved for final release gate); Athena stays premium (council red-line)
 - **Routing config**: `background_delegation`, `todo_enforcer`, `hashline`, `full_auto` sections
 
-## 🐞 Fixed
+## Fixed
 
 - **Delegation killer**: chat.message hook injected reminders with empty messageID on the subagent promptAsync path — opencode schema rejected it, killing every background delegation in ~20ms (found by live E2E smoke)
 - **Delegation child model routing**: child sessions now inherit the routed model (explicit arg → routing.yml agent entry → active preset) instead of falling back to the key-gated default (E2E: AI_LoadAPIKeyError without an active preset)
@@ -1301,13 +842,13 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.3.2] - 2026-08-09
 
-## 🆕 What's New
+## Added
 
 - **Sandbox validation**: added the `sandbox` doctor profile and regression coverage for npm tarball contents, installed hook resolution, doctor status handling, MCP runtime smoke checks, and related CLI/install contracts.
 - **Package portability**: distributed configuration no longer retains checkout-specific machine paths; managed hooks are resolved from the installed package during install/sync.
 - **Doctor contract**: exit statuses now distinguish success (`0`), advisory warnings (`1`), and blocking errors (`>=2`).
 
-## 🐞 Fixed
+## Fixed
 
 - **Global installation diagnostics**: clarified the distinction between advisory doctor warnings and blocking failures.
 
@@ -1315,14 +856,14 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.3.1] - 2026-08-08
 
-## 🆕 What's New
+## Added
 
 - **Release validation coverage**: hook-runner spawn/timeout/SIGKILL handling with process-group cleanup; scanner fixtures that avoid accidental false positives; doctor `global`, `lite`, and `sandbox` profiles with explicit PASS/WARN/ERROR/SKIP statuses; `run-test.sh` exit semantics; and sandbox validation coverage.
 - Local validation logs are ignored via `logs/` because they are generated diagnostics, not release artifacts or source files.
 
 ## [v1.3.0] - 2026-08-06
 
-## 🆕 What's New
+## Added
 
 - **Non-invasive TUI notifications**: hook failures no longer write to `console.error` (TUI pollution) — non-zero exits route to three non-TUI channels: deduped TUI toast (`client.tui.showToast`), structured `client.app.log` entry (service `pantheon-hooks`), and `.pantheon/logs/hooks.log` file append; `PANTHEON_HOOKS_LOG=1` opt-in preserved, routed to log channels only
 - **Delegation lifecycle toasts**: 🚀 `<agent> em execução` / ✅ `<agent> concluiu` with anti-spam (2000ms rate limiter + 3-agents-in-6s aggregation into a single summary toast)
@@ -1337,20 +878,20 @@ latência total e wall de F1 segue inconclusivo.
 - Secret-scan hygiene: wildcard notation for credential references (no literal keys in versioned docs/comments)
 - README: hooks testing docs + `PANTHEON_TOASTS` table with council; AGENTS.md adds "PRs always update the README" convention
 
-## 🐞 Fixed
+## Fixed
 
 - Council toast idle-flush race condition
 
 ## [v1.2.2] - 2026-08-05
 
-## 🆕 What's New
+## Added
 
 - **`pantheon prune`** (#22): legacy cleanup command — XDG-aware config resolution, `--dry-run` default (list only), `--apply` removes stale `opencode.json.bak*` backups (age threshold), `--apply --remove-dirs` for legacy dirs with dead configs; old global `pantheon` installs are suggested for manual `npm uninstall -g pantheon`, never removed (npm-managed)
 - **Release pipeline standardization** (PR #28): single source of truth for version in `scripts/versioning.mjs` (sem-tag aware); CHANGELOG repair (normalized broken `[5.0.0]` heading → `[1.0.0]`, stripped `[v` prefixes across 3.x history, added `[Unreleased]`); `release.yml` redesigned with idempotent gates (skips publish when version already exists); new `scripts/changelog-extract.mjs` and `scripts/version-check.mjs` (+ test suites) so release bodies use real changelog sections; commitlint extended to cover pushes; pre-commit gate added; `cliff.toml` (git-cliff) removed; `docs/RELEASING.md` added; ADR-0007
 - **Test wiring + install docs** (PR #31): `test:security` extended with `test_doctor_layers`; Node test suite wired via `npm run test:node` (`node --test tests/*.mjs` — prune, hook-runner, plugin-log-policy, install/vision contracts, changelog/version checks) into CI; global-install sandbox documented in AGENTS.md / INSTALLATION.md
 - Dead `src/mcp/requirements-mcp-core.txt` catalog duplicate (YAGNI — the installer uses `requirements-mcp.txt`)
 
-## 🐞 Fixed
+## Fixed
 
 - **Reliable global install** (PR #26): hooks plugin recreated (`pantheon-hooks.ts` + `hook-runner.ts` with stdin JSON protocol, version-proof); MCP install made hermetic (absolute paths); packaging fix (`files[]` += `src/plugins/**`, `scripts/hooks/**`, self-reference removed, pinned `@opencode-ai/plugin` 1.18.11); `import uuid` hotfix in `scripts/mcp_persistence_server.py`
 - **Installer/plugin packaging paths** (PR #31): hooks plugin registered via `resolveInstalledPlugin` so the config points at the INSTALLED package path, never the developer's absolute path (#30); TUI registered with absolute dist path in `tui.json` (#32 — relative path caused NpmInstallFailedError); TUI reads its installed package version via `import.meta.url` (works from any cwd)
@@ -1361,7 +902,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.2.1] - 2026-08-03
 
-## 🆕 What's New
+## Added
 
 - **Model routing presets + interactive picker**: 4 presets (go-deepseek, go-premium, go-fast, go-free), zero-mutation default (injects only when `active-preset.json` exists), `set-tier` CLI in `bin/pantheon-init.mjs` with API-key fail-fast, interactive picker in `scripts/install/model-picker.mjs` (atomic write + .bak), `validate-routing.mjs` preset validation, packaging fix so `src/pantheon/**` ships in the tarball
 - 4 new provider families — go-claude (Anthropic), go-openai, go-olympus, go-muses presets + `CAPABILITY_TABLE` (+11 entries: glm-5.1/5.2, kimi-k2.6, qwen3.7-max/plus, minimax-m2.7/m2.5, bare deepseek-v4-pro/flash, big-pickle, nemotron-3-ultra-free, north-mini-code-free)
@@ -1381,7 +922,7 @@ latência total e wall de F1 segue inconclusivo.
 - TUI todo-progress bar (redundant with native TODO + sidebar), v1.1.1
 - Duplicate `scripts/scrub_secrets.py` (canonical is `scrub-secrets.py`)
 
-## 🐞 Fixed
+## Fixed
 
 - Plugin export as function for opencode 1.18.11 API (object export failed to load; hooks.config mutates config in place)
 - Vision pipeline: plugin boot failure (legacy loader), MCP tool ID (`pantheon_vision_vision_describe`), gateway 401 (provider prefix stripped from model ID), temp-file race (age-guarded cleanup, dir never removed), image stripping at source (deepseek-v4-flash declared image-capable), gateway-aware qwen interception, MCP availability verified, refcounted shared temp images, file URLs decoded via `fileURLToPath`, temp image permissions restricted
@@ -1396,7 +937,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.2.0] - 2026-07-30
 
-## 🆕 What's New
+## Added
 
 - **Fallback chains + auto CI retry**: per-agent fallback chains (hermes→talos→athena, apollo→athena→hermes, etc.), CI retry 1 → 2 with exponential backoff + fallback agent, token tracking in `subtask_summary`, `fallback_chains` section in routing.yml
 - Zeus Fusion-style delegation enforced — `edit:deny`, `bash:deny`, never touches files
@@ -1409,7 +950,7 @@ latência total e wall de F1 segue inconclusivo.
 - Persistence docs updated for new tools and auto-purge behavior
 - commitlint scopes completed; auto-release skipped when version already exists
 
-## 🐞 Fixed
+## Fixed
 
 - Council fixes: UUID session isolation in context checkpoints, pre-compaction state save trigger, flash summary quality floor (<10 chars → fallback to Zeus), agents recall `context_get(slug, 'latest')` on startup
 - CI: push triggers removed — validation workflows (CI, commitlint, CodeQL, hotfix, docs) now run on `pull_request` only, eliminating perma-pending duplicate checks
@@ -1418,7 +959,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.0.0] - 2026-07-24
 
-## 🆕 What's New
+## Added
 
 - **OpenCode-only**: Removed all multi-platform support (Claude Code, Cursor, Windsurf, Cline, Continue.dev, VS Code Copilot). Pantheon v1.0 is exclusively for OpenCode.
 - **Global installation**: `npx pantheon-opencode init` installs agents globally to `~/.config/opencode/agents/`. Optional `--project` flag for project-local install.
@@ -1444,14 +985,14 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.1.1] - 2026-07-30
 
-## 🆕 What's New
+## Added
 
 - New release system — beta releases from PR labels, stable from main push (auto-release and beta-release workflows unified)
 - Interactive TUI mode for installer (Fases 1+2) — redesigned sidebar with context progress bar, live session data via events + API
 - Session-scoped context checkpoints in persistence (index, stats, auto-purge, `delete_namespace`); fallback chains, auto CI retry (2x), token tracking
 - Slash commands consolidated from 16 to 5; redundant model configs removed (agents inherit the default model)
 
-## 🐞 Fixed
+## Fixed
 
 - Council: UUID session isolation in context checkpoints, pre-compaction state save, flash summary quality floor, agents recall `context_get(slug, 'latest')` on startup
 - TUI plugin/CI: OpenCode crash from missing plugin deps, version detection with git fallback, commitlint scopes, workflow YAML/MCP path repairs; `datetime.UTC` → `timezone.utc` for Python < 3.11
@@ -1460,7 +1001,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.1.0] - 2026-07-26
 
-## 🆕 What's New
+## Added
 
 - Council synthesis Fase 1+2 — Modo Desempate com Evidência + BackgroundJobBoard (#2)
 - Beta release workflow added (from develop)
@@ -1469,7 +1010,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.0.7] - 2026-07-26
 
-## 🐞 Fixed
+## Fixed
 
 - Installer: fixed `writeFileSync` not defined error
 
@@ -1477,13 +1018,13 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.0.6] - 2026-07-26
 
-## 🆕 What's New
+## Added
 
 - 7 new skills (codemap, simplify, reflect, worktrees, verification-planning, loop-engineering, clonedeps) + 7 matching commands; `background_subagents` enabled by default in canonical config
 - Release pipeline: quality gates, tag creation, pre-release, hotfix support
 - CI simplified from 10 to 6 workflows; agent/skill restructuring — 12 redundant instructions removed, unused commands dropped, gaia archived then restored
 
-## 🐞 Fixed
+## Fixed
 
 - CI/commitlint config (YAML syntax, header-max-length, ignores function, scopes); 45 stale references cleaned across 18 files; invalid `opencode.json` fields removed; installer copies `routing.yml`; YAML frontmatter regenerated for 9 agents
 
@@ -1491,7 +1032,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.0.5] - 2026-07-26
 
-## 🐞 Fixed
+## Fixed
 
 - CI auto-release with OIDC trusted publisher + npm v12 (Node 22 upgrade, clean publish)
 - `doctor.mjs` paths + simplified `prepublishOnly`
@@ -1500,12 +1041,12 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.0.2] - 2026-07-25
 
-## 🆕 What's New
+## Added
 
 - TUI plugin: copy logic, stale skill cleanup, `tui.json` dedup; advanced plugin with version detection and 14 commands
 - Agents migrated from deprecated `tools:` to OpenCode `permission:` model; legacy multi-platform tests removed (OpenCode-only conformance); docs modernized (OpenCode-only, unified commands)
 
-## 🐞 Fixed
+## Fixed
 
 - Hardcoded version fallback replaced with package.json version; routing aligned with actual skills (vscode platform removed)
 
@@ -1513,7 +1054,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v1.0.1] - 2026-07-24
 
-## 🆕 What's New
+## Added
 
 - Installer: unified setup flow, removed lifecycle install, fixed entry points
 
@@ -1521,7 +1062,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.19.2] - 2026-07-21
 
-## 🆕 What's New
+## Added
 
 - `_pantheon_paths.py` — shared path resolution (`PANTHEON_HOME`, `PANTHEON_PROJECT`)
 - `pantheon-persistence` MCP — KV store with SQLite FTS5, TTL, namespaces, 6 tools
@@ -1546,7 +1087,7 @@ latência total e wall de F1 segue inconclusivo.
 - 9 duplicate instructions (now skills on-demand)
 - `multi-model-routing` from prometheus (deleted skill)
 
-## 🐞 Fixed
+## Fixed
 
 - 157 dangling instruction references across 6 platforms
 - YAML frontmatter in all 14 agents (broken by previous sed edits)
@@ -1554,7 +1095,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.19.0] - 2026-07-21
 
-## 🆕 What's New
+## Added
 
 - Memory Persistence Protocol (ADR-006) — agents now have mandatory `memory_recall()` pre-work (top_k=3, skip if score<0.3) and `memory_store()` post-work (2 lines max, importance 0.4-0.9)
 - Session-end auto-save script (`.pantheon/code-mode/session-end-save.py`) — exports Vector DB entries with importance ≥0.4 at session close (ChromaDB direct read + client-side filtering)
@@ -1590,7 +1131,7 @@ latência total e wall de F1 segue inconclusivo.
 - Memory Persistence Protocol documented as ADR-006
 - `.config/opencode/` fully synced from canonical Pantheon (14 agents + 10 instructions)
 
-## 🐞 Fixed
+## Fixed
 
 - 33 dangling `docs/memory-bank/` references fixed across platform configs (`.claude/`, `.cursor/`, `.windsurf/`, `.continue/`, `.clinerules/`, `.github/`, `memories/`, `platform/`, `template/`, `.opencode/skills/`, `.tests/`)
 - `.pantheon/memory-bank/.tmp/` added to `.gitignore`
@@ -1612,7 +1153,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.17.1] - 2026-07-14
 
-## 🆕 What's New
+## Added
 
 - Inline compression triggers (C8/C9/C11): implementation agents (Hermes, Aphrodite, Demeter, Hephaestus, Prometheus) now declare `context-compression` skill and have a concise `## Inline Compression` section covering CRITICAL/HIGH subtask summaries, pre-delegation large blocks, and phase boundaries/handoffs
 - `tests/test_code_mode_args.py`: TDD coverage for the new `args` parameter forwarding
@@ -1620,7 +1161,7 @@ latência total e wall de F1 segue inconclusivo.
 - Agent `.md` files: `context-compression` added to `skills:` frontmatter for all 5 implementation agents
 - `instructions/artifact-protocol.instructions.md`: scrub documented as automatic via MCP layer
 
-## 🐞 Fixed
+## Fixed
 
 - `execute_code_script` now forwards CLI arguments to subprocess — `compress-inline.py` is reachable via MCP (fixes argparse code 2 error)
 - Unified scrubber: 3 divergent implementations consolidated into single canonical `scripts/scrub-secrets.py`, imported by both `memory_mcp_server.py` and `compress-inline.py` via `importlib` (hyphenated filename cannot be statically imported)
@@ -1628,7 +1169,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.17.0] - 2026-07-11
 
-## 🆕 What's New
+## Added
 
 - Pantheon TUI Plugin overhaul: sidebar modernization, clickable commands, dynamic Python version
 - MCP Config section in TUI: list active plugins, MCP status, auto-compaction toggle
@@ -1646,7 +1187,7 @@ latência total e wall de F1 segue inconclusivo.
 - Updated 65+ source files with new .pantheon/ paths
 - `docs/memory-bank/` from git history (fully purged via filter-repo)
 
-## 🐞 Fixed
+## Fixed
 
 - TUI plugin path in tui.json (was pointing to non-existent file)
 - OpenCode MCP config format (command must be array + cwd)
@@ -1655,7 +1196,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.16.0] - 2026-07-10
 
-## 🆕 What's New
+## Added
 
 - MCP Resources Support: pantheon://agents, skills, routing, deepwork, memory-bank
 - Code Mode MCP Adapter: confined script execution from .pantheon/code-mode/
@@ -1674,7 +1215,7 @@ latência total e wall de F1 segue inconclusivo.
 - memory_export: restricted to ~/.pantheon/exports/ with path traversal check
 - Content size limit: 100KB max, 500 char category
 
-## 🐞 Fixed
+## Fixed
 
 - memory_sessions dead code (always returned empty results)
 - install-mcp.mjs filename: dash → underscore
@@ -1683,7 +1224,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.15.0] - 2026-06-26
 
-## 🆕 What's New
+## Added
 
 - **Level 3 Vector Memory:** 5 scripts (`schema.py`, `index.py`, `query.py`, `rebuild.py`, `cli.py`) with dual indexing (FTS5 + optional sqlite-vec embeddings), 8/8 tests passing, 120 entries indexed from memory bank
 - **Two-Tier Persistence Model:** Tier 1 auto-index (`quick_index()`) saves background agent results instantly into Vector Memory; Tier 2 full compression (ZZ artifact + memory bank update) only on Themis APPROVED
@@ -1700,27 +1241,27 @@ latência total e wall de F1 segue inconclusivo.
 - **TASK-016:** Level 3 Implementation Plan — 24 tasks across 5 phases
 - **01-active-context.md:** Updated with deepwork v3.15 changes and Two-Tier model
 
-## 🐞 Fixed
+## Fixed
 
 - **Import Path in Vector Memory Scripts:** `sys.path` now correctly points to parent of `vector_memory/` package, enabling both direct execution and `python -m` usage
 
 ## [v3.14.1] - 2026-06-21
 
-## 🆕 What's New
+## Added
 
 - **Pantheon-Context MCP Experiment:** Removed entire `scripts/pantheon-context-mcp/` directory (server.py, scoring.py, summarizer.py, tests — 12 files, ~1,200 lines)
 - **Stale Agent References:** Stripped `pantheon-context` tool references from all 14 agent files, `.mcp.json`, `opencode.json`, `ROADMAP.md`
 - **Auto-Release CI:** Removed `.github/workflows/auto-release.yml` (triggered broken v3.14.0 release on every push to main)
 - **TUI Sidebar Plugin:** Rewrote from flat file to npm-style directory (`plugins/pantheon-tui/` with `index.tsx`, `package.json`, `dist/tui.tsx`). New features: real context usage bar (color thresholds 70%/90%), collapsible command guide (16 `/pantheon` commands), manual compress button, Python version display, collapsible agent registry
 
-## 🐞 Fixed
+## Fixed
 
 - **Install Script:** `scripts/install/opencode.mjs` now correctly copies npm-style plugin directory and registers in `tui.json` (not `opencode.json` — TUI plugins use separate registration)
 - **CI Release Pipeline:** Added `dry_run` input to manual release workflow, removed auto-merge from release PRs, fixed duplicate steps
 
 ## [v3.14.0] - 2026-06-20
 
-## 🆕 What's New
+## Added
 
 - **Codebase Audit:** Comprehensive 5-agent scan — 48 issues found, all resolved
 - **Mermaid Diagrams:** 5 new diagrams — TDD Cycle (stateDiagram-v2), Artifact Lifecycle (flowchart), Council Synthesis (sequenceDiagram), Architecture (flowchart), Delegation Flow (flowchart)
@@ -1732,7 +1273,7 @@ latência total e wall de F1 segue inconclusivo.
 - **Database Standards:** Async SQLAlchemy 2.0 patterns, connection pooling, migration testing, disaster recovery + 2 Mermaid diagrams
 - **Documentation Quality:** "When NOT to Use" sections on all 7 main agents, English-only throughout, ROADMAP.md updated
 
-## 🐞 Fixed
+## Fixed
 
 - **Dead Agent Purge:** Removed ~150+ references to Echo, Chiron, Argus, Agora across 67+ files (agents, platforms, instructions, skills)
 - **Portuguese→English:** `docs/platforms/README.md` fully translated, `agents/prometheus.agent.md` mixed-language fixed
@@ -1746,7 +1287,7 @@ latência total e wall de F1 segue inconclusivo.
 
 ## [v3.13.0] - 2026-06-20
 
-## 🆕 What's New
+## Added
 
 - **Level 2 Context Compression** — priority scoring engine (5 deterministic dimensions: Impact, Risk, Novelty, Blockers, Downstream relevance), semantic summarization templates per agent-pair, budget allocation (100-line cap, priority-greedy), cross-reference mechanism (D/E/M/C IDs with auto-generated `_xref/index.md`), ZZ artifact format for phase-to-phase context injection, `context-compression` skill (Level 2)
 - **New prompts**: `prompts/semantic-summarize.md` for agent-pair aware semantic summarization
@@ -1771,7 +1312,7 @@ latência total e wall de F1 segue inconclusivo.
 - **Sync Check** — passing
 - **Auto Release** — published at v3.13.0
 
-## 🐞 Fixed
+## Fixed
 
 - **CHANGELOG.md** — removed 4 duplicate v3.12.1 entries and empty v3.12.2 section
 - **Frontmatter consistency** — all 14 agents now parse cleanly with OpenCode YAML frontmatter
@@ -1793,14 +1334,14 @@ latência total e wall de F1 segue inconclusivo.
 
 [compare changes](https://github.com/ils15/pantheon/compare/v3.11.0...v3.12.0)
 
-## 🆕 What's New
+## Added
 
 - **agents:** Add anti-stall resilience and orchestration improvements ([7a61b69](https://github.com/ils15/pantheon/commit/7a61b69))
 - **agents:** Add /pantheon-status command with version badge + agent registry ([984ec65](https://github.com/ils15/pantheon/commit/984ec65))
 - **platform:** Add Pantheon TUI sidebar plugin for OpenCode ([09253c1](https://github.com/ils15/pantheon/commit/09253c1))
 - **release:** Sync version to v3.11.0 ([1a9fb64](https://github.com/ils15/pantheon/commit/1a9fb64))
 
-## 🐞 Fixed
+## Fixed
 
 - **ci:** Sync platform files and add mcp-security skill to pass CI ([a27a245](https://github.com/ils15/pantheon/commit/a27a245))
 
@@ -1808,12 +1349,12 @@ latência total e wall de F1 segue inconclusivo.
 
 [compare changes](https://github.com/ils15/pantheon/compare/v3.8.4...v3.9.0)
 
-## 🆕 What's New
+## Added
 
 - Setup changelogen + git-cliff for auto-releases ([ce4ee22](https://github.com/ils15/pantheon/commit/ce4ee22))
 - Cleanup commands, fix subtask agent, add Context7 tools, improve sync script ([da6ed7c](https://github.com/ils15/pantheon/commit/da6ed7c))
 
-## 🐞 Fixed
+## Fixed
 
 - Add missing closing brace for github configuration in opencode.json ([a63c522](https://github.com/ils15/pantheon/commit/a63c522))
 - Address PR review sync and mapping feedback ([c550049](https://github.com/ils15/pantheon/commit/c550049))

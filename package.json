@@ -1,6 +1,6 @@
 {
   "name": "pantheon-opencode",
-  "version": "1.6.0-beta.18",
+  "version": "1.6.0",
   "description": "Multi-agent orchestration for OpenCode — 14 specialized agents, TDD, Themis review gates.",
   "type": "module",
   "workspaces": [
@@ -36,14 +36,18 @@
     "engine:check": "node scripts/validate-node-engine-policy.mjs",
     "package:validate": "node scripts/validate-package.mjs && npm run engine:check",
     "lint": "biome ci .",
+    "docs:lint": "node scripts/docs-link-check.mjs",
+    "docs:media": "node scripts/docs-media.mjs",
+    "docs:check-changelog": "node scripts/docs-check-changelog.mjs",
     "typecheck": "tsc --noEmit",
     "audit": "npm audit --audit-level=high",
     "secret-scan": "node scripts/secret-scan.mjs",
     "hooks:install": "pre-commit install",
     "hooks:update": "pre-commit autoupdate",
     "test:security": "npm run secret-scan",
-    "test:node": "node scripts/run-node-tests.mjs --label 'test:node' 'tests/*.mjs' 'tests/pantheon/*.mjs'",
-    "coverage": "echo 'Node coverage (report-only, NO threshold is enforced).' && echo 'Covers: the .mjs/.js modules under scripts/, src/ and bin/ that test:node exercises.' && echo 'Does NOT cover: test:ts (hand-rolled tsx loop, no node --test runner) and test:ci (pytest).' && echo '             TypeScript under src/ (41 files) is therefore entirely unmeasured here.' && echo '' && node scripts/run-node-tests.mjs --label 'coverage' -- --experimental-test-coverage --test-coverage-include='scripts/**/*.mjs' --test-coverage-include='src/**/*.mjs' --test-coverage-include='src/**/*.js' --test-coverage-include='bin/**/*.mjs' 'tests/*.mjs' 'tests/pantheon/*.mjs'",
+    "test:node": "node scripts/run-node-tests.mjs --label 'test:node' --exclude 'tests/install-opencode.test.mjs' --exclude 'tests/install-e2e.test.mjs' 'tests/*.mjs' 'tests/pantheon/*.mjs'",
+    "test:install": "PANTHEON_RUN_INSTALL_TESTS=1 node scripts/run-node-tests.mjs --label 'test:install' 'tests/install-opencode.test.mjs' 'tests/install-e2e.test.mjs'",
+    "coverage": "echo 'Node coverage (report-only, NO threshold is enforced).' && echo 'Covers: the .mjs/.js modules under scripts/, src/ and bin/ that test:node exercises.' && echo 'Does NOT cover: test:ts (hand-rolled tsx loop, no node --test runner) and test:ci (pytest).' && echo '             TypeScript under src/ (41 files) is therefore entirely unmeasured here.' && echo '' && node scripts/run-node-tests.mjs --label 'coverage' --exclude 'tests/install-opencode.test.mjs' --exclude 'tests/install-e2e.test.mjs' -- --experimental-test-coverage --test-coverage-include='scripts/**/*.mjs' --test-coverage-include='src/**/*.mjs' --test-coverage-include='src/**/*.js' --test-coverage-include='bin/**/*.mjs' 'tests/*.mjs' 'tests/pantheon/*.mjs'",
     "coverage:plugin-v2": "node scripts/check-plugin-v2-coverage.mjs",
     "test:ts": "for f in tests/pantheon/*.test.ts; do if [ \"$f\" = tests/pantheon/plugin-v2-contract.test.ts ]; then NODE_OPTIONS=--conditions=import tsx \"$f\"; else tsx \"$f\"; fi || exit 1; done",
     "test:hooks": "node scripts/run-node-tests.mjs --label 'test:hooks' 'tests/pantheon/plugin-v2-hook-canary.test.mjs'",
@@ -118,7 +122,8 @@
     "@babel/core": "7.29.7",
     "seroval": "1.6.8",
     "solid-js": "1.9.12",
-    "rolldown": "1.2.7"
+    "rolldown": "1.2.7",
+    "toml": "5.0.1"
   },
   "//overrides": "TUI production advisory fixes: Babel >=7.29.6 and Seroval >=1.6.3; Solid stays at 1.9.12 to satisfy OpenTUI's exact peer. Remove only after upstream ranges include fixed versions; Seroval compatibility is covered by the Solid serializer regression test.",
   "repository": {

@@ -22,7 +22,7 @@ const contextCompression = readPrompt('../src/skills/context-compression/SKILL.m
 const architectureGuide = readPrompt('../docs/ARCHITECTURE.md')
 const memoryGuide = readPrompt('../docs/MEMORY.md')
 const mcpGuide = readPrompt('../docs/mcp-tools.md')
-const agentMcpGuide = readPrompt('../docs/AGENT-MCP.md')
+const agentMcpGuide = readPrompt('../docs/MCP.md')
 const memoryInstaller = readPrompt('../scripts/install-mcp.mjs')
 const generatedAgents = readPrompt('../AGENTS.md')
 const delegationRoleDocs = Object.fromEntries(
@@ -178,7 +178,15 @@ test('memory documentation describes the current low-call policy and current API
 })
 
 test('memory docs and prompts state the current storage, privacy, and grant contracts', () => {
-  assert.match(memoryGuide, /SQLite `memory\.db`[\s\S]*entries have no TTL/i)
+  assert.match(
+    memoryGuide,
+    /SQLite `memory\.db`[\s\S]*capped at 64 KiB serialized[\s\S]*`ttl_seconds`/i,
+  )
+  assert.doesNotMatch(
+    memoryGuide,
+    /entries have no TTL/i,
+    'entries can now expire via ttl_seconds; the no-TTL claim is stale',
+  )
   assert.match(memoryGuide, /FTS5\/BM25[\s\S]*no embedding[\s\S]*model or vector search/i)
   assert.match(memoryGuide, /session-qualified context checkpoints default to 4h/i)
   assert.match(memoryGuide, /_tasks\/[`]? records may be Git-ignored/i)
